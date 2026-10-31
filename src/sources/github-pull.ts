@@ -22,7 +22,7 @@ export const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => p
 /** True when the PR was opened by the agent account from a branch in the configured repository (not a fork). */
 export const agentPull = (pr: { user: { login: string }; head?: { repo?: { full_name: string } | null } | null },
   deployment: Pick<Deployment, 'github' | 'repository'>): boolean =>
-  sameName(pr.user.login, deployment.github.login) && sameName(pr.head?.repo?.full_name ?? '', deployment.repository)
+  !!deployment.github && !!deployment.repository && sameName(pr.user.login, deployment.github.login) && sameName(pr.head?.repo?.full_name ?? '', deployment.repository)
 /** True when a branch belongs to the ticket: its last path segment is the ticket's short name, such as `agent/<name>`. */
 export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): boolean =>
   !!ticket.execution?.name && ref.split('/').at(-1) === ticket.execution.name
@@ -33,6 +33,7 @@ const AUTO_MERGE_ON: ThreadFact = { label: { zh: '自动合并', en: 'Auto-merge
  * Returns an error message when binding is rejected, or undefined when the PR is bound or when the PR is not open (which is not an error).
  */
 export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): string | undefined {
+  if (!ctx.deployment.github || !ctx.deployment.repository) return 'PR reporting requires a configured GitHub Source; omit pr_number when this task has no GitHub PR'
   const ticket = ctx.tickets.get(ticketId)
   if (!ticket || !liveTicket(ticket)) return 'Ticket ended because its PR was closed'
   const source = ctx.triggers.get(ticket.origin.triggerId)

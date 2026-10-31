@@ -7,7 +7,6 @@ and 3 when it runs and waits for setup. A restart fixes neither 2 nor 3: they ne
 """
 
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -20,6 +19,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+if os.name == 'nt':
+    # Keep the POSIX implementation below intact; Windows uses native process and lock handling.
+    import runpy
+    runpy.run_path(str(Path(__file__).with_name('dsh-superagent-windows.py')), run_name='__main__')
+    raise SystemExit
+
+import fcntl
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / '.artifacts'

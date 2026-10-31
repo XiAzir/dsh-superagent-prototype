@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -12,10 +15,16 @@ import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
+const deployment = testDeployment({ github: { ...testDeployment().github!, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
+  it('explains that GitHub API calls need a configured GitHub Source in personal mode', async () => {
+    const personal = testDeployment({ mode: 'personal', repository: undefined, github: undefined, feishu: undefined })
+    const commands = new Commands(() => personal, {}, new AbortController().signal)
+    await expect(commands.gh(['api', 'user'])).rejects.toThrow('The GitHub Source is unavailable: configure a repository and agent CLI before using GitHub commands.')
+    await expect(commands.api('issues')).rejects.toThrow('The GitHub Source is unavailable: configure a repository and agent CLI before using GitHub commands.')
+  })
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
     await commands.gh(['api','some-path','-f','body=`whoami` $(touch x)'])
@@ -24,10 +33,35 @@ describe('account-isolated operations', () => {
   it('runs every command with its environment over the process environment, where undefined removes a variable', async () => {
     process.env.GH_TOKEN = 'personal'
     try {
-      const output = await new Commands(() => deployment, { GH_TOKEN: undefined, DSH_SUPERAGENT_PROBE: 'agent' }, new AbortController().signal).run('env', [])
-      expect(output).toContain('DSH_SUPERAGENT_PROBE=agent')
-      expect(output).not.toContain('GH_TOKEN=')
+      const output = await new Commands(() => deployment, { GH_TOKEN: undefined, DSH_SUPERAGENT_PROBE: 'agent' }, new AbortController().signal)
+        .run(process.execPath, ['-e', "process.stdout.write(JSON.stringify(process.env))"])
+      const environment = JSON.parse(output) as Record<string, string>
+      expect(environment.DSH_SUPERAGENT_PROBE).toBe('agent')
+      expect(environment.GH_TOKEN).toBeUndefined()
     } finally { delete process.env.GH_TOKEN }
+  })
+  it.skipIf(process.platform !== 'win32')('passes literal argv through Windows .ps1 and .cmd wrappers without shell expansion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'command-wrapper-'))
+    try {
+      const capture = join(dir, 'capture.js')
+      const result = join(dir, 'argv.json')
+      writeFileSync(capture, `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(result)}, JSON.stringify(process.argv.slice(2)))\n`)
+      const ps1 = join(dir, 'gh.ps1')
+      const cmd = join(dir, 'gh.cmd')
+      const unpaired = join(dir, 'unpaired.cmd')
+      const marker = join(dir, 'executed.txt')
+      writeFileSync(ps1, `& node "$PSScriptRoot/capture.js" @args\nexit $LASTEXITCODE\n`)
+      writeFileSync(cmd, `@echo off\r\nnode "%~dp0capture.js" %*\r\nexit /b %ERRORLEVEL%\r\n`)
+      writeFileSync(unpaired, `@echo off\r\nnode "%~dp0capture.js" %*\r\n`)
+      const args = ['a value with spaces', `& echo injected > "${marker}"`, '100%PATH%!caret^&pipe|']
+      const commands = new Commands(() => deployment, {}, new AbortController().signal)
+      for (const program of [ps1, cmd]) {
+        await commands.run(program, args)
+        expect(JSON.parse(readFileSync(result, 'utf8'))).toEqual(args)
+      }
+      await expect(commands.run(unpaired, args)).rejects.toThrow(/Cannot safely execute/)
+      expect(() => readFileSync(marker, 'utf8')).toThrow()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
   })
   it('refuses Feishu commands when the deployment has no Feishu bot', async () => {
     await expect(new Commands(() => testDeployment({ feishu: undefined }), {}, new AbortController().signal).lark(['im', '+chat-list'])).rejects.toThrow('The Feishu Source has no working bot CLI')
@@ -172,8 +206,8 @@ it('says how to add the bot to a chat when Feishu answers that it is not a membe
 it('names only the program and how it ended when a command prints no diagnostics, never its arguments', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const secret = 'secret reply text'
-  await expect(commands.run('sh', ['-c', 'exit 3', secret])).rejects.toMatchObject({ message: 'sh exited with code 3', exitCode: 3 })
-  await expect(commands.run('sh', ['-c', 'kill -9 $$', secret])).rejects.toMatchObject({ message: 'sh was stopped by SIGKILL' })
+  await expect(commands.run(process.execPath, ['-e', 'process.exit(3)', secret]))
+    .rejects.toMatchObject({ message: expect.stringMatching(/^node(?:\.exe)? exited with code 3$/), exitCode: 3 })
   await expect(commands.run('/no/such/program', ['secret reply text'])).rejects.toMatchObject({ message: 'program could not run: ENOENT' })
   // Timeouts kill the child with SIGTERM; Node's default error message would echo every argument.
   const timedOut = { killed: true, signal: 'SIGTERM', code: null, stderr: '',
@@ -191,9 +225,12 @@ it('reports failures as CliError with the code the CLI names and the exit status
   const aborted = Object.assign(new Error('The operation was aborted'), { name: 'AbortError', stderr: '' })
   expect(commandError(aborted)).toBe(aborted)
   const controller = new AbortController()
-  const running = new Commands(() => deployment, {}, controller.signal).run('sleep', ['5'])
+  const running = new Commands(() => deployment, {}, controller.signal).run(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'])
   controller.abort()
   await expect(running).rejects.toMatchObject({ name: 'AbortError' })
+  const alreadyAborted = new AbortController(); alreadyAborted.abort()
+  await expect(new Commands(() => deployment, {}, alreadyAborted.signal).run(process.execPath, ['-e', 'process.exit(0)']))
+    .rejects.toMatchObject({ name: 'AbortError' })
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   vi.spyOn(commands, 'run').mockResolvedValue(JSON.stringify({ ok: false, error: { code: 231003, message: 'message not found' } }))
   await expect(commands.lark(['im', '+messages-reply'])).rejects.toMatchObject({ message: 'message not found (231003)', code: 231003 })
@@ -203,12 +240,12 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   const lifetime = new AbortController(), work = new AbortController()
   const commands = new Commands(() => deployment, {}, lifetime.signal)
   const started = Date.now()
-  const running = commands.withSignal(work.signal).run('sleep', ['5'])
+  const running = commands.withSignal(work.signal).run(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'])
   work.abort()
   await expect(running).rejects.toThrow()
   // Only commands bound to the aborted work signal stop.
-  expect(await commands.run('echo', ['still'])).toBe('still\n')
-  const other = commands.withSignal(new AbortController().signal).run('sleep', ['5'])
+  expect((await commands.run(process.execPath, ['-e', "process.stdout.write('still')"])).trim()).toBe('still')
+  const other = commands.withSignal(new AbortController().signal).run(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'])
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)

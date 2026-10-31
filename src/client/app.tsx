@@ -1,13 +1,14 @@
 /** Root panel shell: header with global search and glossary, top-level navigation tabs, and active route view. */
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { SearchView } from './api.ts'
-import { Button, Dot, Icon, Input, Modal, SegmentedTabs } from './controls.tsx'
+import { Button, Dot, Icon, Input, Modal, SegmentedTabs, Tag } from './controls.tsx'
 import type { DeploymentForm } from './deployment.tsx'
 import { EvalStatus } from './eval.tsx'
 import { ExecutionStatus } from './execution.tsx'
 import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
+import { PersonalPage } from './personal.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
@@ -98,8 +99,8 @@ function SearchResults({ result, query, onClose }: { result: SearchView; query: 
   </div>
 }
 
-function Header({ masterId }: { masterId: string | undefined }) {
-  const { t, call, openSession, notify } = usePanel()
+function Header({ masterId, mode, masterReady }: { masterId: string | undefined; mode: 'repository' | 'personal' | undefined; masterReady: boolean }) {
+  const { t, call, openSession, notify, navigate } = usePanel()
   const [glossary, setGlossary] = useState(false)
   const [query, setQuery] = useState('')
   const [result, setResult] = useState<{ query: string; value: SearchView }>()
@@ -124,15 +125,19 @@ function Header({ masterId }: { masterId: string | undefined }) {
   return <header className="dt-head">
     <div className="dt-head-title"><h1 className="dt-title">{t('title')}</h1></div>
     <div className="dt-toolbar">
-      <form ref={search} className="dt-search" role="search" onSubmit={submit} onKeyDown={event => { if (event.key === 'Escape') show() }}>
+      {mode !== 'personal' && <form ref={search} className="dt-search" role="search" onSubmit={submit} onKeyDown={event => { if (event.key === 'Escape') show() }}>
         <Input type="search" icon={<Icon name="search" />} value={query} placeholder={t('searchPlaceholder')} aria-label={t('searchLabel')}
           onChange={event => { setQuery(event.target.value); if (!event.target.value) show() }} />
         {result && <SearchResults result={result.value} query={result.query} onClose={() => { show() }} />}
-      </form>
+      </form>}
+      {mode === 'personal' && <Tag tone="info">{t('personalMode')}</Tag>}
+      {mode === 'personal' && <Button variant="outline" size="sm" icon={<Icon name="plus" size={14} />}
+        onClick={() => navigate({ page: 'tasks' })}>{t('webTask.newTask')}</Button>}
       <Button variant="ghost" size="sm" icon={<Icon name="question" />} aria-label={t('glossary')} title={t('glossary')} aria-haspopup="dialog"
         onClick={() => setGlossary(true)} />
-      <Button variant="outline" size="sm" icon={<Icon name="session" size={14} />} disabled={!masterId}
-        onClick={() => { if (masterId) openSession(masterId).catch(failure => notify(errorText(failure))) }}>{t('openMaster')}</Button>
+      <Button variant="outline" size="sm" icon={<Icon name="session" size={14} />} disabled={!masterId || !masterReady}
+        title={!masterReady ? t('masterWaiting') : undefined}
+        onClick={() => { if (masterId && masterReady) openSession(masterId).catch(failure => notify(errorText(failure))) }}>{t('openMaster')}</Button>
     </div>
     <Glossary open={glossary} onClose={() => setGlossary(false)} />
   </header>
@@ -154,16 +159,18 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
         paused={!!state?.paused} />
       case 'execution': return route.id !== undefined ? <TicketPage key={route.id} id={route.id} />
         : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
+      case 'tasks': return state?.mode === 'personal' ? <PersonalPage key={route.id ?? 'tasks'} id={route.id} /> : waiting
       case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
         deploymentForm={deploymentForm} /> : waiting
     }
   })()
   return <div className="dt-page">
     <div className="dt-column">
-      <Header masterId={state?.masterId} />
+      <Header masterId={state?.masterId} mode={state?.mode} masterReady={state?.masterReady ?? false} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
       <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
-        items={TABS.map(value => ({ value, label: t(`tab.${value}`), id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
+        items={TABS.filter(value => value !== 'tasks' || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
+          id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
       <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page}`} className="dt-main">{page}</main>
     </div>
   </div>
@@ -182,7 +189,23 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   const back = useCallback(() => move(current => ({ route: current.stack.at(-1) ?? HOME, stack: current.stack.slice(0, -1) })), [move])
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
+  const normalizeModeRoute = useCallback((mode: 'repository' | 'personal' | undefined) => move(current => {
+    if (mode === 'personal' && current.route.page === 'overview') return { route: { page: 'tasks' }, stack: current.stack }
+    if (mode === 'repository' && current.route.page === 'tasks') return { route: HOME, stack: current.stack }
+    return { route: current.route, stack: current.stack }
+  }), [move])
   return <PanelProvider t={t} openSession={openSession} navigate={navigate} back={back} backLabel={routeLabel(t, location.stack.at(-1) ?? HOME)}>
-    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} />
+    <AppPages route={location.route} openTab={openTab} deploymentForm={deploymentForm} normalizeModeRoute={normalizeModeRoute} />
   </PanelProvider>
+}
+
+function AppPages({ route, openTab, deploymentForm, normalizeModeRoute }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm
+  normalizeModeRoute: (mode: 'repository' | 'personal' | undefined) => void }) {
+  const { state } = usePanelData()
+  const normalized = useRef<'repository' | 'personal'>()
+  useEffect(() => {
+    if (state?.mode && normalized.current !== state.mode) { normalized.current = state.mode; normalizeModeRoute(state.mode) }
+    if (state?.mode === 'repository' && route.page === 'tasks') normalizeModeRoute('repository')
+  }, [state?.mode, route.page, normalizeModeRoute])
+  return <Pages route={route} openTab={openTab} deploymentForm={deploymentForm} />
 }

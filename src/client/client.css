@@ -73,6 +73,23 @@
 .dt-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dt-filters .dt-search { margin-left: auto; }
 .dt-form { display: flex; flex-direction: column; gap: 24px; }
+.dt-web-task-page { display: flex; flex-direction: column; gap: 24px; min-width: 0; }
+.dt-web-task-composer { gap: 12px; }
+.dt-web-task-composer .dt-textarea { min-height: 84px; }
+.dt-web-task-empty { padding: 20px 16px; border: 0.5px dashed var(--dsw-alias-border-l3); border-radius: 12px; text-align: center; }
+.dt-web-task-empty .dt-hint + .dt-hint { margin-top: 4px; }
+.dt-web-task-list .dt-row[data-selected] { background: var(--dsw-alias-interactive-bg-hover); }
+.dt-web-task-messages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.dt-web-task-message { min-width: 0; padding: 14px 16px; border: 0.5px solid var(--dsw-alias-border-l2); border-radius: 12px; }
+.dt-web-task-user { background: var(--dsw-alias-bg-module-platform); }
+.dt-web-task-message-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); }
+.dt-web-task-message-head strong { color: var(--dsw-alias-label-secondary); font-weight: 600; }
+.dt-web-task-message-head time { margin-left: auto; }
+.dt-web-task-user-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 20px; }
+.dt-web-task-message .dt-md { overflow-wrap: anywhere; }
+.dt-web-task-results { display: flex; flex-direction: column; gap: 16px; }
+.dt-web-task-results article { padding: 12px 14px; border-radius: 10px; background: var(--dsw-alias-bg-module-platform); overflow-wrap: anywhere; }
+.dt-web-task-results h3 { margin: 0 0 8px; font-size: 13px; line-height: 20px; font-weight: 600; }
 .dt-fieldset { display: flex; flex-direction: column; gap: inherit; min-width: 0; margin: 0; padding: 0; border: 0; }
 .dt-field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; line-height: 20px; min-width: 0; }
 .dt-field small { color: var(--dsw-alias-label-caption); font-size: 12px; }

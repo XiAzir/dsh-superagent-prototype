@@ -1,0 +1,1 @@
+An explicit request from the Web source is routed directly and does not need a proactive assessment. Assess any other proactive candidate with the enabled rules and its bounded source context before routing it. Policy and tool permissions remain in force.

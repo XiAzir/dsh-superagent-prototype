@@ -80,6 +80,21 @@ it('answers only a same-origin request from the panel on the loopback address', 
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
 })
 
+it('applies same-origin checks to personal Web task posts and maps setup and lookup failures', async () => {
+  const store = { settings: () => SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
+    policy: { sources: { web: { allowed: [{ id: 'owner' }] } } } }), get: () => undefined,
+    keys: () => [], threads: { get: () => undefined }, tickets: { get: () => undefined }, decisions: { byThread: () => [] } }
+  const call = serve({ machine: { mode: 'personal', promptMaxChars: { get: () => 100_000 }, admissionContextMaxPages: { get: () => 10 },
+      admissionContextTimeoutMs: { get: () => 15_000 } }, store,
+    configured: () => false, health: {}, requestPass: () => {}, engine: { receive: () => 'stored' } })
+
+  expect(await call('POST', 'web/tasks', { text: '新任务', requestId: 'request_123456' }, { origin: 'http://evil.example' }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(await call('POST', 'web/tasks', { text: '新任务', requestId: 'request_123456' }))
+    .toMatchObject({ status: 503 })
+  expect(await call('GET', 'web/tasks/missing')).toEqual({ status: 404, body: { error: '任务对话不存在。' } })
+})
+
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {
   const saves: unknown[] = []
   const call = serve({

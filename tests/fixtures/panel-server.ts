@@ -108,6 +108,7 @@ export interface PanelServer {
   opened: string[]
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
+  webTasks: { items: ApiResponse<'GET web/tasks'>['items']; records: Record<string, ApiResponse<'GET web/tasks/:id'>> }
 }
 export let server: PanelServer
 
@@ -159,7 +160,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused,
+  mode: server.setup.machine.mode ?? 'repository', masterReady: !server.setup.problem, masterId: 'master', paused: server.settings.paused,
   // The panel does not read health; the service script does.
   health: {},
 })
@@ -248,14 +249,14 @@ function initial(): PanelServer {
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
     health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
-    setup: { machine: MACHINE, problem: null, feishuProblem: null,
+    setup: { machine: { ...MACHINE, mode: 'repository' }, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
-    settings, revisions: { policy: 3, eval: 1, executor: 0 },
+    settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
-      defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], notificationPending: false, next_offset: null },
+      defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], failures: [], notificationPending: false, next_offset: null },
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
@@ -291,6 +292,34 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET web/tasks': { query: ['offset', 'limit'], answer: ({ query }) => {
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    return { items: server.webTasks.items.slice(offset, offset + limit), next_offset: offset + limit < server.webTasks.items.length ? offset + limit : null }
+  } },
+  'GET web/tasks/:id': { answer: ({ params }) => server.webTasks.records[params.id] ?? refuse(404, '任务对话不存在。') },
+  'POST web/tasks': { body: true, answer: ({ body }) => {
+    const id = `web-task-${body.requestId}`
+    const existing = server.webTasks.records[id]
+    if (existing) return existing.messages[0]?.text === body.text ? existing : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+    const at = new Date().toISOString()
+    const created = { id, title: body.text.split('\n')[0]!.slice(0, 100), createdAt: at, updatedAt: at, status: 'queued' as const,
+      tickets: [], messages: [{ id: `web-message-${body.requestId}`, role: 'user' as const, text: body.text, at }] }
+    server.webTasks.records[id] = created
+    const { messages: _messages, ...summary } = created
+    server.webTasks.items.unshift(summary)
+    return created
+  } },
+  'POST web/tasks/:id/messages': { body: true, answer: ({ params, body }) => {
+    const task = server.webTasks.records[params.id]
+    if (!task) return refuse(404, '任务对话不存在。')
+    const previous = task.messages.find(message => message.id === `web-message-${body.requestId}`)
+    if (previous) return previous.text === body.text ? task : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+    const at = new Date().toISOString()
+    task.messages.push({ id: `web-message-${body.requestId}`, role: 'user', text: body.text, at }); task.updatedAt = at
+    const summary = server.webTasks.items.find(item => item.id === task.id)
+    if (summary) summary.updatedAt = at
+    return task
+  } },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

@@ -1,5 +1,11 @@
 # dsh-superagent
 
+This fork adds **personal mode, a Web task inbox, and Windows support** to the
+upstream research prototype. Repository mode remains available. Personal mode runs
+with a model and a local execution environment, and accepts tasks directly from
+the DSH Web panel. See [Personal mode](docs/personal.md) and
+[Windows setup](docs/windows.md).
+
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
 > We have adapted it for publication, so it is not identical to our internal version or the implementation described in *Exploring Super-agent Design: Towards a More Autonomous Agent System*. Some designs discussed in the article are directions for future development and are not implemented in this prototype.
@@ -9,6 +15,10 @@ dsh-superagent is a proactive coding agent for one GitHub repository, packaged a
 It is also a way of working with an agent: **take as little human attention as possible, and give as much value as possible.** An agent that can act for a whole team can also waste a whole team's attention, so it acts only when asked or when a rule the team wrote allows it, and speaks only when someone must act or can use a result. [docs/000-philosophy.md](docs/000-philosophy.md) explains the principle and what it asks of the operator.
 
 ## Setup
+
+This local checkout includes Windows compatibility maintenance. See
+[Windows setup](docs/windows.md) for PowerShell 7, native service management and
+the dedicated-profile workflow. The original Unix deployment remains available.
 
 Setup has many steps, so an agent does it with you. Ask your coding agent:
 
@@ -29,6 +39,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [006 Deployment](docs/006-deployment.md): manual setup, configuration, upgrades and troubleshooting
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
+- [Personal mode](docs/personal.md): Web tasks, follow-ups, and local results
 
 ## Development
 

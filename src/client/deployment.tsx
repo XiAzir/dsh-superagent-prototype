@@ -35,14 +35,17 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
   const snapshot = form?.state
   const editable = snapshot?.status === 'ready' && snapshot.writable
   // Pass `revision` only while DSH serves writable values so a draft started before `ready` rebases once writable.
-  const draft = useDraft({ saved: limitsOf(editable ? snapshot.value : setup.machine), revision: editable ? snapshot.revision : undefined,
+  const machine = editable ? snapshot.value : setup.machine
+  const saved = { ...limitsOf(machine), mode: text((machine as Record<string, unknown>).mode) || 'repository' }
+  const draft = useDraft({ saved, revision: editable ? snapshot.revision : undefined,
     reload: async () => {},
     save: async (value, revision, base) => {
       const ops: Op[] = MACHINE_LIMITS.filter(key => value[key].trim() !== base[key].trim())
         .map(key => value[key].trim() ? { op: 'set', path: [key], value: Number(value[key]) } : { op: 'unset', path: [key] })
+      if (value.mode !== base.mode) ops.push({ op: 'set', path: ['mode'], value: value.mode })
       if (!form || !await form.mutate(ops, revision)) throw new Error(t('deploymentRefused'))
       notify(t('saved'))
-      return { revision: revision + 1, restarting: false }
+      return { revision: revision + 1, restarting: value.mode !== base.mode }
     } })
   const accounts = setup.accounts
   // Remote browsers (`memory` mode) are read-only; `unavailable` indicates `dsh-superagent` is still starting.
@@ -72,6 +75,14 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
           <span className="dt-field-head">{t('deploymentStateDir')}<InfoTip text={t('deploymentStateDirHint')} /></span>
           <span className="dt-mono">{setup.machine.stateDir}</span>
         </div>
+        <Field label={t('deploymentMode')} hint={t('deploymentModeHint')}>
+          <select className="dt-select" value={draft.value.mode} disabled={!editable}
+            onChange={event => draft.edit({ ...draft.value, mode: event.target.value })}>
+            <option value="repository">{t('mode.repository')}</option><option value="personal">{t('mode.personal')}</option>
+          </select>
+        </Field>
+        {draft.value.mode === 'personal' && <Hint>{t('deploymentPersonalHint')}</Hint>}
+        {draft.value.mode === 'repository' && <Hint>{t('deploymentRepositoryHint')}</Hint>}
       </Section>
       <Section title={t('deploymentLimits')} hint={t('deploymentLimitsHint')}>
         {limit('promptMaxChars', t('deploymentPromptMaxChars'))}

@@ -103,7 +103,9 @@ export const feishuKind: SourceKind<FeishuConfig> = {
       label: { zh: '立即同步', en: 'Sync now' },
       ready: part => !!part.syncChat,
       async run(host, part, signal) {
-        const commands = sourceContext(host, feishuKind).commands.withSignal(signal)
+        const context = sourceContext(host, feishuKind)
+        if (context.configured() && (context.deployment.mode ?? 'repository') === 'personal') throw new Error('Feishu Source is disabled in personal mode')
+        const commands = context.commands.withSignal(signal)
         const chat = String(part.syncChat)
         const members = ['im', '+chat-members-list', '--chat-id', chat, '--member-types', 'user', '--page-all', '--page-limit', '0']
         const result = MembersSchema.parse(await commands.lark(members))

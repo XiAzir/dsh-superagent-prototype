@@ -1,6 +1,9 @@
 import { expect, it, vi } from 'vitest'
 import { Config, type Machine } from '../src/deployment.ts'
 import { apply } from '../src/index.ts'
+import { protectStateDirectory } from '../src/infra/private-directory.ts'
+
+vi.mock('../src/infra/private-directory.ts', () => ({ protectStateDirectory: vi.fn() }))
 
 // Stub Runtime to capture the resolved Machine settings and restart callback.
 const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void }[])
@@ -32,6 +35,7 @@ it('reads a limit DSH commits a new value of without a restart, and asks DSH to 
   const { ctx, handlers, configure } = context()
   const config = Config({ stateDir: '/srv/state', promptMaxChars: 5000 })
   await apply(ctx as never, config)
+  expect(protectStateDirectory).toHaveBeenCalledWith('/srv/state')
   expect(configure).toHaveBeenCalledExactlyOnceWith({ auto: false }, ctx.fiber)
   const { machine } = runtimes.at(-1)!
   expect(machine.promptMaxChars.get()).toBe(5000)

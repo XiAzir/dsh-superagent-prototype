@@ -60,6 +60,7 @@ export class Setup {
   /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
+    if ((machine.mode ?? 'repository') === 'personal') throw new Error(`${block === 'source:feishu' ? 'Feishu' : 'GitHub'} Sources are unavailable in personal mode`)
     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
       : resolveDeployment(machine, settings.sources.github?.config, this.probe())
     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
@@ -76,6 +77,21 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
+    const machineProblem = (error: unknown): never => {
+      if (error instanceof SetupError) throw error
+      throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
+    }
+    if ((machine.mode ?? 'repository') === 'personal') {
+      const deployment = await resolveDeployment(machine, undefined, probe)
+      await writeEnvironment(deployment, settings.executor.blockedCommands).catch(machineProblem)
+      this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
+      await verifyEnvironment(deployment, context.subprocess, lifetime).catch((error: unknown) => {
+        this.restore()
+        machineProblem(error)
+      })
+      this.feishuProblem = undefined
+      return deployment
+    }
     const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
@@ -84,10 +100,6 @@ export class Setup {
       return undefined
     })
     const resolved = { ...deployment, ...(feishu ? { feishu } : {}) }
-    const machineProblem = (error: unknown): never => {
-      if (error instanceof SetupError) throw error
-      throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
-    }
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
     await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
