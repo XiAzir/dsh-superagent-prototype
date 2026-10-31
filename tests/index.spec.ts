@@ -9,10 +9,17 @@ vi.mock('../src/infra/private-directory.ts', () => ({ protectStateDirectory: vi.
 const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void }[])
 vi.mock('../src/app/runtime.ts', () => ({ Runtime: class {
   ready = Promise.resolve()
+  sources = { register: vi.fn(() => vi.fn()) }
   constructor(_ctx: unknown, readonly machine: Machine, readonly restart: () => void) { runtimes.push(this) }
   configured() { return true }
   async stop() {}
 } }))
+vi.mock('../src/app/qq-source.ts', () => ({ QqBridge: class {
+  kind = { kind: 'qq' }
+  constructor(_host: unknown) {}
+  async start() {}
+  async stop() {}
+}, QqSourceError: class extends Error {} }))
 /** Simulate the Cordis loader updating a volatile configuration reference in place. */
 const commit = (reference: unknown, value: unknown) => { (reference as Record<symbol, (value: unknown) => void>)[Symbol.for('cosmokit.volatile.write')]!(value) }
 

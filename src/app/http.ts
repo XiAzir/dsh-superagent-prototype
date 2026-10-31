@@ -28,8 +28,10 @@ import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { WebTasks, WebTaskError } from './web-tasks.ts'
+import { QqSourceError, type QqBridge } from './qq-source.ts'
 
 export interface HttpHost {
+  readonly qq?: QqBridge | undefined
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
@@ -80,6 +82,7 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number):
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof QqSourceError) return [error.status, { error: error.message }]
   if (error instanceof WebTaskError) return [error.status, { error: error.message }]
   if (error instanceof z.ZodError) {
     const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
@@ -165,6 +168,14 @@ function routes(runtime: HttpHost): Routes {
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET qq/status': () => {
+      if (!runtime.qq) throw new QqSourceError(503, 'QQ 接入模块尚未启动。')
+      return runtime.qq.status()
+    },
+    'PUT qq/token': async ({ body }) => {
+      if (!runtime.qq) throw new QqSourceError(503, 'QQ 接入模块尚未启动。')
+      return runtime.qq.setToken(z.object({ value: z.string().max(4000) }).strict().parse(await body()).value)
+    },
     'GET web/tasks': ({ query }) => {
       const parsed = z.object({ offset: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(100).default(50) }).parse(query)
       return web().list(parsed.offset, parsed.limit)

@@ -9,6 +9,20 @@ import { SetupError } from '../src/setup.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
+
+it('protects the QQ credential endpoint with the same origin check and accepts only a bounded token value', async () => {
+  const saved: string[] = []
+  const call = serve({ qq: { status: async () => ({ tokenConfigured: true }), setToken: async (value: string) => {
+    saved.push(value); return { configured: !!value }
+  } } })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token' }, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
+  expect(saved).toEqual([])
+  expect(await call('PUT', 'qq/token', { value: 'x'.repeat(4001) })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token', actor: 'forged' })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token' })).toEqual({ status: 200, body: { configured: true } })
+  expect(await call('GET', 'qq/status')).toEqual({ status: 200, body: { tokenConfigured: true } })
+  expect(saved).toEqual(['onebot-test-token'])
+})
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
   let handler: Handler = async () => {}

@@ -9,6 +9,7 @@ import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
 import type { WebTaskSummary, WebTaskView } from './web-tasks.ts'
+import type { QqStatus } from './qq-source.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -19,6 +20,8 @@ interface Paged { offset?: number; limit?: number }
 type Delivery = 'injected' | 'pending'
 
 export interface Api {
+  'GET qq/status': { response: QqStatus }
+  'PUT qq/token': { body: { value: string }; response: { configured: boolean } }
   'GET web/tasks': { query?: Paged; response: { items: WebTaskSummary[]; next_offset: number | null } }
   'GET web/tasks/:id': { response: WebTaskView }
   'POST web/tasks': { body: { text: string; requestId: string }; response: WebTaskView }

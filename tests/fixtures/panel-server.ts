@@ -20,7 +20,8 @@ import { githubChannel } from '../../src/sources/github-trigger.ts'
 import { feishuKind } from '../../src/sources/feishu.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import type { Health } from '../../src/sources/host.ts'
-import type { SourceKind } from '../../src/sources/kind.ts'
+import type { FieldSpec, SourceKind } from '../../src/sources/kind.ts'
+import { QqConfigSchema } from '../../src/app/qq-source.ts'
 import { testDeployment } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
@@ -79,7 +80,26 @@ export const droppedReply = (id: string, hoursAgo: number, source: 'feishu' | 'g
 const dayAgo = () => new Date(Date.now() - 86_400_000).toISOString()
 export const problemOf = (code: SetupCode, values: Record<string, string> = {}) => new SetupError(code, values).problem
 // The kinds' configurations differ, and the fake reads them only as the records the views carry.
-const KINDS = [feishuKind, githubKind] as unknown as SourceKind[]
+const qqLabel = (zh: string, en: string) => ({ zh, en })
+const qqFields: FieldSpec[] = [
+  { key: 'connection', type: 'select', label: qqLabel('连接方式', 'Connection'), options: [
+    { value: 'forward', label: qqLabel('正向 WebSocket', 'Forward WebSocket') },
+    { value: 'reverse', label: qqLabel('反向 WebSocket', 'Reverse WebSocket') }] },
+  { key: 'url', type: 'text', label: qqLabel('NapCat WebSocket 地址', 'NapCat WebSocket URL') },
+  { key: 'privateMessages', type: 'switch', label: qqLabel('接收已授权账号的私聊', 'Receive authorized private messages') },
+  { key: 'groups', type: 'rows', label: qqLabel('接收的 QQ 群', 'Allowed groups'), columns: [
+    { key: 'id', type: 'text', label: qqLabel('群号', 'Group ID') }, { key: 'name', type: 'text', optional: true, label: qqLabel('名称', 'Name') }] },
+  { key: 'commandPrefix', type: 'text', label: qqLabel('交办命令前缀', 'Command prefix') },
+  { key: 'sessionMinutes', type: 'number', label: qqLabel('会话窗口 / 分钟', 'Session window / minutes'), min: 1, max: 1440 },
+  { key: 'groupFollowups', type: 'select', label: qqLabel('群聊追问关联', 'Group follow-ups'), options: [
+    { value: 'reply', label: qqLabel('引用回复原消息', 'Quoted replies') },
+    { value: 'sender-window', label: qqLabel('同一发送者的会话窗口', 'Sender session window') }] },
+  { key: 'replyChunkSize', type: 'number', label: qqLabel('每段回复字符数', 'Reply chunk characters'), min: 200, max: 4000 },
+  { key: 'maxReplyChunks', type: 'number', label: qqLabel('每条回复最多分段数', 'Maximum reply chunks'), min: 1, max: 50 },
+]
+const qqKind = { kind: 'qq', title: qqLabel('QQ · NapCat', 'QQ · NapCat'), description: qqLabel('NapCat OneBot v11', 'NapCat OneBot v11'),
+  schema: QqConfigSchema, health: ['qq'], fields: qqFields } as unknown as SourceKind
+const KINDS = [feishuKind, githubKind, qqKind] as unknown as SourceKind[]
 export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000, admissionContextMaxPages: 10,
   admissionContextTimeoutMs: 15000 }
 
@@ -109,6 +129,9 @@ export interface PanelServer {
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
   webTasks: { items: ApiResponse<'GET web/tasks'>['items']; records: Record<string, ApiResponse<'GET web/tasks/:id'>> }
+  qqStatus: ApiResponse<'GET qq/status'>
+  qqToken?: string
+  qqTokenError?: string
 }
 export let server: PanelServer
 
@@ -235,11 +258,11 @@ function threadPage(key: string, { before, around }: { before?: string; around?:
 function initial(): PanelServer {
   const settings = SettingsSchema.parse({
     policy: { sources: { feishu: { allowed: [{ id: 'ou_alice', name: 'Alice' }], syncChat: 'oc_team' },
-      github: { allowed: [{ id: 'alice' }] } },
+      github: { allowed: [{ id: 'alice' }] }, qq: { allowed: [] } },
       rules: [{ id: 'copy', name: '文案修改', enabled: true, instruction: '修正明确的文案错误' }] },
     sources: { feishu: { enabled: true, config: { cli: 'lark-bot', chats: [{ chatId: 'oc_team', listen: 'mentions' }],
       directMessages: true } },
-      github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } } },
+      github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } }, qq: { enabled: false, config: {} } },
     executor: { blockedCommands: ['gh-personal'] },
   })
   const ended = ticketSummary({ id: 't0', title: '旧工单', state: 'ended', actions: { retry: false, stop: false },
@@ -253,6 +276,8 @@ function initial(): PanelServer {
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
     settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
+    qqStatus: { enabled: false, mode: 'forward', state: 'disabled', detail: 'QQ 来源已关闭。', forwardUrl: 'ws://127.0.0.1:3001',
+      reverseUrl: 'ws://127.0.0.1:6199/onebot/v11/ws', tokenConfigured: false, allowedUsers: 0, groups: 0, received: 0 },
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
@@ -292,6 +317,13 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET qq/status': { answer: () => ({ ...server.qqStatus, tokenConfigured: !!server.qqToken || server.qqStatus.tokenConfigured }) },
+  'PUT qq/token': { body: true, answer: ({ body }) => {
+    if (server.qqTokenError) return refuse(500, server.qqTokenError)
+    server.qqToken = body.value
+    server.qqStatus = { ...server.qqStatus, tokenConfigured: !!body.value }
+    return { configured: !!body.value }
+  } },
   'GET web/tasks': { query: ['offset', 'limit'], answer: ({ query }) => {
     const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
     return { items: server.webTasks.items.slice(offset, offset + limit), next_offset: offset + limit < server.webTasks.items.length ? offset + limit : null }
