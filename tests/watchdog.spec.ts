@@ -7,7 +7,7 @@ import { once } from 'node:events'
 import { expect, it } from 'vitest'
 import { registerHttp, type HttpHost } from '../src/app/http.ts'
 import { baselineAssessment, watchdogSnapshot } from '../src/app/watchdog.ts'
-import { loopbackUrl, runCommand, watchdogOnce } from '../scripts/dsh-superagent-watchdog.mjs'
+import { assessorInput, loopbackUrl, runCommand, watchdogOnce } from '../scripts/dsh-superagent-watchdog.mjs'
 
 const SCRIPT = resolve('scripts/dsh-superagent-watchdog.mjs')
 const hostName = '127.0.0.1'
@@ -17,6 +17,16 @@ it('restricts the Watchdog target to a loopback HTTP origin', () => {
   expect(loopbackUrl('http://localhost:3082/')).toBe('http://localhost:3082')
   for (const url of ['https://127.0.0.1:3082', 'http://example.com', 'http://127.0.0.1:3082/path',
     'http://user:pass@127.0.0.1:3082', 'http://127.0.0.1:3082/?token=x']) expect(() => loopbackUrl(url)).toThrow()
+})
+
+it('redacts quoted credential fields and structured secret keys before assessor input', () => {
+  const serialized = assessorInput({ schema: 1, observedAt: '', infrastructure: { configured: true, paused: false,
+    health: { runtime: { state: 'ready', detail: '{"app_secret":"json-secret-value", "api_key": "key-secret-value"} token="quoted-token-value"' } },
+    executor: { activeWorkers: 0, maxWorkers: 1 }, tickets: [{ id: 't', token: 'structured-token-value', app_secret: 'structured-app-secret-value' }], candidates: [] })
+  for (const secret of ['json-secret-value', 'key-secret-value', 'quoted-token-value', 'structured-token-value', 'structured-app-secret-value']) {
+    expect(serialized).not.toContain(secret)
+  }
+  expect(serialized).toContain('[redacted]')
 })
 
 it('builds bounded snapshots that distinguish completion, human waits, stops and review candidates', () => {

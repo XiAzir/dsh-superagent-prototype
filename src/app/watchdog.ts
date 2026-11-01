@@ -47,7 +47,7 @@ export interface WatchdogTicket {
 const redact = (value: string): string => value
   .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[redacted]')
   .replace(/\b((?:gh[pousr]_|github_pat_|xox[baprs]-|sk-)[A-Za-z0-9_-]{12,})\b/g, '[redacted]')
-  .replace(/\b(token|secret|password|passwd|authorization|api[_-]?key)(\s*[:=]\s*)([^\s,;]+)/gi, '$1$2[redacted]')
+  .replace(/(["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|app[_-]?secret|client[_-]?secret|private[_-]?key|password|passwd|authorization|api[_-]?key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gi, '$1"[redacted]"')
   .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[redacted]@')
 const compact = (value: string, max = 600): string => redact(value).replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, max)
 const safeHealth = (health: Readonly<Record<string, Health>>) => Object.fromEntries(Object.entries(health).map(([name, value]) => [name,

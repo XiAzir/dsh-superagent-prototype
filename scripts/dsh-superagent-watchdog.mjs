@@ -41,7 +41,7 @@ function validateAssessment(value) {
 function redactText(value) {
   return value.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[redacted]')
     .replace(/\b((?:gh[pousr]_|github_pat_|xox[baprs]-|sk-)[A-Za-z0-9_-]{12,})\b/g, '[redacted]')
-    .replace(/\b(token|secret|password|passwd|authorization|api[_-]?key)(\s*[:=]\s*)([^\s,;]+)/gi, '$1$2[redacted]')
+    .replace(/(["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|app[_-]?secret|client[_-]?secret|private[_-]?key|password|passwd|authorization|api[_-]?key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/gi, '$1"[redacted]"')
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[redacted]@')
 }
 
@@ -53,7 +53,9 @@ export function assessorInput(snapshot) {
 function redactSnapshot(value) {
   if (typeof value === 'string') return redactText(value)
   if (Array.isArray(value)) return value.map(redactSnapshot)
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSnapshot(item)]))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+    [key, /^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|app[_-]?secret|client[_-]?secret|private[_-]?key|password|passwd|authorization|api[_-]?key)$/i.test(key)
+      ? '[redacted]' : redactSnapshot(item)]))
   return value
 }
 
@@ -177,9 +179,9 @@ async function recoverIfAllowed(options, state, commandRunner, emit) {
   try {
     const result = await commandRunner(managerCommand(options), { timeoutMs: options.managerTimeoutMs, maxOutput: 32 * 1024, signal: options.signal })
     recovery.lastResult = 'ok'; recovery.lastAt = new Date(now).toISOString()
-    return { attempted: true, result: 'ok', output: result.stdout.slice(0, 2000), attempt: recovery.attempts }
+    return { attempted: true, result: 'ok', output: redactText(result.stdout).slice(0, 2000), attempt: recovery.attempts }
   } catch (error) {
-    recovery.lastResult = 'failed'; recovery.lastError = String(error).slice(0, 1000); recovery.lastAt = new Date(now).toISOString()
+    recovery.lastResult = 'failed'; recovery.lastError = redactText(String(error)).slice(0, 1000); recovery.lastAt = new Date(now).toISOString()
     return { attempted: true, result: 'failed', error: recovery.lastError, attempt: recovery.attempts }
   }
 }
@@ -197,14 +199,14 @@ export async function watchdogOnce(options) {
     snapshot = await getSnapshot(merged.url, merged.timeoutMs, merged.fetchImpl, merged.signal)
   } catch (caught) {
     if (merged.signal?.aborted) return { report: { status: 'waiting', cancelled: true }, changed: false, exitCode: 0 }
-    error = String(caught instanceof Error ? caught.message : caught)
+    error = redactText(String(caught instanceof Error ? caught.message : caught))
     errorKind = 'snapshot'
   }
   if (snapshot) try {
     assessment = await assess(snapshot, merged.assessorCommand, merged.timeoutMs, merged.commandRunner, merged.signal)
   } catch (caught) {
     if (merged.signal?.aborted) return { report: { status: 'waiting', cancelled: true }, changed: false, exitCode: 0 }
-    error = String(caught instanceof Error ? caught.message : caught)
+    error = redactText(String(caught instanceof Error ? caught.message : caught))
     errorKind = 'assessor'
   }
   if (error) assessment = { status: 'stalled', semanticReview: merged.assessorCommand ? 'configured' : 'not_configured',
@@ -227,9 +229,9 @@ export async function watchdogOnce(options) {
         method: 'POST', headers: { 'x-orchestrator-request': '1', 'content-type': 'application/json' }, body: '{}',
         signal: AbortSignal.any([AbortSignal.timeout(merged.timeoutMs), ...(merged.signal ? [merged.signal] : [])]) })
       const result = response.ok ? await response.json() : { requested: false, error: `HTTP ${response.status}` }
-      nudgeResults.push({ ticketId, ...result })
+      nudgeResults.push(redactSnapshot({ ticketId, ...result }))
       if (result.requested === true) sentNudges[ticketId] = merged.now()
-    } catch (caught) { nudgeResults.push({ ticketId, requested: false, error: String(caught).slice(0, 500) }) }
+    } catch (caught) { nudgeResults.push({ ticketId, requested: false, error: redactText(String(caught)).slice(0, 500) }) }
   }
   const key = fingerprint(snapshot ?? { infrastructure: { error }, tickets: [], candidates: [] }, assessment)
   const failureFingerprint = error ? `${errorKind}:${key}` : undefined
@@ -244,11 +246,11 @@ export async function watchdogOnce(options) {
   state.lastRecoveryNotice = recoveryNotice
   state.lastSeenAt = new Date(merged.now()).toISOString()
   await saveState(merged.stateFile, state)
-  const report = { profile: merged.profile, status: assessment.status, ...(error ? { error, errorKind } : {}), ...(recoveredFrom ? { recovered: true } : {}),
+  const report = redactSnapshot({ profile: merged.profile, status: assessment.status, ...(error ? { error, errorKind } : {}), ...(recoveredFrom ? { recovered: true } : {}),
     ...(snapshot ? { observedAt: snapshot.observedAt, infrastructure: snapshot.infrastructure, executor: snapshot.executor,
       ticketCount: snapshot.tickets.length, candidateCount: snapshot.candidates.length } : {}), findings: assessment.findings,
     ...(assessment.semanticReview ? { semanticReview: assessment.semanticReview } : {}), ...(recovery.attempted || recovery.skipped ? { recovery } : {}),
-    ...(nudgeResults.length ? { nudges: nudgeResults } : {}) }
+    ...(nudgeResults.length ? { nudges: nudgeResults } : {}) })
   if (changed) await merged.emit(report)
   return { report, changed, exitCode: assessment.status === 'healthy' ? 0 : assessment.status === 'waiting' ? 2 : 3 }
 }
