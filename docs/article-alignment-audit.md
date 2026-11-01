@@ -4,6 +4,14 @@
 
 依据：[《Super-agent 设计探索：迈向更自主的 Agent 系统》](https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg)。原文以逻辑职责划分和系统机制为主，并在结语明确开源插件只实现其中部分设计。下面分别记录现有机制、此次修复和部署条件。
 
+## 本轮复审修订与取舍
+
+本轮按原文的逻辑 Router、独立 Worker、事件订阅、Inline & Spill 和外部监督继续完善现有实现。QQ/Web 的统一聊天入口增加 `routing: router`：先确定消息要求的动作，纯查询只读取状态，工作补充再 attach。候选中的 `matched_tickets` 表示关联线索，`delivered_to` 记录实际交付，避免把查询关联当成执行输入。原始消息继续按引用传给 Worker。
+
+这是普通聊天交互的路由扩展：消息已引用某个任务，仍可能只是在询问进展。代价是 QQ/Web 人类候选会经过 Router 意图判断；来源授权、群范围和闲聊过滤继续走确定性代码，Session 事件批处理继续生效。PR/CI 等已订阅环境事件保留原文的多对多直通和 handback。后续可把经实测稳定的高频交互判断固化为 Fast Path。
+
+回复在持久化 receipt 后立即返回，实际发送异步确认；同工单和会话内保序，不同工单可并行，交互状态保留独立发送槽。Worker 的确认消息只等待自身回执。Watchdog 增强了所有输出路径的脱敏、进程树有界清理、活跃任务优先的稳定分页及跨页静默去重；独立模型判断继续通过外部 assessor 接口选配。Web 历史列表采用事务同步的摘要索引和数据库分页。完整媒体交付当前推荐同机部署，跨机的字节传输与路径映射列入后续适配。
+
 ## 逐章对照
 
 | 原文章节 | 设计要求 | 审查结果与处理 | 实现与验收入口 |
@@ -13,7 +21,7 @@
 | §2.1、§7.2 | 单常驻 Router 可以合并推理期间积压的事件 | 保留 Session inbox steering、每 Thread pending 批处理、多项 route 决定和 durable assessment effect；现有测试验证逻辑聚批和顺序；性能数值以实际负载实测为准 | `src/core/evals.ts`、`src/app/assessment.ts`、`src/app/delivery.ts`；`tests/core-engine.spec.ts`、`tests/delivery.spec.ts` |
 | §2.2 | Worker 上下文隔离，可自行组织 subagent；关键结论统一回 Router | 保留每工单目录、会话和并发配额；QQ 附件获取、产物上传由来源适配器完成，Worker 登记报告和产物；后台作业和 subagent 随 Assignment 停止 | `src/app/tools/executor.ts`、`src/app/artifacts.ts`、`src/executor/background.ts`；`tests/qq-source.spec.ts`、`tests/background.spec.ts` |
 | §3.1 | 确定性代码先过滤来源、身份与群范围，再做语义判断 | 保留 Source scope、策略 gate、人工显式请求及观察/自动模式；QQ 先过滤机器人、自身消息、未授权发送者和群，普通群闲聊默认过滤 | `src/core/intake.ts`、`src/core/evals.ts`、`src/policy.ts`、`src/app/qq-source.ts`；`tests/policy.spec.ts`、`tests/qq-source.spec.ts` |
-| §3.2 | 归属确定的 Thread 直通订阅 Worker，新任务和跨任务消息由 Router 决定 | 保留多对多订阅、context-only 跟随、handback；修复 QQ 将窗口内所有私聊强行归为同任务的问题：默认无引用消息进入语义路由，已知引用继续直通；发送者窗口模式可显式选用 | `src/app/qq-threads.ts`、`src/app/links.ts`；`tests/qq-threads.spec.ts`、`tests/qq-source.spec.ts`、`tests/followups.spec.ts` |
+| §3.2 | 归属确定的 Thread 直通订阅 Worker，新任务和跨任务消息由 Router 决定 | PR/CI 等环境事件保留多对多订阅、context-only 和 handback；QQ/Web 交互先选动作，状态查询只读，执行补充再 attach；保留语义私聊归属和发送者窗口选项，具体取舍见上节 | `src/app/qq-threads.ts`、`src/app/links.ts`、`src/core/intake.ts`；`tests/qq-source.spec.ts`、`tests/conversational-status.spec.ts`、`tests/followups.spec.ts` |
 | §3.3 | 对象有唯一 ID，关联引用逐跳展开，长内容 Spill | 保留 Trigger→Thread→Ticket→Assignment/Session/Report 的资源链、分页和权限；补齐附件稳定引用、近邻文件上下文、产物 ID，以及状态报告的 600 字摘要和完整报告读取入口 | `src/app/cards.ts`、`src/app/resources.ts`、`src/core/replies.ts`；`tests/cards.spec.ts`、`tests/tools.spec.ts`、`tests/core-engine.spec.ts` |
 | §3.3 | 按任务需要读取真实上下文 | QQ 保留 file_id、名称、大小等字段，按引用解析 NapCat API 并获取字节；图片进入视觉工具输出；视频提供有界抽帧、时间点及采样范围；模型能力不足时返回明确状态 | `src/sources/qq-attachments.ts`、`src/sources/qq-media.ts`；`tests/qq-attachments.spec.ts`、`tests/qq-media.spec.ts`、`tests/qq-source.spec.ts` |
 | §3.4 | 根据环境信号提前行动，有价值再交付 | 保留书面规则授权的 inferred admission、observe→auto 渐进启用和静默回执策略；策略可要求后台复现/起草并静默放弃。额外对外操作继续遵守原授权及各来源交付规则 | `src/core/evals.ts`、`prompts/admission.md`、`src/app/assessment.ts`；`tests/assessment.spec.ts`、`tests/policy.spec.ts` |
@@ -28,7 +36,21 @@
 | §8.3 | 共享与隔离范围明确，A2A 可独立探索 | 保留工单读取权限、context-only 标记、子代理继承工单工具限制、停止任务后工具封锁；本次近邻上下文限定同机器人/聊天/发送者/时间窗口，并只读一跳展开 | `src/app/resources.ts`、`src/app/qq-threads.ts`、`src/app/sessions.ts`；`tests/tools.spec.ts`、`tests/runtime.spec.ts` |
 | §8.4 | 不可信事件与凭据暴露面需要系统约束 | QQ token 留在宿主适配器；附件按授权引用读取，检查大小/路径/URL/取消；产物按工单目录快照并校验 SHA-256；新增 CLI 凭据导出和改号命令防护；Watchdog 快照和模型输入脱敏 | `src/sources/qq-attachments.ts`、`src/app/artifacts.ts`、`src/infra/credential-guard.ts`；`tests/artifacts.spec.ts`、`tests/environment.spec.ts`、`tests/watchdog.spec.ts` |
 
-## 模块提交
+## 本轮复审提交
+
+| 模块 | 提交 |
+| --- | --- |
+| Watchdog 全路径凭据脱敏 | `91633b0` |
+| Watchdog 进程树有界清理 | `417db9e` |
+| Watchdog 活跃任务优先分页 | `bcb461b` |
+| 异步回复、交互发送槽与回执读取 | `4c4f24a` |
+| QQ/Web 只读状态查询、显式工作投递 | `87e8d71` |
+| Web 摘要索引与事务分页 | `49aa682` |
+| Watchdog 清理收尾、稳定分页与静默去重 | `d3e6f6f` |
+| 状态查询审计文案 | `c1fd8e5` |
+| Worker 确认只等待自身回执 | `cb6115f` |
+
+## 前一轮模块提交
 
 | 模块 | 提交 |
 | --- | --- |
@@ -48,11 +70,11 @@
 
 ## 验收范围与运行条件
 
-最终门禁：`pnpm test -- --reporter=dot` 共 73 个测试文件通过、1 个按环境跳过；1284 项通过、24 项跳过。`pnpm typecheck` 和 `pnpm build` 通过。Windows wrapper 的 5 项专属用例实际执行；POSIX 专属用例在 Windows 跳过。测试保持原 Router/Worker 提示词字符预算。
+本轮最终门禁：`pnpm exec vitest run --reporter=dot` 共 74 个测试文件通过、1 个按环境跳过；1307 项通过、25 项跳过。`pnpm typecheck` 和 `pnpm build` 通过。Windows wrapper 的 5 项专属用例实际执行；POSIX 专属用例在 Windows 跳过。测试保持原 Router/Worker 提示词字符预算。
 
-- OneBot 测试使用真实本地 WebSocket 协议及 Runtime，验证读取实际文件字节、授权撤销、原文件变化后的快照、上传确认和重试；保持线上 QQ 对话安静。
+- OneBot 测试使用真实本地 WebSocket 协议及 Runtime，验证读取实际文件字节、授权撤销、原文件变化后的快照、上传确认和重试，以及引用已完成任务询问状态时保留原执行状态；Web 的同类查询使用真实 Engine 验证。线上 QQ 收发验收留待重启原 profile 后执行。
 - 图片链路验证实际 PNG 字节进入工具视觉块；视频链路使用真实 FFmpeg 音视频 fixture，验证帧数量、时间顺序、尺寸和消息字节上限。视频提供采样画面，音频转录另行执行。
-- Watchdog 测试启动独立短时进程，验证取消、网络超时、模型 assessor 故障隔离、静默去重、状态恢复、nudge 冷却、有限恢复和手动停止保护。独立模型会话通过 assessor 命令接入；持续调度和自动恢复由操作者选配。
+- Watchdog 测试启动独立短时进程，验证取消、超时与输出超限后的进程树清理、清理失败时资源释放、模型 assessor 故障隔离、分页覆盖、跨页静默去重、状态恢复、nudge 冷却、有限恢复和手动停止保护。独立模型会话通过 assessor 命令接入；持续调度和自动恢复由操作者选配。
 - 同一 OS 用户的 Worker 仍拥有该用户的执行权限。当前 CLI 防护降低常见凭据暴露面；强凭据隔离需要独立 OS 权限或操作级 broker。云端存储与跨设备 daemon 同样需要独立部署配置。
 - 构建产物更新后，重启 DSH profile 可加载运行时代码和 preset 改动。保留已有数据库和任务状态。
-- 本轮只读检查确认现有本机 DSH 处于个人模式、运行和排队工单均为 0；当前宿主仍加载旧运行时代码，重启原终端中的 profile 后生效。
+- 本轮保留已有生产进程。最终构建已更新本地插件产物，重启原终端中的 profile 后加载新代码。

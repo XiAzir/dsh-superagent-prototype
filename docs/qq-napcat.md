@@ -48,7 +48,7 @@ NapCat 配置文件对应 `network.websocketServers[]`，常用字段为 `enable
 2. 在 NapCat WebUI 中创建并启用 **WebSocket 客户端**，目标 URL 填 `ws://127.0.0.1:6199/onebot/v11/ws`。
 3. 消息格式选择 `array`，应用配置。
 
-NapCat 配置文件对应 `network.websocketClients[]`，常用字段为 `enable`、`url`、`messagePostFormat`、`token`、`reconnectInterval` 和 `heartInterval`。当前反向监听使用回环地址，适合部署在同一台机器；跨机器部署可以使用正向模式连接可达的 NapCat 服务。
+NapCat 配置文件对应 `network.websocketClients[]`，常用字段为 `enable`、`url`、`messagePostFormat`、`token`、`reconnectInterval` 和 `heartInterval`。当前反向监听使用回环地址，适合部署在同一台机器。当前推荐 Superagent 与 NapCat 同机运行，完整支持文字及文件、图片、视频产物交付。正向模式可跨机器连接消息事件和文字回复；文件与媒体产物通过 Superagent 本机绝对路径交给 NapCat，完整产物交付依赖两端都能读取相同路径。分机部署的字节传输或路径映射适配仍需另行实现。
 
 ## 3. 保存访问令牌与授权范围
 
