@@ -57,6 +57,34 @@ describe('worker shims', () => {
     expect([(await exec(join(bin, 'gh'), ['api', 'user'])).stdout, (await exec(join(bin, 'lark-cli'), ['im'])).stdout]).toEqual(['gh api user\n', 'lark im\n'])
     expect(readdirSync(bin)).not.toContain('git')
   })
+  itPosix('blocks GitHub credential export/account changes and Lark auth/config before the configured CLI runs', async () => {
+    const marker = join(dir, 'called')
+    const gh = program(join(dir, 'gh-agent'), `printf '%s\\n' "$*" >> '${marker}'`)
+    const lark = program(join(dir, 'lark-bot'), `printf '%s\\n' "$*" >> '${marker}'`)
+    const base = testDeployment()
+    await writeEnvironment(testDeployment({ stateDir: dir, github: { ...base.github!, cli: gh }, feishu: { ...base.feishu!, cli: lark } }), [])
+    const bin = workerBin(dir)
+    const denied = [
+      ['gh', ['auth', 'token']], ['gh', ['auth', 'git-credential', 'get']],
+      ['gh', ['auth', 'status', '--show-token']], ['gh', ['auth', 'status', '-t']],
+      ['gh', ['auth', 'login', '--with-token', 'credential-fixture-must-not-echo']],
+      ...['login', 'logout', 'switch', 'refresh', 'setup-git'].map(action => ['gh', ['auth', action]] as [string, string[]]),
+      ['lark-cli', ['auth', 'status']], ['lark-cli', ['auth', 'login']], ['lark-cli', ['config', 'strict-mode', 'user', '--global']],
+    ] as [string, string[]][]
+    for (const [command, args] of denied) {
+      await expect(exec(join(bin, command), args)).rejects.toMatchObject({ code: 1 })
+      expect(existsSync(marker)).toBe(false)
+    }
+    const refusal = await exec(join(bin, 'gh'), ['auth', 'login', '--with-token', 'credential-fixture-must-not-echo']).catch((error: unknown) => error as { stderr?: string })
+    expect(refusal.stderr).not.toContain('credential-fixture-must-not-echo')
+    await expect(exec(join(bin, 'gh'), ['--hostname', 'github.com', 'auth', 'status'])).resolves.toMatchObject({ stdout: 'auth status\n' })
+    await expect(exec(join(bin, 'gh'), ['pr', 'list'])).resolves.toMatchObject({ stdout: 'pr list\n' })
+    await expect(exec(join(bin, 'gh'), ['api', 'user'])).resolves.toMatchObject({ stdout: 'api user\n' })
+    await expect(exec(join(bin, 'lark-cli'), ['api', 'GET', '/open-apis/bot/v3/info'])).resolves.toMatchObject({ stdout: 'api GET /open-apis/bot/v3/info\n' })
+    expect(readFileSync(marker, 'utf8').trim().split('\n')).toEqual([
+      'auth status', 'pr list', 'api user', 'api GET /open-apis/bot/v3/info',
+    ])
+  })
   itPosix('replace only what dsh-superagent wrote and refuse anything else in its places', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli'])
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
@@ -95,6 +123,26 @@ describe('Windows worker wrappers', () => {
     const { stdout } = await exec(invocation.file, invocation.args, { env: { ...process.env, PATH: [bin, process.env.PATH].join(';') }, timeout: 10_000 })
     expect(JSON.parse(stdout)).toEqual(args)
     expect(readFileSync(join(bin, 'gh.ps1'), 'utf8')).toContain(Buffer.from(target, 'utf16le').toString('base64'))
+  })
+  itWindows('rejects credential/account commands before the configured CLI and preserves allowed argv', async () => {
+    const marker = join(dir, 'called.jsonl')
+    const target = join(dir, 'agent gh.ps1')
+    const cmd = target.replace(/\.ps1$/i, '.cmd')
+    const markerLiteral = marker.replaceAll("'", "''")
+    writeFileSync(target, `param([Parameter(ValueFromRemainingArguments=$true)][string[]]$ArgList)\r\n[IO.File]::AppendAllText('${markerLiteral}', (ConvertTo-Json -InputObject ([string[]]$ArgList) -Compress) + [Environment]::NewLine)\r\n`)
+    writeFileSync(cmd, '@echo off\r\nREM paired entry\r\n')
+    const base = testDeployment()
+    await writeEnvironment(testDeployment({ stateDir: dir, github: { ...base.github!, cli: cmd }, feishu: undefined }), [])
+    const bin = workerBin(dir)
+    for (const args of [['auth', 'token'], ['auth', 'status', '--show-token'], ['auth', 'status', '-t'], ['auth', 'switch']]) {
+      const invocation = commandInvocation(join(bin, 'gh.cmd'), args)
+      await expect(exec(invocation.file, invocation.args)).rejects.toMatchObject({ code: 1 })
+      expect(existsSync(marker)).toBe(false)
+    }
+    const args = ['api', 'repos/acme/repo/issues', '--jq', '.title == "a b"', 'semi;colon', 'amp&pipe|paren()']
+    const invocation = commandInvocation(join(bin, 'gh.cmd'), args)
+    await exec(invocation.file, invocation.args)
+    expect(JSON.parse(readFileSync(marker, 'utf8'))).toEqual(args)
   })
   itWindows('writes paired owned shims and refuses foreign files without weakening marker checks', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['GH.CMD', 'Git.EXE', 'LARK-CLI.PS1', 'personal-cli.cmd', 'PERSONAL-CLI'])

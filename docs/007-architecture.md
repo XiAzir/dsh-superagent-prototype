@@ -376,6 +376,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/onebot-message.ts` | OneBot v11 event decoding, QQ message segments, attachment markers, and message normalization |
 | `src/sources/qq-attachments.ts` | Bounded credential-backed NapCat attachment resolution and byte transfer |
 | `src/sources/qq-media.ts` | Image modality checks and bounded timestamped video frames for model-visible media |
+| `src/infra/credential-guard.ts` | Worker CLI argv guard against credential export and account changes |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |

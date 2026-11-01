@@ -11,6 +11,7 @@ import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 import { commandEnvironment, windowsCommandTarget } from './platform.ts'
+import { CREDENTIAL_GUARD_PROGRAM } from './credential-guard.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 const WINDOWS_MARKER = 'REM Written by dsh-superagent on every start; edits are lost.'
@@ -83,7 +84,8 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
 
 /**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
- * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
+ * Each shim strips the shim directory from PATH, applies the credential/account guard, then runs the real CLI.
+ * This is a default-PATH guardrail: workers run as the operator's OS user, whose home-directory files remain readable.
  */
 export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
@@ -107,7 +109,12 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
         "$env:PATH = (($env:PATH -split ';' | Where-Object { $_ -and [IO.Path]::GetFullPath($_).TrimEnd('\\') -ine $self }) -join ';')",
         `$value = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'))`,
         ...('program' in windowsAction
-          ? ['& $value @args', 'exit $LASTEXITCODE']
+          ? [
+            `$guard = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(CREDENTIAL_GUARD_PROGRAM, 'utf8').toString('base64')}'))`,
+            `& node -e $guard '${name}' @args`,
+            'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+            '& $value @args', 'exit $LASTEXITCODE',
+          ]
           : ['[Console]::Error.WriteLine($value)', 'exit 1']),
       ].join('\r\n') + '\r\n'
       const cmd = join(dir, `${name}.cmd`)
@@ -132,10 +139,11 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const guard = (name: string): string => `node -e ${shellQuote(CREDENTIAL_GUARD_PROGRAM)} ${shellQuote(name)} "$@" || exit $?`
+  const run = (name: string, program: string): string => `${withoutShims}\n${guard(name)}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', github ? run(github.cli) : fail('gh is unavailable: this installation has no GitHub Source.'), github ? { program: github.cli } : { message: 'gh is unavailable: this installation has no GitHub Source.' })
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'), feishu ? { program: feishu.cli } : { message: 'lark-cli is unavailable: this installation has no Feishu bot.' })
+  await shim('gh', github ? run('gh', github.cli) : fail('gh is unavailable: this installation has no GitHub Source.'), github ? { program: github.cli } : { message: 'gh is unavailable: this installation has no GitHub Source.' })
+  await shim('lark-cli', feishu ? run('lark-cli', feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'), feishu ? { program: feishu.cli } : { message: 'lark-cli is unavailable: this installation has no Feishu bot.' })
   const blocked = new Set<string>()
   for (const configuredName of blockedCommands) {
     const name = process.platform === 'win32'
