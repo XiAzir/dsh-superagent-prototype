@@ -53,14 +53,14 @@ async function runBounded(binary: string, args: string[], timeoutMs = 12_000): P
   })
 }
 
-function mockAgent(modalities: string[] = ['text', 'image'], limits = { maxImageBytes: 4_000_000, maxMessageImageBytes: 4_000_000 }) {
+function mockAgent(modalities: string[] | null = ['text', 'image'], limits = { maxImageBytes: 4_000_000, maxMessageImageBytes: 4_000_000 }) {
   const ctx = new Context()
   let count = 0
   const saveImage = vi.fn(async ({ data, mediaType, name }: { data: Uint8Array; mediaType: string; name?: string }) => ({
     attachmentId: `img-${++count}`, mediaType, bytes: data.byteLength, ...(name ? { name } : {}),
   }))
   ctx.reflect.provide('attachments', { saveImage, imageLimits: limits })
-  ctx.reflect.provide('llm', { resolveModelInfo: vi.fn(async () => ({ inputModalities: modalities })) })
+  ctx.reflect.provide('llm', { resolveModelInfo: vi.fn(async () => modalities === null ? {} : { inputModalities: modalities }) })
   const agent = { ctx, session: { requestHeader: () => ({ config: { provider: 'test-provider', model: 'test-model' } }) }, options: {} } as unknown as Agent
   return { agent, saveImage }
 }
@@ -86,6 +86,16 @@ it('refuses invalid image bytes and reports unavailable modality without saving'
   const unavailable = await readQqMedia(noImage.agent, { id: 'no-modality', type: 'image', status: 'downloaded', path }, new AbortController().signal)
   expect(unavailable.understanding).toMatchObject({ status: 'unavailable' })
   expect(noImage.saveImage).not.toHaveBeenCalled()
+})
+
+it('keeps image input available when a custom provider omits modality metadata, matching DSH', async () => {
+  const dir = await workdir(), path = join(dir, 'image.png')
+  await writeFile(path, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9V0AAAAASUVORK5CYII=', 'base64'))
+  const { agent, saveImage } = mockAgent(null)
+  const result = await readQqMedia(agent, { id: 'custom-provider', type: 'image', status: 'downloaded', path }, new AbortController().signal)
+  expect(result.understanding).toMatchObject({ status: 'visual_input_ready', media: 'image' })
+  expect(result.images).toEqual([expect.objectContaining({ attachmentId: 'img-1', mediaType: 'image/png' })])
+  expect(saveImage).toHaveBeenCalledTimes(1)
 })
 
 it('extracts at most six ordered bounded frames and labels video coverage', async () => {

@@ -43,7 +43,8 @@ async function imageCapability(agent: Agent, signal: AbortSignal): Promise<strin
   const route = modelRoute(agent), llm = agent.ctx.get('llm')
   if (!route || !llm) return '当前模型路由不可用，无法确认图片输入能力'
   const info = await llm.resolveModelInfo(route.provider, route.model, signal)
-  return info.inputModalities?.includes('image') ? undefined : `当前模型 ${route.model} 不支持图片输入`
+  // Match DSH's attachment contract: an omitted capability list leaves the custom provider's input route available.
+  return info.inputModalities !== undefined && !info.inputModalities.includes('image') ? `当前模型 ${route.model} 不支持图片输入` : undefined
 }
 
 async function binaryCandidates(kind: 'ffmpeg' | 'ffprobe'): Promise<string[]> {
