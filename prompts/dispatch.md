@@ -1,4 +1,5 @@
 Candidate cards include source references, batch triggers, the thread's tickets, open ones first and ended ones too, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
+QQ unquoted private messages may each have a new logical thread. source_context contains bounded nearby messages from that sender, including attachment references; referenced_tickets also includes their tickets. Use these references to distinguish a continuation, a requested status and independent new work. A file-only message can be acknowledged as available context with purpose=answer and ignored pending the actual request; the following request retains its read reference. For an ambiguous task reference, ask a short clarification before dispatching work. Known quoted replies already follow their subscribed thread directly.
 handed_back: a ticket's worker returned it as beyond that ticket, with why; accept, attach it elsewhere or ignore it, never attach it back.
 Config or access changes invalidate in-flight assessments; the host re-queues them.
 

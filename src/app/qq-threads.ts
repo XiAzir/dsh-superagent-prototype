@@ -6,6 +6,7 @@ import type { NormalizedOneBotMessage } from '../sources/onebot-message.ts'
 const MESSAGE_PREFIX = 'qq-message:'
 const THREAD_PREFIX = 'qq-thread:'
 const ACTIVE_PREFIX = 'qq-active:'
+const RECENT_PREFIX = 'qq-recent:'
 const PAGE_SIZE = 30
 const HISTORY_LIMIT = 200
 const MAX_CURSOR = 10_000
@@ -20,6 +21,7 @@ interface ActiveThread extends ChatIdentity { userId: string; threadId: string; 
 export interface QqThreadOptions {
   sessionMinutes: number
   groupFollowups: 'reply' | 'sender-window'
+  privateFollowups?: 'semantic' | 'sender-window'
   forceNew?: boolean
   addressed: boolean
 }
@@ -41,6 +43,7 @@ export class QqThreads {
     if (replyKnown) return { threadId: parent!.threadId, replyKnown: true }
 
     if (identity.messageType === 'private') {
+      if (options.privateFollowups === 'semantic') return { threadId: threadId(identity, message.id), replyKnown: false }
       const activeKey = activeKeyOf(identity, message.userId)
       const active = this.store.get(record<ActiveThread>(activeKey))
       if (active && sameChat(active, identity) && active.userId === message.userId && withinWindow(message.at, active.lastAt, options.sessionMinutes)) {
@@ -59,6 +62,20 @@ export class QqThreads {
     return undefined
   }
 
+  /** Bounded same-sender chat context for semantic routing, without subscribing a ticket to that chat. */
+  contextFor(message: NormalizedOneBotMessage, minutes: number): string[] {
+    const identity = identityOf(message)
+    if (!identity) return []
+    const recent = this.store.get(record<MessageLink[]>(recentKeyOf(identity, message.userId))) ?? []
+    const active = this.store.get(record<ActiveThread>(activeKeyOf(identity, message.userId)))
+    const prior = active && sameChat(active, identity) ? this.store.get(record<ThreadData>(threadKeyOf(active.threadId))) : undefined
+    const fallback = prior?.history.slice(-8).flatMap(item => this.store.get(record<MessageLink>(messageKey(identity, item.id))) ?? []) ?? []
+    return [...new Map([...fallback, ...recent].filter(item => sameChat(item, identity) && item.userId === message.userId
+      && item.id !== message.id && Date.parse(item.at) <= Date.parse(message.at) && withinWindow(message.at, item.at, minutes))
+      .sort((a, b) => a.at.localeCompare(b.at)).map(item => [item.triggerId, item])).values()]
+      .filter(item => item.triggerId).slice(-8).map(item => item.triggerId)
+  }
+
   recordIncoming(message: NormalizedOneBotMessage, threadId: string, triggerId: string, attachments: SourceAttachmentRef[] = []): void {
     const identity = identityOf(message)
     if (!identity || !validTime(message.at)) return
@@ -71,6 +88,9 @@ export class QqThreads {
       const link: MessageLink = { ...identity, id: message.id, userId: message.userId, threadId, triggerId, at: message.at,
         text: message.text, ...(message.replyTo ? { replyTo: message.replyTo } : {}) }
       this.store.set(record<MessageLink>(mapKey), link)
+      const recentKey = record<MessageLink[]>(recentKeyOf(identity, message.userId))
+      const recent = this.store.get(recentKey) ?? []
+      this.store.set(recentKey, [...recent, link].sort((a, b) => a.at.localeCompare(b.at)).slice(-12))
       this.append(threadId, thread, { id: message.id, from: message.userId, at: message.at, text: message.text,
         ...attachments.length ? { attachments } : {},
         ...(message.replyTo ? { reply_to: message.replyTo } : {}) })
@@ -150,6 +170,9 @@ function messageKey(identity: ChatIdentity, messageId: string): string {
 function threadKeyOf(threadId: string): string { return `${THREAD_PREFIX}${encoded(threadId)}` }
 function activeKeyOf(identity: ChatIdentity, userId: string): string {
   return `${ACTIVE_PREFIX}${encoded(identity.selfId)}:${identity.messageType}:${encoded(identity.chatId)}:${encoded(userId)}`
+}
+function recentKeyOf(identity: ChatIdentity, userId: string): string {
+  return `${RECENT_PREFIX}${encoded(identity.selfId)}:${identity.messageType}:${encoded(identity.chatId)}:${encoded(userId)}`
 }
 function threadId(identity: ChatIdentity, rootId: string): string {
   return `${identity.messageType === 'private' ? 'p' : 'g'}:${identity.selfId}:${identity.chatId}:${rootId}`

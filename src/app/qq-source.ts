@@ -30,6 +30,7 @@ export const QqConfigSchema = z.object({
     .refine(groups => new Set(groups.map(group => group.id)).size === groups.length, '群号重复').default([]),
   commandPrefix: z.string().trim().min(1).max(30).default('/agent'),
   sessionMinutes: z.number().int().min(1).max(1440).default(30), groupFollowups: z.enum(['reply', 'sender-window']).default('reply'),
+  privateFollowups: z.enum(['semantic', 'sender-window']).default('semantic'),
   replyChunkSize: z.number().int().min(200).max(4000).default(1800), maxReplyChunks: z.number().int().min(1).max(50).default(20),
   requestTimeoutMs: z.number().int().min(1000).max(60000).default(15000),
 }).strict()
@@ -207,7 +208,8 @@ export class QqBridge {
     }
     if (!text || text.length > 16000) return
     const addressed = message.messageType === 'private' || message.mentions.includes(message.selfId) || prefixed || forceNew
-    const resolved = this.threads.resolve(message, { sessionMinutes: config.sessionMinutes, groupFollowups: config.groupFollowups, forceNew, addressed })
+    const resolved = this.threads.resolve(message, { sessionMinutes: config.sessionMinutes, groupFollowups: config.groupFollowups,
+      privateFollowups: config.privateFollowups, forceNew, addressed })
     if (!resolved) return
     const channel = { source: 'qq', thread: `qq:${resolved.threadId}`, address: { self_id: message.selfId, message_type: message.messageType,
       recipient_id: chat, user_id: message.userId, message_id: message.id, thread_id: resolved.threadId } }
@@ -219,6 +221,10 @@ export class QqBridge {
         senderName: message.senderName, attachments: message.attachments } }
     const attachments = this.attachments.references(trigger)
     if (attachments.length) trigger.attachments = attachments
+    if (!forceNew && !resolved.replyKnown) {
+      const context = this.threads.contextFor(message, config.sessionMinutes)
+      if (context.length) trigger.context = context
+    }
     return this.host.store.atomic(() => {
       this.threads.recordIncoming(message, resolved.threadId, eventId, attachments)
       const result = this.host.receive(trigger)
@@ -323,6 +329,9 @@ function qqFields(): FieldSpec[] {
     { key: 'commandPrefix', type: 'text', label: label('交办命令前缀', 'Command prefix') },
     { key: 'groupFollowups', type: 'select', label: label('群聊追问关联', 'Group follow-ups'), options: [
       { value: 'reply', label: label('引用回复原消息', 'Quoted replies') }, { value: 'sender-window', label: label('同一发送者的会话窗口', 'Sender session window') }] },
+    { key: 'privateFollowups', type: 'select', label: label('私聊任务归属', 'Private task routing'), options: [
+      { value: 'semantic', label: label('由 Router 判断新消息归属', 'Router semantic routing') },
+      { value: 'sender-window', label: label('沿用发送者会话窗口', 'Sender session window') }] },
     number('sessionMinutes', '会话窗口 / 分钟', 'Session window / minutes', 1, 1440),
     { key: 'host', type: 'select', advanced: true, label: label('反向监听地址', 'Reverse listen host'), options: ['127.0.0.1', 'localhost', '::1'].map(value => ({ value, label: label(value, value) })) },
     number('port', '反向监听端口', 'Reverse listen port', 1024, 65535),

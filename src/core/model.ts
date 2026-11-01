@@ -37,6 +37,8 @@ export interface Trigger {
   at: string
   text: string
   attachments?: AttachmentReference[]
+  /** Source-selected nearby event IDs for bounded, read-only context; these create no subscription or mandate. */
+  context?: string[]
   channel?: ChannelRef
   url?: string
   /** Source-native details for adapters; the core never interprets them. */

@@ -122,6 +122,7 @@ export function triggerMessage(trigger: Trigger, link: { source_url?: string; so
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
     ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link,
     ...trigger.attachments?.length ? { attachments: trigger.attachments } : {}, ...(note ? { routing_note: note } : {}),
+    ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
 /** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */

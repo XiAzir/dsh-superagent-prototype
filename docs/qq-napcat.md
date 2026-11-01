@@ -76,7 +76,9 @@ QQ 来源初始关闭，按以下步骤启用：
 
 引用机器人回复或已知任务消息，可在原任务中继续追问。普通群消息默认在代码层过滤。
 
-- 私聊在同一账号的 `sessionMinutes` 窗口内延续会话，默认 30 分钟。
+- 私聊默认 `privateFollowups: semantic`：无引用的新消息各自形成候选逻辑 Thread，由 Router 根据原话、近邻消息和相关工单判断新任务、补充、问询或闲聊。引用已知消息时仍进入对应 Thread 并订阅直通。
+- 近邻上下文只保留相同机器人、聊天和发送者在 `sessionMinutes` 窗口内的最近 8 条入站引用，默认 30 分钟。上下文引用授予所选 Worker 按需读取这些原消息/附件的入口，并保持只读；消息归属及订阅由 Router 单独决定。`/new` 清空本次上下文关联。
+- 可选 `privateFollowups: sender-window` 延续原发送者窗口行为。
 - 群聊默认 `groupFollowups: reply`，通过引用回复关联任务。
 - 可选 `sender-window` 模式允许同一群内、同一发送者的窗口内补充消息继续原任务。
 - `/new` 或 `/agent new` 重置当前发送者的会话窗口，下一条消息开始新任务；也可在命令后直接写任务内容。
@@ -113,6 +115,7 @@ FFmpeg 优先从 `SUPERAGENT_FFMPEG_PATH` / `SUPERAGENT_FFPROBE_PATH`（兼容 `
 | `commandPrefix` | `/agent` | 交办前缀 |
 | `sessionMinutes` | `30` | 发送者会话窗口 |
 | `groupFollowups` | `reply` | 群聊追问方式 |
+| `privateFollowups` | `semantic` | 无引用私聊消息交由 Router 判断归属；可选 sender-window |
 | `replyChunkSize / maxReplyChunks` | `1800 / 20` | 回复分段 |
 | `requestTimeoutMs` | `15000` | OneBot 请求超时 |
 

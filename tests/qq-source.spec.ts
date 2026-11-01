@@ -108,6 +108,37 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('routes unquoted private tasks independently and lets the selected worker read a nearby source file', async () => {
+    const { runtime, store } = await startQq()
+    expect(QqConfigSchema.parse({}).privateFollowups).toBe('semantic')
+    const file = join(runtime.machine.stateDir, 'nearby-source.txt')
+    await writeFile(file, 'nearby attachment')
+    rpcHandlers.get_file = () => ({ file, file_name: 'source.txt' })
+    await push(event(91, 'private', owner, [{ type: 'file', data: { file: 'source.txt', file_id: 'nearby-file' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const source = qqTriggers(runtime)[0]!
+    await host!.route({ kind: 'ignore', trigger_id: source.id, reason: 'File provided as source context; awaiting task.' })
+    await push(event(92, 'private', owner, [{ type: 'text', data: { text: '请总结刚才的文件' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 2)
+    const request = qqTriggers(runtime)[1]!
+    expect(request.context).toContain(source.id)
+    expect(request.threads).not.toEqual(source.threads)
+    const accepted = await host!.route({ kind: 'accept', trigger_id: request.id, title: 'Summarize file', worktree_name: 'summarize-file', acknowledgement: '收到，整理文件摘要。' })
+    await runtime.idle()
+    const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+    const bytes = await host!.runTool(`worker-${ticketId}`, 'orchestrator_read', { resource: source.attachments![0]!.read })
+    expect(await readFile(String(bytes.path), 'utf8')).toBe('nearby attachment')
+    await push(event(93, 'private', owner, [{ type: 'text', data: { text: '另外，调查一个全新的任务' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 3)
+    await runtime.idle()
+    const another = qqTriggers(runtime)[2]!
+    expect(store.triggers.disposition(another.id)?.fanout).toEqual([])
+    expect(host!.relays(runtime.masterId).some(item => item.trigger_id === another.id && item.kind === 'candidate')).toBe(true)
+    await push(event(94, 'private', owner, [{ type: 'reply', data: { id: '92' } }, { type: 'text', data: { text: '补充文件任务' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 4)
+    expect(store.triggers.disposition(qqTriggers(runtime)[3]!.id)?.fanout).toEqual([ticketId])
+    expect(store.tickets.list()).toHaveLength(1)
+  })
   it('renders downloaded image bytes as multimodal tool output and sends media artifacts with QQ native segments', async () => {
     const { runtime, store } = await startQq()
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')

@@ -99,6 +99,9 @@ function list<T>({ offset, limit }: Read, fetch: (offset: number, count: number)
 /** Check whether a worker session's ticket is authorized to read a trigger (via delivery, ticket origin, or followed thread). */
 const readable = (host: ResourceHost, ticket: Ticket, trigger: Trigger): boolean => reached(ticket, trigger, key => host.store.threads.get(key))
   || ticket.origin.triggerIds.includes(trigger.id) || trigger.threads.some(ref => ticket.follows?.some(follow => follow.thread === threadKey(ref)))
+  || [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' && !input.context ? [input.triggerId] : [])]
+    .some(id => { const source = host.store.triggers.get(id); return source?.source === trigger.source
+      && source.actor.id === trigger.actor.id && !!source.context?.includes(trigger.id) })
 const trigger = (host: ResourceHost, id: string, ticketId?: string): Trigger => {
   const found = host.store.triggers.get(id)
   if (!found) throw new UserError('unknownTrigger')

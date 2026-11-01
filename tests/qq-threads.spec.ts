@@ -26,6 +26,20 @@ const resolveAndRecord = (msg: NormalizedOneBotMessage, options = opts()) => {
 }
 
 describe('QqThreads', () => {
+  it('uses semantic routing for unquoted private messages while retaining bounded source context and quoted fast paths', () => {
+    const config = { ...opts(), privateFollowups: 'semantic' as const }
+    const first = message('201', { messageType: 'private', groupId: undefined })
+    const initial = resolveAndRecord(first, config)!
+    const second = message('202', { messageType: 'private', groupId: undefined, at: '2026-10-31T10:01:00.000Z' })
+    expect(threads.resolve(second, config)?.threadId).toBe('p:900:100:202')
+    expect(threads.contextFor(second, 30)).toEqual(['trigger-201'])
+    resolveAndRecord(second, config)
+    expect(threads.resolve(message('203', { messageType: 'private', groupId: undefined, replyTo: '201' }), config))
+      .toEqual({ threadId: initial.threadId, replyKnown: true })
+    expect(threads.contextFor({ ...second, userId: '200' }, 30)).toEqual([])
+    expect(threads.contextFor({ ...second, selfId: '901' }, 30)).toEqual([])
+    expect(threads.contextFor({ ...second, at: '2026-10-31T12:00:00.000Z' }, 30)).toEqual([])
+  })
   it('keeps group replies on the known parent thread, including replies to bot messages', async () => {
     const root = message('1', { mentions: ['900'], text: '@bot do task' })
     const first = resolveAndRecord(root, opts({ addressed: true }))!
