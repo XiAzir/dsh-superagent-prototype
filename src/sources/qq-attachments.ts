@@ -181,8 +181,11 @@ async function invoke<T>(fn: () => Promise<T>, retries: number, signal: AbortSig
 }
 
 function publicLookup(trustedOrigin: boolean) {
-  return (hostname: string, _options: unknown, callback: (error: NodeJS.ErrnoException | null, address?: string | Array<{ address: string; family: number }>, family?: number) => void) => {
-    dnsLookup(hostname, { all: true, verbatim: true }, (error, addresses) => {
+  return (hostname: string, input: unknown, callback: (error: NodeJS.ErrnoException | null, address?: string | Array<{ address: string; family: number }>, family?: number) => void) => {
+    const options = input && typeof input === 'object' ? input as { all?: boolean; family?: number; hints?: number } : {}
+    dnsLookup(hostname, { all: true, verbatim: true,
+      ...options.family === 4 || options.family === 6 ? { family: options.family } : {},
+      ...typeof options.hints === 'number' ? { hints: options.hints } : {} }, (error, addresses) => {
       if (error) { callback(error); return }
       const list = addresses as Array<{ address: string; family: number }>
       if (!trustedOrigin && list.some(entry => entry.family === 4 ? privateIPv4(entry.address) : !entry.address.toLowerCase().startsWith('2') && !entry.address.toLowerCase().startsWith('3'))) {
@@ -191,7 +194,9 @@ function publicLookup(trustedOrigin: boolean) {
       }
       const chosen = list[0]
       if (!chosen) { callback(new Error('empty dns result')); return }
-      callback(null, chosen.address, chosen.family)
+      // Node's automatic IPv4/IPv6 selection requests all addresses and expects the lookup callback's array overload.
+      if (options.all) callback(null, list)
+      else callback(null, chosen.address, chosen.family)
     })
   }
 }

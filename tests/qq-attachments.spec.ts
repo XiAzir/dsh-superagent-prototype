@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type Server } from 'node:http'
+import { getDefaultAutoSelectFamily, setDefaultAutoSelectFamily } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { OneBotAttachment } from '../src/sources/onebot-message.ts'
 import { fetchOneBotAttachment } from '../src/sources/qq-attachments.ts'
@@ -44,6 +45,23 @@ describe('fetchOneBotAttachment', () => {
     expect(result).toMatchObject({ status: 'downloaded', name: 'report.pdf', size: 4, mime: 'application/pdf', source: 'api-url' })
     expect(result.path).toContain(join(stateDir, 'qq-attachments'))
     expect(await readFile(result.path!)).toEqual(Buffer.from([37, 80, 68, 70]))
+  })
+
+  it.each(['image', 'video', 'file'] as const)('downloads a %s through a hostname with Node dual-stack address selection', async type => {
+    const stateDir = await tempDir()
+    const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+    const remote = await fixture(bytes, 'image/png')
+    const url = remote.url.replace('127.0.0.1', 'localhost')
+    const previous = getDefaultAutoSelectFamily()
+    setDefaultAutoSelectFamily(true)
+    try {
+      const call = vi.fn(async () => ({ url, file_name: 'download.png', file_size: bytes.length }))
+      const result = await fetchOneBotAttachment({ attachment: { type, file: 'download.png', file_id: 'known-locator' },
+        messageId: '17', authorized: true, stateDir, call, retries: 0, downloadOrigins: [new URL(url).origin] })
+      expect(result).toMatchObject({ status: 'downloaded', size: bytes.length, source: 'api-url' })
+      expect(call).toHaveBeenCalledWith(type === 'image' ? 'get_image' : 'get_file', { file: 'known-locator' }, expect.any(AbortSignal))
+      expect(await readFile(result.path!)).toEqual(Buffer.from(bytes))
+    } finally { setDefaultAutoSelectFamily(previous) }
   })
 
   it('recovers the file_id from get_msg and permits only an API-returned file under an allowed NapCat root', async () => {
