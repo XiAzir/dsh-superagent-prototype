@@ -658,6 +658,7 @@ const TEXT = {
   'reason.startedTicket': ['已经开过工单 {ticket}', 'Already started Ticket {ticket}'],
   'reason.acceptedBefore': ['触发 {trigger} 之前已接单', 'Trigger {trigger} was accepted before'],
   'reason.routed': ['已转给工单 {ticket}', 'Routed to Ticket {ticket}'],
+  'reason.statusRead': ['已依据工单 {ticket} 的状态记录答复', 'Answered from saved status of Ticket {ticket}'],
   'reason.stopUnknown': ['要停止的工单不存在或已结束', 'The Ticket to stop is unknown or ended'],
   'reason.stopNotExplicit': ['停止需要名单里的人明确要求', 'Stopping needs an explicit request from someone on the list'],
   'reason.directionUnsettled': ['实现意图或目标未确定，或还要产品或设计决定', 'Intent or target not settled, or a product or design decision is still open'],
