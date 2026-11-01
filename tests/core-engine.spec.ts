@@ -1008,6 +1008,17 @@ describe('automatic input', () => {
   })
 })
 describe('replies', () => {
+  it('spills long status reports behind their original report resource without changing the stored content', () => {
+    const h = harness(), ticketId = accepted(h).ticketId!
+    const summary = '可验证的进展'.repeat(300)
+    h.engine.report(ticketId, { state: 'progress', summary })
+    h.engine.receive(trigger('2', { text: '进展如何？' }))
+    const reply = h.engine.reply({ purpose: 'status', ticketId, triggerId: '2', text: '正在推进。' })
+    const stored = h.repo.tickets.get(ticketId)!.assignments.at(-1)!
+    expect(reply.snapshot?.latest_report).toMatchObject({ chars: summary.length, summary: summary.slice(0, 600),
+      read: `ticket/${ticketId}/report/${stored.id}` })
+    expect(stored.report?.summary).toBe(summary)
+  })
   it('delivers only artifacts registered in the current ready report and preserves result retry identity', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!

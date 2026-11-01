@@ -18,6 +18,8 @@ export type ReplyRequest =
   | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string; artifacts?: string[] }
 /** A queued message: its id, whether it went out, and whether an earlier request had queued it already. */
 export interface Reply { id: string; status: ReplyStatus; reused: boolean; snapshot?: TicketStatusSnapshot }
+type StoredReport = NonNullable<Ticket['assignments'][number]['report']>
+interface SnapshotReport { state: StoredReport['state']; at: string; summary: string; chars: number; read: string }
 /** Read-only facts available to the Router when it replies to a person's status question. */
 export interface TicketStatusSnapshot {
   ticket_id: string
@@ -32,9 +34,9 @@ export interface TicketStatusSnapshot {
     ended_at?: string
     ended_reason?: string
     idle_at?: string
-    report?: { state: NonNullable<Ticket['assignments'][number]['report']>['state']; at: string; summary: string }
+    report?: SnapshotReport
   }
-  latest_report?: { assignment_id: string; state: NonNullable<Ticket['assignments'][number]['report']>['state']; at: string; summary: string }
+  latest_report?: SnapshotReport & { assignment_id: string }
   undelivered_inputs: number
   delivery_failure?: { at: string; error: string }
   attention?: { question: string }
@@ -138,6 +140,8 @@ export class Replies extends EnginePart {
     const report = assignment?.report
     const reportAssignment = ticket.assignments.findLast(item => item.report)
     const latest = reportAssignment?.report
+    const brief = (value: StoredReport, assignmentId: string): SnapshotReport => ({ state: value.state, at: value.at,
+      summary: value.summary.slice(0, 600), chars: value.summary.length, read: `ticket/${ticket.id}/report/${assignmentId}` })
     const snapshot: TicketStatusSnapshot = {
       ticket_id: ticket.id,
       title: ticket.title,
@@ -149,8 +153,8 @@ export class Replies extends EnginePart {
         ...(assignment.endedAt ? { ended_at: assignment.endedAt } : {}),
         ...(assignment.endedReason ? { ended_reason: assignment.endedReason } : {}),
         ...(assignment.idleAt ? { idle_at: assignment.idleAt } : {}),
-        ...(report ? { report: { state: report.state, at: report.at, summary: report.summary } } : {}) } } : {}),
-      ...(latest && reportAssignment ? { latest_report: { assignment_id: reportAssignment.id, state: latest.state, at: latest.at, summary: latest.summary } } : {}),
+        ...(report ? { report: brief(report, assignment.id) } : {}) } } : {}),
+      ...(latest && reportAssignment ? { latest_report: { assignment_id: reportAssignment.id, ...brief(latest, reportAssignment.id) } } : {}),
       undelivered_inputs: ticket.undelivered.length,
       ...(ticket.delivery ? { delivery_failure: { at: ticket.delivery.at, error: ticket.delivery.error } } : {}),
       ...(ticket.attention ? { attention: { question: ticket.attention.question } } : {}),
