@@ -1,4 +1,4 @@
-import { expect, it, vi } from 'vitest'
+import { expect, it, onTestFinished, vi } from 'vitest'
 import { Config, type Machine } from '../src/deployment.ts'
 import { apply } from '../src/index.ts'
 import { protectStateDirectory } from '../src/infra/private-directory.ts'
@@ -24,18 +24,19 @@ vi.mock('../src/app/qq-source.ts', () => ({ QqBridge: class {
 const commit = (reference: unknown, value: unknown) => { (reference as Record<symbol, (value: unknown) => void>)[Symbol.for('cosmokit.volatile.write')]!(value) }
 
 function context() {
-  const handlers = new Map<string, () => void>()
+  const handlers = new Map<string, (paths: readonly (readonly string[])[]) => void>()
+  const disposers: (() => void)[] = []
   const configure = vi.fn(() => () => {})
   const describe = vi.fn(() => [])
   const ctx = {
-    on: vi.fn((name: string, handler: () => void) => { handlers.set(name, handler) }),
+    on: vi.fn((name: string, handler: (paths: readonly (readonly string[])[]) => void) => { handlers.set(name, handler) }),
     inject: vi.fn((_services: string[], callback: (child: unknown) => void) => { callback({ effect: (effect: () => unknown) => effect(), settings: { configure } }) }),
-    effect: vi.fn(),
+    effect: vi.fn((effect: () => (() => void) | undefined) => { const dispose = effect(); if (dispose) disposers.push(dispose) }),
     fiber: { restart: vi.fn(async () => {}) },
     get: vi.fn((name: string) => name === 'settings' ? { describe } : undefined),
     logger: { info: vi.fn(), error: vi.fn() },
   }
-  return { ctx, handlers, configure, describe }
+  return { ctx, handlers, configure, describe, disposers }
 }
 
 it('reads a limit DSH commits a new value of without a restart, and asks DSH to generate no settings page', async () => {
@@ -48,7 +49,42 @@ it('reads a limit DSH commits a new value of without a restart, and asks DSH to 
   expect(machine.promptMaxChars.get()).toBe(5000)
   commit(config.promptMaxChars, 8000)
   expect(machine.promptMaxChars.get()).toBe(8000)
-  expect(handlers.has('loader/volatile-update')).toBe(false)
+  handlers.get('loader/volatile-update')!([['promptMaxChars']])
+  expect(ctx.fiber.restart).not.toHaveBeenCalled()
+})
+
+it('defers a saved mode change until the next turn, then restarts once with its committed value', async () => {
+  vi.useFakeTimers()
+  onTestFinished(() => { vi.useRealTimers() })
+  const { ctx, handlers, describe } = context()
+  const config = Config({ stateDir: '/srv/state', mode: 'personal' })
+  await apply(ctx as never, config)
+  const { machine } = runtimes.at(-1)!
+  commit(config.mode, 'repository')
+  const updated = handlers.get('loader/volatile-update')!
+  updated([['mode'], ['promptMaxChars']])
+  updated([['mode']])
+  expect(machine.mode).toBe('personal')
+  expect(ctx.fiber.restart).not.toHaveBeenCalled()
+  await vi.runAllTimersAsync()
+  expect(ctx.fiber.restart).toHaveBeenCalledTimes(1)
+  expect(describe).toHaveBeenCalledTimes(1)
+})
+
+it('cancels a mode restart when the saved mode returns to its running value or the plugin is disposed', async () => {
+  vi.useFakeTimers()
+  onTestFinished(() => { vi.useRealTimers() })
+  const { ctx, handlers, disposers } = context()
+  const config = Config({ stateDir: '/srv/state', mode: 'personal' })
+  await apply(ctx as never, config)
+  const updated = handlers.get('loader/volatile-update')!
+  commit(config.mode, 'repository'); updated([['mode']])
+  commit(config.mode, 'personal'); updated([['mode']])
+  await vi.runAllTimersAsync()
+  expect(ctx.fiber.restart).not.toHaveBeenCalled()
+  commit(config.mode, 'repository'); updated([['mode']])
+  disposers.forEach(dispose => dispose())
+  await vi.runAllTimersAsync()
   expect(ctx.fiber.restart).not.toHaveBeenCalled()
 })
 

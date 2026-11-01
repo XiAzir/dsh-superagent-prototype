@@ -623,7 +623,7 @@ Most built-in instructions live in `prompts/*.md`, with one sentence per line jo
 
 ## Configuration reload
 
-Every plugin configuration key except `stateDir` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
+Every plugin configuration key except `stateDir` is volatile and exposed through DeepSeek Harness's configuration form. The host fences writes by revision and persists them to `cordis.patch.yml`. Limits are read on use and apply in place. Each Superagent activation captures its operating mode; a committed `mode` change schedules a restart of that plugin through `loader/volatile-update`. The Deployment page merges the form's exposed fields over runtime machine values so older form projections retain the correct mode.
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

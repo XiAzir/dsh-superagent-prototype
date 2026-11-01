@@ -1,5 +1,6 @@
 /** Main plugin entry: mounts the Runtime and provides its restart callback for deployment account changes. */
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-settings'
 import { Runtime } from './app/runtime.ts'
 import { Config, machineOf, type DeploymentConfig } from './deployment.ts'
@@ -23,6 +24,16 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   const restart = (): void => {
     ctx.fiber.restart().then(() => { ctx.get('settings')?.describe() }).catch((error: unknown) => { ctx.logger.error('dsh-superagent restart failed: %s', String(error)) })
   }
+  // DSH's editable forms accept volatile fields. Keep this activation's mode fixed until a saved mode change remounts it.
+  let modeRestart: ReturnType<typeof setTimeout> | undefined
+  ctx.on('loader/volatile-update', paths => {
+    if (!paths.some(path => path.length === 1 && path[0] === 'mode') || modeRestart !== undefined || config.mode.get() === machine.mode) return
+    modeRestart = setTimeout(() => {
+      modeRestart = undefined
+      if (config.mode.get() !== machine.mode) restart()
+    }, 0)
+  })
+  ctx.effect(() => () => { clearTimeout(modeRestart) })
   const runtime = new Runtime(ctx, machine, restart)
   ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal')))
   const qq = runtime.qq = new QqBridge({ store: runtime.store, configured: () => runtime.configured(), receive: trigger => runtime.receive(trigger),

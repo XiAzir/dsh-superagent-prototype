@@ -35,7 +35,8 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
   const snapshot = form?.state
   const editable = snapshot?.status === 'ready' && snapshot.writable
   // Pass `revision` only while DSH serves writable values so a draft started before `ready` rebases once writable.
-  const machine = editable ? snapshot.value : setup.machine
+  // DSH forms expose only volatile fields; use runtime values for omitted configuration fields.
+  const machine = editable ? { ...setup.machine, ...snapshot.value } : setup.machine
   const saved = { ...limitsOf(machine), mode: text((machine as Record<string, unknown>).mode) || 'repository' }
   const draft = useDraft({ saved, revision: editable ? snapshot.revision : undefined,
     reload: async () => {},
