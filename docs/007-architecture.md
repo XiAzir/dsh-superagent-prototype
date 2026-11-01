@@ -349,6 +349,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/qq-source.ts` | QQ Source connection lifecycle and credential-backed status |
 | `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
 | `src/app/artifacts.ts` | Immutable ticket-scoped deliverable snapshots and digest verification |
+| `src/app/watchdog.ts` | Bounded task and infrastructure snapshots for an independent external control loop |
 | `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
 | `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
 | `src/app/api.ts` | `Api`, including `GET qq/status` and `PUT qq/token`, every route's parameters, query, body and response, and the list filters; it imports only types, so the panel bundles it |
@@ -431,6 +432,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/qq-attachments.spec.ts` | NapCat file resolution, download limits, cancellation and source validation |
 | `tests/qq-media.spec.ts` | Image input capability and real FFmpeg frame extraction with media limits |
 | `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
+| `tests/watchdog.spec.ts` | Independent process monitoring, assessor input, quiet reports and bounded recovery |
 | `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |

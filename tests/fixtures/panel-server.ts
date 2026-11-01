@@ -353,6 +353,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     return task
   } },
   'GET state': { answer: stateView },
+  'GET watchdog/snapshot': { answer: () => ({ schema: 1, observedAt: new Date().toISOString(), infrastructure: { configured: true, paused: false, health: {}, setup: [] },
+    executor: { activeWorkers: 0, maxWorkers: 4 }, tickets: [], candidates: [], baseline: { status: 'healthy', findings: [], semanticReview: 'not_configured' } }) },
+  'POST watchdog/tickets/:id/request-status': { answer: () => ({ requested: false }) },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {
     const q = query.q ?? ''

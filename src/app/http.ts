@@ -29,6 +29,7 @@ import { decisionList, search, threadDetail, threadList } from './views/threads.
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { WebTasks, WebTaskError } from './web-tasks.ts'
 import { QqSourceError, type QqBridge } from './qq-source.ts'
+import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
 
 export interface HttpHost {
   readonly qq?: QqBridge | undefined
@@ -39,7 +40,7 @@ export interface HttpHost {
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople & Pick<Engine, 'receive'>
+  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus'>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -184,6 +185,17 @@ function routes(runtime: HttpHost): Routes {
     'POST web/tasks': async ({ body }) => web().create(await body()),
     'POST web/tasks/:id/messages': async ({ params, body }) => web().followup(params.id, await body()),
     'GET state': () => stateView(runtime),
+    'GET watchdog/snapshot': () => {
+      const snapshot = watchdogSnapshot(runtime)
+      return { ...snapshot, baseline: baselineAssessment(snapshot) }
+    },
+    'POST watchdog/tickets/:id/request-status': ({ params }) => {
+      const id = ticket(params.id)
+      // Engine only queues this bounded nudge for a live worker whose latest report explicitly says `waiting`.
+      const requested = runtime.engine.requestStatus(id)
+      if (requested) runtime.requestPass()
+      return { requested }
+    },
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),

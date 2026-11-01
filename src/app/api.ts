@@ -27,6 +27,10 @@ export interface Api {
   'POST web/tasks': { body: { text: string; requestId: string }; response: WebTaskView }
   'POST web/tasks/:id/messages': { body: { text: string; requestId: string }; response: WebTaskView }
   'GET state': { response: StateView }
+  /** Bounded diagnostic projection for the external Watchdog process; contains no source message bodies or environment values. */
+  'GET watchdog/snapshot': { response: import('./watchdog.ts').WatchdogSnapshot & { baseline: ReturnType<typeof import('./watchdog.ts').baselineAssessment> } }
+  /** Ask an explicitly waiting worker for a status report; other ticket states are unchanged. */
+  'POST watchdog/tickets/:id/request-status': { response: { requested: boolean } }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }
   'GET sources': { response: SourceStatusView[] }

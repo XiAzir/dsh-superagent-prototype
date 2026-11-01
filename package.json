@@ -25,9 +25,12 @@
     "locale/*.json",
     "README.md",
     "docs/windows.md",
+    "docs/watchdog.md",
     "scripts/dsh-superagent",
     "scripts/dsh-superagent-windows.py",
     "scripts/dsh-superagent-windows-bootstrap.mjs",
+    "scripts/dsh-superagent-watchdog.mjs",
+    "scripts/dsh-superagent-watchdog.d.mts",
     "prompts",
     "skills"
   ],
