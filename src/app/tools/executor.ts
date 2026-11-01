@@ -84,7 +84,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           : 'The ticket\'s GitHub PR number; only available when a GitHub Source is configured. Omit when the task has no PR.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
         artifacts: z.array(z.object({ path: z.string().min(1), name: z.string().optional(),
-          kind: z.enum(['file', 'image', 'video']).default('file') }).strict()).max(8).optional()
+          kind: z.enum(['file', 'image', 'video']).optional() }).strict()).max(8).optional()
           .describe('With state=ready: output files inside this task directory. The host snapshots them and the Router delivers them through the original source; do not call QQ or handle its credentials yourself.'),
       }).strict(),
       execute: async (args, signal) => {

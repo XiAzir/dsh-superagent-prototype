@@ -276,7 +276,8 @@ async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortS
 
     let apiMeta: Record<string, unknown> | undefined
     let trustedApiMeta = false
-    let apiLocator = attachment.file_id ?? attachment.id
+    // Image/video segments conventionally carry their opaque OneBot locator in `file`.
+    let apiLocator = attachment.file_id ?? attachment.id ?? (attachment.type !== 'file' ? attachment.file : undefined)
     const action = attachment.type === 'image' ? 'get_image' : 'get_file'
     const readApiMeta = async (locator: string): Promise<void> => {
       const response = await invoke(() => options.call(action, { file: locator }, signal), limits.retries, signal)
@@ -330,7 +331,8 @@ async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortS
       checkAbort(signal)
       const found = messageAttachment(apiData(response) ?? response, attachment)
       if (found) {
-        const recoveredId = [found.file_id, found.id].find(value => typeof value === 'string' && value)
+        const recoveredId = [found.file_id, found.id, ...(attachment.type !== 'file' ? [found.file] : [])]
+          .find(value => typeof value === 'string' && validateName(value))
         if (typeof recoveredId === 'string' && recoveredId !== apiLocator) {
           apiLocator = recoveredId
           try { await readApiMeta(recoveredId); const result = await tryApiMeta(); if (result) return result }

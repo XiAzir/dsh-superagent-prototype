@@ -211,14 +211,15 @@ export class Sessions {
   mayRead(sessionId: string, revision: number): boolean {
     return revision === this.promptVersion(sessionId).revision || (this.host.store.get(KV.sessions.prompts(sessionId)) ?? []).includes(revision)
   }
-  /** Returns a tool registrar for `agent` that renders tool output as JSON text and attaches `output.image` as an image when present. */
+  /** Returns a tool registrar that renders structured output and ordered single/multiple image references. */
   private registerTool(agent: Agent, binding: SessionBinding): RegisterTool {
     return (name, description, schema, execute) => {
       binding.disposers.push(agent.ctx.tools.register({ name, description, parameters: z.toJSONSchema(schema),
         output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => {
           const text = { type: 'text' as const, text: JSON.stringify(value) }
-          const image = value && typeof value === 'object' && 'image' in value ? (value as { image: never }).image : undefined
-          return image ? [text, { type: 'image' as const, attachment: image }] : [text]
+          const output = value && typeof value === 'object' ? value as { image?: never; images?: never[] } : undefined
+          const images = [...output?.image ? [output.image] : [], ...Array.isArray(output?.images) ? output.images : []]
+          return [text, ...images.slice(0, 8).map(attachment => ({ type: 'image' as const, attachment }))]
         } },
         execute: (args, execution) => execute(schema.parse(args), execution.signal) }))
     }

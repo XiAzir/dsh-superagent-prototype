@@ -1,5 +1,6 @@
 /** NapCat OneBot source: admission, persistent thread routing and replies to the original QQ chat. */
 import { z } from 'zod'
+import { pathToFileURL } from 'node:url'
 import { key, type OutboundMessage, type ReceiveResult, type Trigger } from '../core/index.ts'
 import { record } from '../kv.ts'
 import { SourcePolicySchema } from '../policy.ts'
@@ -10,6 +11,7 @@ import { normalizeOneBotMessage } from '../sources/onebot-message.ts'
 import { QqThreads } from './qq-threads.ts'
 import { safeFailureMessage } from './session-failures.ts'
 import { QqAttachmentStore } from './qq-attachment-store.ts'
+import { readQqMedia } from '../sources/qq-media.ts'
 import type { ArtifactRegistry } from './artifacts.ts'
 import type { Store } from './store.ts'
 
@@ -248,14 +250,23 @@ export class QqBridge {
       if (!this.host.artifacts || !message.ticketId) throw new Error('Artifact delivery requires its originating task and durable artifact registry')
       const artifact = await this.host.artifacts.verify(id, message.ticketId)
       if (!this.canSend(address)) return 'gone'
-      const reply = await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
-        { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file: artifact.path, name: artifact.name })
+      const native = artifact.kind === 'image' || artifact.kind === 'video'
+      if (native && !artifact.mediaType.startsWith(`${artifact.kind}/`)) throw new Error('Artifact media kind and format do not match')
+      const reply = native
+        ? await client.call<{ message_id?: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
+          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id,
+            message: [{ type: artifact.kind, data: { file: pathToFileURL(artifact.path).href } }] })
+        : await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
+          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file: artifact.path, name: artifact.name })
       // NapCat confirms file uploads with file_id, not the message_id used for text replies.
-      if (!reply || !Object.hasOwn(reply, 'file_id') || (reply.file_id !== null && typeof reply.file_id !== 'string')) throw new Error('NapCat did not confirm the file upload')
+      const fileId = native ? String((reply as { message_id?: string | number })?.message_id ?? '') : (reply as { file_id?: string | null })?.file_id
+      if (native ? !/^-?\d+$/.test(String(fileId)) : fileId !== null && typeof fileId !== 'string') throw new Error('NapCat did not confirm the artifact delivery')
       this.host.store.atomic(() => {
         delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
-        delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: reply.file_id ?? null }]
+        delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: fileId ?? null }]
         this.host.store.set(deliveryKey(message.id), delivery)
+        if (native) this.threads.recordOutgoing(String(fileId), address.thread_id!, {
+          messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, `[${artifact.kind}] ${artifact.name}`)
       })
     }
     if (delivery.chunks.some((chunk, index) => chunk.text !== chunks[index])) throw new Error('QQ 回复分段配置发生变化，请恢复原分段大小后重试。')
@@ -281,7 +292,10 @@ export class QqBridge {
       description: { zh: '通过 NapCat / OneBot v11 接收 QQ 私聊和群聊任务，并回复原会话。', en: 'Receive QQ tasks through NapCat / OneBot v11 and reply in the original chat.' },
       schema: QqConfigSchema, health: ['qq'], fields: qqFields(),
       attachments: { references: trigger => this.attachments.references(trigger),
-        read: (trigger, id, _agent, signal) => this.attachments.read(trigger, id, signal) },
+        read: async (trigger, id, agent, signal) => {
+          const result = await this.attachments.read(trigger, id, signal)
+          return agent && (result.type === 'image' || result.type === 'video') ? readQqMedia(agent, result, signal) : result
+        } },
       scope: ({ meta }, config) => (meta.messageType === 'private' ? config.privateMessages : config.groups.some(group => group.id === meta.groupId))
         ? { listened: true, observed: false } : { listened: false, reason: 'source_disabled' },
       channel: { artifacts: true, allowed: address => this.canSend(address), send: (_host, message) => this.send(message), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },

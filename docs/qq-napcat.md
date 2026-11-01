@@ -95,7 +95,11 @@ QQ 活动可在 **来源、触发、评估、执行** 页查看。个人任务�
 
 Worker 完成文件任务时，通过 `orchestrator_report(state=ready, artifacts=[{path,name}])` 登记任务目录中的产物。系统保存独立快照、校验大小和 SHA-256；Router 的 `orchestrator_reply(purpose=result)` 自动携带报告内的产物。QQ 适配器通过私聊/群文件 API 上传，并记录确认结果，重试跳过已确认的文件。产物默认最多 8 个、每个 50 MiB。Worker 修改原文件后，已登记的快照继续保持原内容。
 
-图片视觉输入和视频抽帧能力见后续媒体模块；当前文件链路测试覆盖实际字节读取、产物快照、上传确认、重试与授权撤销。
+图片读取会检查当前模型的图片输入能力，识别实际 PNG/JPEG/WebP/GIF 字节，再通过 DSH 附件服务输出视觉块。视频读取通过 FFprobe 获取时长和音频存在信息，FFmpeg 在 30 秒内最多抽取 6 张、最长边 1280 的采样画面，按时间顺序提供图片与时间点；同时遵守模型每图和单消息总字节上限。结果用 `understanding.status=visual_input_ready` 表示视觉输入已准备，并给出采样范围；音频转录需另行执行。
+
+FFmpeg 优先从 `SUPERAGENT_FFMPEG_PATH` / `SUPERAGENT_FFPROBE_PATH`（兼容 `FFMPEG_PATH` / `FFPROBE_PATH`）与 PATH 查找；Windows 还会发现用户主目录下的 `ffmpeg-*-essentials_build/bin`。子进程使用参数数组、关闭 shell，并在超时或取消后退出、清理抽帧临时目录。
+
+产物省略 kind 时按显示文件名推断类型；image/video 使用 QQ 原生媒体消息并保存 message_id 供引用，显式 kind=file 则作为文件上传。自动验收覆盖真实图片字节进入工具视觉块、真实 FFmpeg 音视频抽帧，以及本地 OneBot WebSocket 中的媒体交付。
 
 ## 配置参考
 

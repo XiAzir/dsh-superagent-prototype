@@ -1,4 +1,5 @@
 import { once } from 'node:events'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -107,6 +108,42 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('renders downloaded image bytes as multimodal tool output and sends media artifacts with QQ native segments', async () => {
+    const { runtime, store } = await startQq()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+    const original = join(runtime.machine.stateDir, 'source-image')
+    await writeFile(original, png)
+    rpcHandlers.get_image = params => {
+      expect(params).toEqual({ file: 'opaque-image' })
+      return { file: original, file_name: 'source.png', file_size: png.length }
+    }
+    await push(event(81, 'private', owner, [{ type: 'image', data: { file: 'opaque-image' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const trigger = qqTriggers(runtime)[0]!
+    const accepted = await host!.route({ kind: 'accept', trigger_id: trigger.id, title: 'Read image', worktree_name: 'read-image', acknowledgement: '收到，查看图片。' })
+    await runtime.idle()
+    const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id, workerId = `worker-${ticketId}`
+    const agent = host!.agents.get(workerId)! as unknown as Agent
+    Object.assign(agent, { options: { provider: 'test', model: 'visual' } })
+    const image = { attachmentId: 'actual-image', mediaType: 'image/png', bytes: png.length, width: 1, height: 1 }
+    agent.ctx.reflect.provide('attachments', { imageLimits: { maxImageBytes: 4096, maxMessageImageBytes: 4096 }, saveImage: vi.fn(async ({ data }: { data: Uint8Array }) => {
+      expect(Buffer.from(data)).toEqual(png); return image
+    }) })
+    agent.ctx.reflect.provide('llm', { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) })
+    const read = await host!.runTool(workerId, 'orchestrator_read', { resource: trigger.attachments![0]!.read })
+    expect(read).toMatchObject({ status: 'downloaded', understanding: { status: 'visual_input_ready' }, images: [image] })
+    const tool = host!.tools.get(workerId)!.get('orchestrator_read') as unknown as { output: { render(args: unknown, result: unknown): unknown[] } }
+    expect(tool.output.render({}, read)).toEqual([{ type: 'text', text: JSON.stringify(read) }, { type: 'image', attachment: image }])
+    const ticket = store.tickets.get(ticketId)!
+    await mkdir(ticket.execution!.directory, { recursive: true })
+    const output = join(ticket.execution!.directory, 'result.png'), video = join(ticket.execution!.directory, 'result.mp4')
+    await writeFile(output, png); await writeFile(video, 'video transport fixture')
+    await host!.runTool(workerId, 'orchestrator_report', { state: 'ready', summary: '媒体产物已准备。', artifacts: [{ path: output }, { path: video }] })
+    await host!.runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'result', ticket_id: ticketId, text: '请查收媒体。' })
+    const media = sent.flatMap(item => item.params.message as { type: string; data: { file?: string } }[]).filter(item => ['image', 'video'].includes(item.type))
+    expect(media.map(item => item.type)).toEqual(['image', 'video'])
+    expect(media.every(item => item.data.file?.startsWith('file:///'))).toBe(true)
+  })
   it('exposes a source file as a durable authorized read reference and delivers an immutable task artifact through the Outbox', async () => {
     const { runtime, bridge: qq, store } = await startQq()
     const original = join(runtime.machine.stateDir, 'napcat-source.xlsx')

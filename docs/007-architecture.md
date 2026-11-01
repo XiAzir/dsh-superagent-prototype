@@ -374,6 +374,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/onebot-client.ts` | OneBot v11 forward and reverse WebSocket clients, connection lifecycle, and outbound requests |
 | `src/sources/onebot-message.ts` | OneBot v11 event decoding, QQ message segments, attachment markers, and message normalization |
 | `src/sources/qq-attachments.ts` | Bounded credential-backed NapCat attachment resolution and byte transfer |
+| `src/sources/qq-media.ts` | Image modality checks and bounded timestamped video frames for model-visible media |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
@@ -428,6 +429,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/onebot-client.spec.ts`, `tests/onebot-message.spec.ts` | OneBot v11 connection behavior and normalized QQ events, replies, and attachment metadata |
 | `tests/qq-source.spec.ts` | QQ admission, source policy, reply delivery, credentials, and the live connection lifecycle |
 | `tests/qq-attachments.spec.ts` | NapCat file resolution, download limits, cancellation and source validation |
+| `tests/qq-media.spec.ts` | Image input capability and real FFmpeg frame extraction with media limits |
 | `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
 | `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

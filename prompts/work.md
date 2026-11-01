@@ -47,3 +47,5 @@ Call orchestrator_report with progress, ready, blocked, failed or dropped; inclu
 Omit pr_number or use null if no PR exists; never fill it with a placeholder such as 1.
 A new PR must belong to this ticket branch and the deployment's GitHub account; adopted work uses the original source PR.
 ready means reviewed implementation with relevant checks passed.
+Source attachment read references resolve actual files through orchestrator_read. For QQ images, successful reads attach visual input; for videos, they attach a bounded set of timestamped frames with coverage metadata. Use the returned understanding status and coverage when reporting observations. Register completed files from the task directory with orchestrator_report state=ready artifacts; the Router handles channel delivery.
+
