@@ -21,7 +21,7 @@ it('restricts the Watchdog target to a loopback HTTP origin', () => {
 
 it('redacts quoted credential fields and structured secret keys before assessor input', () => {
   const serialized = assessorInput({ schema: 1, observedAt: '', infrastructure: { configured: true, paused: false,
-    health: { runtime: { state: 'ready', detail: '{"app_secret":"json-secret-value", "api_key": "key-secret-value"} token="quoted-token-value"' } },
+    health: { runtime: { state: 'ready', detail: '{"app_secret":"json-secret-value", "api_key": "key-secret-value"} token="quoted-token-value"' } } },
     executor: { activeWorkers: 0, maxWorkers: 1 }, tickets: [{ id: 't', token: 'structured-token-value', app_secret: 'structured-app-secret-value' }], candidates: [] })
   for (const secret of ['json-secret-value', 'key-secret-value', 'quoted-token-value', 'structured-token-value', 'structured-app-secret-value']) {
     expect(serialized).not.toContain(secret)
@@ -219,6 +219,40 @@ it('waits for a timed-out child process to close before rejecting', async () => 
   const started = Date.now()
   await expect(runCommand([process.execPath, '-e', 'setTimeout(()=>{},10000)'], { timeoutMs: 100 })).rejects.toThrow('timed out')
   expect(Date.now() - started).toBeLessThan(2000)
+})
+
+it('terminates real descendant processes on timeout and output overflow within a hard bound', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-watchdog-tree-'))
+  const source = 'const{spawn}=require("node:child_process");const fs=require("node:fs");const p=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",windowsHide:true});fs.writeFileSync(process.argv[1],JSON.stringify({parent:process.pid,child:p.pid}));if(process.argv[2]==="output")process.stdout.write("123456789");setInterval(()=>{},1000)'
+  const trees: { parent: number; child: number }[] = []
+  try {
+    for (const mode of ['timeout', 'output']) {
+      const pidFile = join(directory, `${mode}.json`), started = Date.now()
+      await expect(runCommand([process.execPath, '-e', source, pidFile, mode], { timeoutMs: mode === 'timeout' ? 150 : 5000, maxOutput: 4 }))
+        .rejects.toThrow(mode === 'timeout' ? 'timed out' : 'output exceeded')
+      const tree = JSON.parse(await readFile(pidFile, 'utf8')) as { parent: number; child: number }
+      trees.push(tree)
+      expect(Date.now() - started).toBeLessThan(2000)
+      const deadline = Date.now() + 1500
+      while (Date.now() < deadline) {
+        try { process.kill(tree.child, 0); await new Promise(resolvePromise => setTimeout(resolvePromise, 50)) }
+        catch { break }
+      }
+      expect(() => process.kill(tree.child, 0)).toThrow()
+    }
+  } finally {
+    for (const tree of trees) {
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/PID', String(tree.parent), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        await Promise.race([once(killer, 'close'), new Promise(resolvePromise => setTimeout(resolvePromise, 1000))])
+        try { process.kill(tree.child) } catch {}
+      } else {
+        try { process.kill(-tree.parent, 'SIGKILL') } catch {}
+        try { process.kill(tree.child, 'SIGKILL') } catch {}
+      }
+    }
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 it('runs the assessor command as a separate process with the bounded snapshot on stdin', async () => {

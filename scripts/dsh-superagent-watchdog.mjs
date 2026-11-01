@@ -64,17 +64,41 @@ export async function runCommand(command, { input = '', timeoutMs = 30_000, maxO
     throw new Error('Command must be a non-empty argv array')
   }
   return await new Promise((resolvePromise, reject) => {
-    const child = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: env ?? process.env })
-    const out = [], err = []; let bytes = 0, settled = false, stopError
+    const child = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: env ?? process.env,
+      detached: process.platform !== 'win32' })
+    const out = [], err = []; let bytes = 0, settled = false, stopError, termination
     const finish = (error, result) => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', aborted);
       error ? reject(error) : resolvePromise(result) }
-    const terminate = error => { if (settled || stopError) return; stopError = error; child.kill(); if (child.pid === undefined) finish(error) }
+    const terminateTree = async pid => {
+      if (process.platform === 'win32') {
+        let killer
+        try {
+          killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+          await new Promise(resolveDone => {
+            const deadline = setTimeout(() => { killer.kill(); resolveDone() }, 750)
+            killer.once('error', () => { clearTimeout(deadline); resolveDone() })
+            killer.once('close', () => { clearTimeout(deadline); resolveDone() })
+          })
+        } catch { /* Fall through to the direct child signal below. */ }
+        try { process.kill(pid) } catch {}
+        return
+      }
+      try { process.kill(-pid, 'SIGTERM') } catch { try { process.kill(pid, 'SIGTERM') } catch {} }
+      await new Promise(resolveDone => setTimeout(resolveDone, 100))
+      try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch {} }
+    }
+    const terminate = error => {
+      if (settled || stopError) return
+      stopError = error
+      if (child.pid === undefined) { finish(error); return }
+      termination = terminateTree(child.pid).finally(() => finish(error))
+    }
     const aborted = () => terminate(new Error('Command was aborted'))
-    const collect = target => chunk => { bytes += chunk.length; if (bytes > maxOutput) { terminate(new Error('Command output exceeded its limit')); return }
+    const collect = target => chunk => { if (stopError || settled) return; bytes += chunk.length; if (bytes > maxOutput) { terminate(new Error('Command output exceeded its limit')); return }
       target.push(chunk) }
     child.stdout.on('data', collect(out)); child.stderr.on('data', collect(err))
-    child.once('error', error => { if (!child.pid) finish(error); else stopError ??= error })
-    child.once('close', code => stopError ? finish(stopError)
+    child.once('error', error => { if (!child.pid) finish(error); else terminate(error) })
+    child.once('close', code => stopError ? termination?.then(() => finish(stopError))
       : code === 0 ? finish(undefined, { stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') })
         : finish(new Error(`Command exited with ${code}: ${Buffer.concat(err).toString('utf8').slice(0, 2000)}`)))
     const timer = setTimeout(() => terminate(new Error(`Command timed out after ${timeoutMs} ms`)), timeoutMs)
