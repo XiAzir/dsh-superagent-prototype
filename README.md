@@ -6,6 +6,12 @@ with a model and a local execution environment, and accepts tasks directly from
 the DSH Web panel. See [Personal mode](docs/personal.md) and
 [Windows setup](docs/windows.md).
 
+This fork also includes QQ file and visual-media input, immutable task artifacts,
+Router status replies, semantic QQ task routing and an external Watchdog. See
+[QQ / NapCat](docs/qq-napcat.md), [Watchdog](docs/watchdog.md), and the
+[article alignment audit](docs/article-alignment-audit.md) for implementation evidence,
+verification and deployment conditions.
+
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >
 > We have adapted it for publication, so it is not identical to our internal version or the implementation described in *Exploring Super-agent Design: Towards a More Autonomous Agent System*. Some designs discussed in the article are directions for future development and are not implemented in this prototype.
