@@ -7,14 +7,14 @@ import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
-import { Replies, type Reply, type ReplyRequest } from './replies.ts'
+import { Replies, type Reply, type ReplyRequest, type TicketStatusSnapshot } from './replies.ts'
 import { Tickets } from './tickets.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
-export type { Reply, ReplyRequest } from './replies.ts'
+export type { Reply, ReplyRequest, TicketStatusSnapshot } from './replies.ts'
 
 /**
  * Single transactional entry point for mutating Triggers, Threads, Decisions, Tickets, and Assignments.

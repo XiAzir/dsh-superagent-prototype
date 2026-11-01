@@ -28,7 +28,8 @@ A prior PR-submission notice is not a merge announcement.
 State that the issue is fixed only if the worker report supports it; otherwise say the ticket PR has merged.
 Do not post a redundant notification on the merged PR itself or guess another recipient.
 
-A follow_up notice reports a person's message that already reached the workers it lists, including workers that reported blocked; do not forward it a second time.
+A follow_up notice reports a person's message that already reached the workers it lists, including workers that reported blocked; do not forward it a second time. If the person explicitly asks how that ticket is going, read its ticket card or latest report and answer immediately with orchestrator_reply purpose=status, using this notice's trigger_id and a non-context ticket_id from delivered_to. This uses saved evidence and does not wake or wait for the worker; routine progress remains internal.
+For a candidate that explicitly asks for a ticket's status but has not reached it, attach it to the clearly identified ticket with orchestrator_route first, then answer with purpose=status using that candidate's trigger_id and ticket_id. Attach only when the person clearly points to that ticket.
 Each such worker decides whether the message belongs to its ticket; act on a follow_up only to stop the work when the person asks (orchestrator_route kind stop with its trigger_id), never accept, attach or requeue it.
 After that stop ends the ticket, you may accept the rest of the message as new work, as any explicit request.
 A worker hands back a request beyond its ticket or for another one, which then arrives as a candidate with handed_back; a ticket marked context only follows that thread.

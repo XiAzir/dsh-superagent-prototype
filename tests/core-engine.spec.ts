@@ -1061,6 +1061,44 @@ describe('replies', () => {
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ status: 'pending' })
     expect(h.outbox.at(-1)!.channel).toEqual(trigger('1').channel)
   })
+  it('answers a reached human status question from a read-only snapshot with trigger-and-ticket idempotency', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const asked = trigger('2', { actor: guest, channel: { source: 'chat', thread: 't1', address: { message: '2' } } })
+    h.engine.receive(asked)
+    h.engine.report(ticketId, { state: 'progress', summary: 'Updated the parser; checking edge cases.' })
+    const first = h.engine.reply({ purpose: 'status', ticketId, triggerId: asked.id, text: 'The parser is updated and edge cases are being checked.' })
+    expect(first).toMatchObject({ status: 'pending', reused: false, snapshot: {
+      ticket_id: ticketId, title: 'Fix', stage: { stage: 'working' },
+      assignment: { state: 'running', report: { state: 'progress', summary: 'Updated the parser; checking edge cases.' } },
+    } })
+    expect(h.outbox.at(-1)).toMatchObject({ id: key('status-reply', asked.id, ticketId), channel: asked.channel,
+      text: 'The parser is updated and edge cases are being checked.', kind: 'reply', ticketId })
+    expect(h.engine.reply({ purpose: 'status', ticketId, triggerId: asked.id, text: 'Different wording.' })).toMatchObject({
+      id: first.id, reused: true,
+    })
+    expect(h.outbox.filter(item => item.id === first.id)).toHaveLength(1)
+    const second = trigger('3', { actor: guest })
+    h.engine.receive(second)
+    expect(h.engine.reply({ purpose: 'status', ticketId, triggerId: second.id, text: 'Still working.' }).id).not.toBe(first.id)
+  })
+  it('refuses status replies without a human trigger that explicitly reached the named ticket', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2', { human: false }))
+    expect(() => h.engine.reply({ purpose: 'status', ticketId, triggerId: '2', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
+    h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    expect(() => h.engine.reply({ purpose: 'status', ticketId, triggerId: '3', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
+
+    const contextTicket = accepted(h, '4', 'other').ticketId!
+    h.engine.followForContext(contextTicket, { source: 'chat', id: 'issue' })
+    h.engine.receive(trigger('5', { actor: guest, threads: [{ source: 'chat', id: 'issue' }] }))
+    expect(h.repo.triggers.disposition('5')).toMatchObject({ fanout: [contextTicket], context: [contextTicket] })
+    expect(() => h.engine.reply({ purpose: 'status', ticketId: contextTicket, triggerId: '5', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
+  })
 })
 describe('ticket commands', () => {
   it('ends a ticket by the same rule on a close and on a ready report: once no PR it opened is open, as the latest of them ended', () => {

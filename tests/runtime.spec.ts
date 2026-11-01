@@ -257,7 +257,7 @@ it('fans a person\'s later thread message out to the live worker as context and 
   expect(runtime.store.get(resource)).toBeUndefined()
   expect(runtime.store.tickets.get(ticket.id)!.inputs).toEqual([expect.objectContaining({ kind: 'trigger', triggerId: followup.id })])
   expect(relays(runtime.masterId)).toEqual([{ kind: 'follow_up', trigger_id: followup.id, from: 'ou_guest', thread: `feishu:${CHAT}:om_1`,
-    at: followup.at, text: '顺便看看日志', delivered_to: [{ ticket_id: ticket.id, title: '修复回归', state: 'working' }],
+    at: followup.at, text: '顺便看看日志', delivered_to: [{ ticket_id: ticket.id, title: '修复回归', state: 'working', read: `ticket/${ticket.id}` }],
       note: expect.stringContaining('worker has it and decides') }])
   expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_1`).map(decision => decision.triggerIds)).toEqual([[ticket.origin.triggerId]])
   expect(await runTool(sessionId, 'orchestrator_read', { resource: `trigger/${followup.id}` }))

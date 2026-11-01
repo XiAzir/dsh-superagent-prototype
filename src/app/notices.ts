@@ -75,9 +75,12 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
 
 /** Steering relay payload for the main Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string }
-/** What a follow-up asks of the main Session: nothing but a stop the person asks for, since its ticket's worker decides it. */
-const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '
-  + '(orchestrator_route kind stop with this trigger_id).'
+/** A follow-up may get a status answer from saved evidence; its worker still decides the message's work scope. */
+const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides whether it belongs; only stop the work when the person asks '
+  + '(orchestrator_route kind stop with this trigger_id). If the person explicitly asks for status, answer promptly from the '
+  + 'ticket card or latest report with orchestrator_reply purpose status, naming this trigger_id and a ticket_id marked '
+  + 'delivered_to (never a context-only ticket). Do not wake or wait for the worker to answer a status question. '
+  + 'Ordinary progress stays internal.'
 /**
  * Builds a steering relay for a human follow-up trigger that reached at least one live ticket (including an ended ticket
  * that resumed on the follow-up), with the trigger rendered as workers read it, the replied-to message, and the open
@@ -90,7 +93,8 @@ export function followupNotice(store: Store, sources: SourceRegistry, triggerId:
   const tickets = disposition!.fanout.flatMap(id => {
     const ticket = store.tickets.get(id)
     const context = disposition!.context?.includes(id) ? { context: true } : {}
-    return ticket && liveTicket(ticket) ? [{ ticket_id: id, title: ticket.title, state: ticketCard(ticket).state, ...context }] : []
+    return ticket && liveTicket(ticket) ? [{ ticket_id: id, title: ticket.title, state: ticketCard(ticket).state,
+      read: `ticket/${ticket.id}`, ...context }] : []
   })
   if (!tickets.length) return undefined
   return followupRelay(triggerMessage(trigger, {}, undefined, repliedTo({ store, sources }, trigger)), tickets)
@@ -100,7 +104,7 @@ export function followupNotice(store: Store, sources: SourceRegistry, triggerId:
  * tickets it reached with their state. Their workers decide it; the main Session may only stop the work on it.
  */
 export function followupRelay(message: { trigger_id: string },
-  tickets: readonly { ticket_id: string; title: string; state: string; context?: boolean }[]): Relay {
+  tickets: readonly { ticket_id: string; title: string; state: string; read?: string; context?: boolean }[]): Relay {
   return { id: `followup:${message.trigger_id}`, text: JSON.stringify({ kind: 'follow_up', ...message, delivered_to: tickets,
     note: FOLLOWUP_NOTE }) }
 }

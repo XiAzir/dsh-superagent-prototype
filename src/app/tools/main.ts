@@ -222,21 +222,28 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. Web and QQ replies may contain the complete useful result, up to 20000 characters. Feishu IM limit: ${IM_WORDS} words.`,
+      description: `Send an answer to a human question, a status update requested by a human follow-up, a ready result, or attention requiring human action, as the replies section says. purpose=status requires both the current follow-up trigger_id and a ticket_id it reached on a non-context thread; it returns the current read-only status snapshot with the reply receipt. For status, use only evidence in that snapshot, ticket card or latest report; do not ask the worker to answer. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. Web and QQ replies may contain the complete useful result, up to 20000 characters. Feishu IM limit: ${IM_WORDS} words.`,
       schema: z.object({
-        trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
-        ticket_id: z.string().optional(),
-        purpose: z.enum(['answer', 'result', 'attention']),
+        trigger_id: z.string().min(1).optional().describe('Original human question for answer; current human follow-up for status.'),
+        ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention.'),
+        purpose: z.enum(['answer', 'status', 'result', 'attention']),
         human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
         text: z.string().min(1).max(20000),
         artifacts: z.array(z.string().min(1)).max(8).optional().describe('With purpose=result: IDs from this ticket\'s ready report. Omit to deliver all reported artifacts through the source channel.'),
-      }).strict(),
+      }).strict().superRefine((args, context) => {
+        if (args.purpose === 'status') {
+          if (!args.trigger_id) context.addIssue({ code: 'custom', path: ['trigger_id'], message: 'Status requires the human follow-up trigger_id' })
+          if (!args.ticket_id) context.addIssue({ code: 'custom', path: ['ticket_id'], message: 'Status requires an explicit ticket_id' })
+        }
+      }),
       execute: async args => {
-        const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
-          ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
-          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
+        const reply = args.purpose === 'status'
+          ? host.engine.reply({ purpose: 'status', text: args.text, triggerId: args.trigger_id!, ticketId: args.ticket_id! })
+          : host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
+            ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
+            ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
         await host.sendReplies()
-        return { status: host.store.replyStatus(reply.id) ?? reply.status }
+        return { status: host.store.replyStatus(reply.id) ?? reply.status, ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
       },
     }),
     tool({

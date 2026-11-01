@@ -1,10 +1,11 @@
 /** The Engine's messages to Channels, each by the rule that allows it. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, ticketOutcome } from './model.ts'
-import type { ChannelRef, Ticket, Trigger } from './model.ts'
+import { latestAssignment, latestReport, liveTicket, reached, ticketOutcome } from './model.ts'
+import type { ChannelRef, Ticket, TicketOutcome, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
+import { ticketStage } from './stage.ts'
 
 /**
  * A message for a Channel, by purpose: an Executor's acknowledgement of a person's request it works on, the answer to a
@@ -13,9 +14,31 @@ import { EnginePart } from './part.ts'
  */
 export type ReplyRequest =
   | { purpose: 'acknowledgement'; ticketId: string; triggerId: string; text: string }
+  | { purpose: 'status'; ticketId: string; triggerId: string; text: string }
   | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string; artifacts?: string[] }
 /** A queued message: its id, whether it went out, and whether an earlier request had queued it already. */
-export interface Reply { id: string; status: ReplyStatus; reused: boolean }
+export interface Reply { id: string; status: ReplyStatus; reused: boolean; snapshot?: TicketStatusSnapshot }
+/** Read-only facts available to the Router when it replies to a person's status question. */
+export interface TicketStatusSnapshot {
+  ticket_id: string
+  title: string
+  stage: ReturnType<typeof ticketStage>
+  updated_at: string
+  outcome?: TicketOutcome
+  assignment?: {
+    id: string
+    state: Ticket['assignments'][number]['state']
+    started_at?: string
+    ended_at?: string
+    ended_reason?: string
+    idle_at?: string
+    report?: { state: NonNullable<Ticket['assignments'][number]['report']>['state']; at: string; summary: string }
+  }
+  latest_report?: { assignment_id: string; state: NonNullable<Ticket['assignments'][number]['report']>['state']; at: string; summary: string }
+  undelivered_inputs: number
+  delivery_failure?: { at: string; error: string }
+  attention?: { question: string }
+}
 
 /**
  * Replies writes the Engine's messages to Channels through the Outbox port: an acknowledgement, the answer to a person's
@@ -34,7 +57,8 @@ export class Replies extends EnginePart {
    * that is not ready, completed, merged, or dropped.
    */
   reply(request: ReplyRequest): Reply {
-    return request.purpose === 'acknowledgement' ? this.acknowledge(request) : this.answer(request)
+    return request.purpose === 'acknowledgement' ? this.acknowledge(request)
+      : request.purpose === 'status' ? this.status(request) : this.answer(request)
   }
   /**
    * Queue the acknowledgement an accept carries where the message that started the ticket was written, if it has a Channel
@@ -61,7 +85,7 @@ export class Replies extends EnginePart {
     this.takeUp(ticket.id, trigger.id)
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }
-  private answer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' }>): Reply {
+  private answer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' | 'status' }>): Reply {
     const trigger = request.triggerId ? this.repo.triggers.get(request.triggerId) : undefined
     if (request.triggerId && !trigger) throw new UserError('unknownTrigger')
     const ticket = request.ticketId ? this.require(request.ticketId)
@@ -97,6 +121,42 @@ export class Replies extends EnginePart {
       this.repo.tickets.save(ticket)
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
+  }
+  /** Send a current status only to the human trigger that actually reached the explicitly named ticket. */
+  private status(request: Extract<ReplyRequest, { purpose: 'status' }>): Reply {
+    const ticket = this.require(request.ticketId)
+    const trigger = this.repo.triggers.get(request.triggerId)
+    if (!trigger) throw new UserError('unknownTrigger')
+    const disposition = this.repo.triggers.disposition(trigger.id)
+    if (!trigger.human || !trigger.channel || !disposition?.fanout.includes(ticket.id)
+      || disposition.context?.includes(ticket.id) || !reached(ticket, trigger, key => this.repo.threads.get(key), false)) {
+      throw new UserError('notReached')
+    }
+    const id = key('status-reply', trigger.id, ticket.id)
+    const existing = this.options.outbox.status(id)
+    const assignment = latestAssignment(ticket)
+    const report = assignment?.report
+    const reportAssignment = ticket.assignments.findLast(item => item.report)
+    const latest = reportAssignment?.report
+    const snapshot: TicketStatusSnapshot = {
+      ticket_id: ticket.id,
+      title: ticket.title,
+      stage: ticketStage(ticket),
+      updated_at: ticket.updatedAt,
+      ...(ticket.ended ? { outcome: ticket.ended.outcome } : {}),
+      ...(assignment ? { assignment: { id: assignment.id, state: assignment.state,
+        ...(assignment.startedAt ? { started_at: assignment.startedAt } : {}),
+        ...(assignment.endedAt ? { ended_at: assignment.endedAt } : {}),
+        ...(assignment.endedReason ? { ended_reason: assignment.endedReason } : {}),
+        ...(assignment.idleAt ? { idle_at: assignment.idleAt } : {}),
+        ...(report ? { report: { state: report.state, at: report.at, summary: report.summary } } : {}) } } : {}),
+      ...(latest && reportAssignment ? { latest_report: { assignment_id: reportAssignment.id, state: latest.state, at: latest.at, summary: latest.summary } } : {}),
+      undelivered_inputs: ticket.undelivered.length,
+      ...(ticket.delivery ? { delivery_failure: { at: ticket.delivery.at, error: ticket.delivery.error } } : {}),
+      ...(ticket.attention ? { attention: { question: ticket.attention.question } } : {}),
+    }
+    this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'reply', ticketId: ticket.id })
+    return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined, snapshot }
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
   private sourceChannel(ticket: Ticket): ChannelRef | undefined { return this.source(ticket)?.channel ?? ticket.channels[0] }
