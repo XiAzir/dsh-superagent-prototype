@@ -350,6 +350,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
 | `src/app/artifacts.ts` | Immutable ticket-scoped deliverable snapshots and digest verification |
 | `src/app/watchdog.ts` | Bounded task and infrastructure snapshots for an independent external control loop |
+| `src/app/schedules.ts` | Persistent local command schedules, revision guards, coalesced timer occurrences and Runtime-owned cancellation |
 | `src/client/artifacts.tsx` | Authorized personal-task file downloads with busy state and retryable errors |
 | `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
 | `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
@@ -402,6 +403,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/qq.tsx` | QQ connection status, NapCat setup guidance, and separate token controls embedded in the Source card |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
+| `src/client/schedules.tsx` | Local scheduled-command forms, revisions, enable/disable, manual runs and execution summaries |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
 | `src/client/prompt-config.ts` | The prompt configuration by section, by the team sections, skill names, built-in parts (`part/<key>`, with `withOverride`) and part headings the prompt views give, and the line diff of the full prompt, as pure functions |
@@ -435,6 +437,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/qq-media.spec.ts` | Image input capability and real FFmpeg frame extraction with media limits |
 | `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
 | `tests/watchdog.spec.ts` | Independent process monitoring, assessor input, quiet reports and bounded recovery |
+| `tests/schedules.spec.ts` | Scheduled command validation, persistence, serial execution, timeout, pause, restart and stale-result isolation |
+| `tests/panel-schedules.spec.tsx` | Scheduled-command creation, edits, revision conflicts, execution controls and confirmed deletion |
 | `tests/panel-artifacts.spec.tsx` | Web download authorization header, filename, busy state and refusal feedback |
 | `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

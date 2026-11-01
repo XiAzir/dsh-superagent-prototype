@@ -33,6 +33,7 @@ import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { WebTasks, WebTaskError } from './web-tasks.ts'
 import { QqSourceError, type QqBridge } from './qq-source.ts'
 import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
+import { ScheduleConfigSchema, ScheduleConflict, ScheduleLimit, ScheduleNotFound, type Schedules } from './schedules.ts'
 
 export interface HttpHost {
   readonly qq?: QqBridge | undefined
@@ -40,6 +41,7 @@ export interface HttpHost {
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly artifacts?: Pick<ArtifactRegistry, 'verify'> | undefined
+  readonly schedules?: Pick<Schedules, 'list' | 'create' | 'update' | 'runNow' | 'remove'> | undefined
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
@@ -66,7 +68,7 @@ export interface HttpHost {
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404, message: string) { super(message) } }
+class RouteError extends Error { constructor(readonly status: 400 | 404 | 503, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -91,6 +93,9 @@ const encodedFilename = (name: string): string => encodeURIComponent(name).repla
 function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof QqSourceError) return [error.status, { error: error.message }]
   if (error instanceof WebTaskError) return [error.status, { error: error.message }]
+  if (error instanceof ScheduleConflict) return [409, { error: error.message }]
+  if (error instanceof ScheduleNotFound) return [404, { error: error.message }]
+  if (error instanceof ScheduleLimit) return [400, { error: error.message }]
   if (error instanceof z.ZodError) {
     const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
@@ -173,8 +178,23 @@ function routes(runtime: HttpHost): Routes {
       } })
   }
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
+  const schedules = () => runtime.schedules ?? (() => { throw new RouteError(503, 'Schedules are not ready') })()
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET schedules': () => schedules().list(),
+    'POST schedules': async ({ body }) => {
+      const request = z.object({ config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))
+      return { item: schedules().create(request.config) }
+    },
+    'PUT schedules/:id': async ({ params, body }) => {
+      const request = z.object({ revision: z.number().int().nonnegative(), config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))
+      return { item: schedules().update(params.id, request.revision, request.config) }
+    },
+    'POST schedules/:id/run': ({ params }) => schedules().runNow(params.id),
+    'DELETE schedules/:id': async ({ params, body }) => {
+      const request = z.object({ revision: z.number().int().nonnegative() }).strict().parse(await body(4096))
+      return schedules().remove(params.id, request.revision)
+    },
     'GET qq/status': () => {
       if (!runtime.qq) throw new QqSourceError(503, 'QQ 接入模块尚未启动。')
       return runtime.qq.status()

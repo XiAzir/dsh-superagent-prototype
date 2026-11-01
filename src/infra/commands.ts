@@ -82,7 +82,7 @@ export class Commands {
     return repository
   }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
-  async run(program: string, args: string[], cwd?: string): Promise<string> {
+  async run(program: string, args: string[], cwd?: string, timeoutMs = TIMEOUT_MS): Promise<string> {
     if (this.signal.aborted) throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
     const invocation = commandInvocation(program, args)
     try {
@@ -113,7 +113,7 @@ export class Commands {
           timedOut = true
           if (windows) aborting ??= stopTree(pid).then(() => { child.kill('SIGTERM') })
           else child.kill('SIGTERM')
-        }, TIMEOUT_MS)
+        }, timeoutMs)
         if (this.signal.aborted) abortTree()
       })
     } catch (error) { throw commandError(error, program) }

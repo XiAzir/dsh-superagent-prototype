@@ -12,6 +12,7 @@ import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
+import { ScheduleConflict } from '../src/app/schedules.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
@@ -28,6 +29,37 @@ it('protects the QQ credential endpoint with the same origin check and accepts o
   expect(await call('PUT', 'qq/token', { value: 'onebot-test-token' })).toEqual({ status: 200, body: { configured: true } })
   expect(await call('GET', 'qq/status')).toEqual({ status: 200, body: { tokenConfigured: true } })
   expect(saved).toEqual(['onebot-test-token'])
+})
+
+it('serves bounded local schedule CRUD and immediate-run responses with revision conflicts', async () => {
+  const config = { name: 'Local mail check', enabled: true, program: 'C:\\tools\\python.exe', args: ['C:\\tasks\\mail.py', '--once'],
+    cwd: 'C:\\tasks', intervalSeconds: 300, timeoutSeconds: 120 }
+  const item = { id: 'schedule-1', revision: 2, config, nextRunAt: '2026-11-01T10:05:00.000Z', running: false }
+  const schedules = {
+    list: () => ({ revision: 3, items: [item] }),
+    create: (value: unknown) => ({ ...item, id: 'schedule-2', revision: 1, config: value }),
+    update: (id: string, revision: number) => {
+      if (id !== item.id) throw new Error('Schedule not found')
+      if (revision !== item.revision) throw new ScheduleConflict()
+      return item
+    },
+    runNow: (id: string) => ({ status: 'queued' as const, item: id === item.id ? item : (() => { throw new Error('Schedule not found') })() }),
+    remove: async (id: string, revision: number) => {
+      if (id !== item.id) throw new Error('Schedule not found')
+      if (revision !== item.revision) throw new ScheduleConflict()
+      return { removed: true as const }
+    },
+  }
+  const call = serve({ schedules })
+  expect(await call('GET', 'schedules')).toEqual({ status: 200, body: { revision: 3, items: [item] } })
+  expect(await call('POST', 'schedules', { config })).toMatchObject({ status: 200, body: { item: { id: 'schedule-2', revision: 1 } } })
+  expect(await call('POST', 'schedules', { config, surprise: true })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'schedules/schedule-1', { revision: 1, config })).toEqual({ status: 409, body: { error: 'Schedule changed. Reload before saving.' } })
+  expect(await call('PUT', 'schedules/schedule-1', { revision: 2, config })).toEqual({ status: 200, body: { item } })
+  expect(await call('POST', 'schedules/schedule-1/run')).toEqual({ status: 200, body: { status: 'queued', item } })
+  expect(await call('DELETE', 'schedules/schedule-1', { revision: 1 })).toMatchObject({ status: 409 })
+  expect(await call('DELETE', 'schedules/schedule-1', { revision: 2 })).toEqual({ status: 200, body: { removed: true } })
+  expect(await call('POST', 'schedules/schedule-1/run', undefined, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
 })
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {

@@ -112,6 +112,7 @@ export interface PanelServer {
   prompts: PromptsView
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   ticketDelay?: Promise<void>
+  schedules: ApiResponse<'GET schedules'>
   decisions: ApiResponse<'GET decisions'>['items']
   decisionDelay?: Promise<void>
   threads: ThreadRow[]
@@ -290,6 +291,10 @@ function initial(): PanelServer {
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
       defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], failures: [], notificationPending: false, next_offset: null },
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() }, decisions: [acceptDecision()],
+    schedules: { revision: 1, items: [{ id: 'schedule-1', revision: 1, config: { name: '邮箱检查', enabled: true,
+      program: 'C:\\Python\\python.exe', args: ['mail_check.py', '--quiet'], cwd: 'C:\\mail-check', intervalSeconds: 300,
+      timeoutSeconds: 120 }, nextRunAt: '2026-11-02T00:00:00.000Z', lastRun: { status: 'success', startedAt: '2026-11-01T00:00:00.000Z',
+      finishedAt: '2026-11-01T00:00:03.000Z', exitCode: 0 }, running: false }] },
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
       { stage: 'person', action: 'answer' }),
@@ -361,6 +366,38 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     return task
   } },
   'GET state': { answer: stateView },
+  'GET schedules': { answer: () => server.schedules },
+  'POST schedules': { body: true, answer: ({ body }) => {
+    const revision = ++server.schedules.revision
+    const item = { id: `schedule-${server.schedules.items.length + 2}`, revision: 1, config: body.config,
+      nextRunAt: body.config.enabled ? new Date(Date.now() + body.config.intervalSeconds * 1000).toISOString() : null, running: false }
+    server.schedules.items.push(item)
+    return { item }
+  } },
+  'PUT schedules/:id': { body: true, answer: ({ params, body }) => {
+    const item = server.schedules.items.find(candidate => candidate.id === params.id)
+    if (!item) return refuse(404, 'Schedule not found')
+    if (item.revision !== body.revision) return refuse(409, 'Schedule changed. Reload before saving.')
+    item.revision++; server.schedules.revision++
+    item.config = body.config
+    item.nextRunAt = body.config.enabled ? new Date(Date.now() + body.config.intervalSeconds * 1000).toISOString() : null
+    return { item }
+  } },
+  'POST schedules/:id/run': { answer: ({ params }) => {
+    const item = server.schedules.items.find(candidate => candidate.id === params.id)
+    if (!item) return refuse(404, 'Schedule not found')
+    const status = server.settings.paused ? 'queued' : 'running'
+    item.running = status === 'running'
+    item.lastRun = { status: 'running', startedAt: new Date().toISOString() }
+    return { status, item }
+  } },
+  'DELETE schedules/:id': { body: true, answer: ({ params, body }) => {
+    const index = server.schedules.items.findIndex(candidate => candidate.id === params.id)
+    if (index < 0) return refuse(404, 'Schedule not found')
+    if (server.schedules.items[index]!.revision !== body.revision) return refuse(409, 'Schedule changed. Reload before saving.')
+    server.schedules.items.splice(index, 1); server.schedules.revision++
+    return { removed: true }
+  } },
   'GET watchdog/snapshot': { answer: () => ({ schema: 1, observedAt: new Date().toISOString(), infrastructure: { configured: true, paused: false, health: {}, setup: [] },
     executor: { activeWorkers: 0, maxWorkers: 4 }, tickets: [], candidates: [], baseline: { status: 'healthy', findings: [], semanticReview: 'not_configured' } }) },
   'POST watchdog/tickets/:id/request-status': { answer: () => ({ requested: false }) },

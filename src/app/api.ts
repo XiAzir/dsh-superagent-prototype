@@ -10,6 +10,7 @@ import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } f
 import type { TicketListView } from './views/tickets.ts'
 import type { WebTaskSummary, WebTaskView } from './web-tasks.ts'
 import type { QqStatus } from './qq-source.ts'
+import type { ScheduleConfig, ScheduleItem, ScheduleList } from './schedules.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -20,6 +21,11 @@ interface Paged { offset?: number; limit?: number }
 type Delivery = 'injected' | 'pending'
 
 export interface Api {
+  'GET schedules': { response: ScheduleList }
+  'POST schedules': { body: { config: ScheduleConfig }; response: { item: ScheduleItem } }
+  'PUT schedules/:id': { body: { revision: number; config: ScheduleConfig }; response: { item: ScheduleItem } }
+  'POST schedules/:id/run': { response: { status: 'queued' | 'running'; item: ScheduleItem } }
+  'DELETE schedules/:id': { body: { revision: number }; response: { removed: true } }
   'GET qq/status': { response: QqStatus }
   'PUT qq/token': { body: { value: string }; response: { configured: boolean } }
   'GET web/tasks': { query?: Paged; response: { items: WebTaskSummary[]; next_offset: number | null } }
