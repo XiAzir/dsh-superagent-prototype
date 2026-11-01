@@ -222,7 +222,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a status update requested by a human follow-up, a ready result, or attention requiring human action, as the replies section says. purpose=status requires both the current follow-up trigger_id and a ticket_id it reached on a non-context thread; it returns the current read-only status snapshot with the reply receipt. For status, use only evidence in that snapshot, ticket card or latest report; do not ask the worker to answer. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. Web and QQ replies may contain the complete useful result, up to 20000 characters. Feishu IM limit: ${IM_WORDS} words.`,
+      description: `Reply as the replies section directs. status requires a human trigger_id and a non-context ticket_id it reached; use saved card/report evidence without waiting for the worker. Its receipt includes a snapshot. result requires readiness/completion or a rule-authorized dropped result; attention requires the current question. Web/QQ limit: 20000 characters; Feishu: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().min(1).optional().describe('Original human question for answer; current human follow-up for status.'),
         ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention.'),
