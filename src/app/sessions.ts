@@ -61,31 +61,10 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
-/** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
-const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
-  + 'end the turn instead of waiting for them.'
-/** What a main Session under `standard` is told when its command would wait the shell's default. */
-const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
-  + 'as a waiting step holds back new candidates.'
-/** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
-const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
-const POWERSHELL_SLEEP = /(?:^|[;&|({`\n])\s*(?:(?:Microsoft\.PowerShell\.Utility\\)?Start-Sleep|sleep)\b/i
-/**
- * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
- * job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
- * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
- * job wait its timeout; the router preset ends both after 5 seconds.
- */
-function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
-  const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
-  if (name === 'bash' || name === 'pwsh') {
-    const sleeps = typeof args.command === 'string' && (name === 'pwsh' ? POWERSHELL_SLEEP : SLEEP).test(args.command)
-    if (sleeps || typeof args.timeoutMs === 'number' && args.timeoutMs > 30_000) return NO_WAIT
-    if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
-  }
-  if (name === 'job_output' && args.wait === true && (typeof args.timeout_ms === 'number' ? args.timeout_ms > 5_000 : !routed())) return NO_WAIT
-  return undefined
-}
+/** Inherited work tools are refused for Routers, including Sessions created earlier with a broader preset. */
+const ROUTER_DENIED_TOOLS = new Set([...WORK_TOOLS.filter(name => name !== 'skill'), 'pwsh', 'ask_user_question', 'plugin_manager',
+  'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit'])
+const ROUTER_TOOL_REFUSAL = 'The main Session routes work through its orchestrator tools; Executor Sessions handle code, files, commands and other task execution.'
 
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
@@ -273,27 +252,13 @@ export class Sessions {
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
       const parent = scopeParentOf(agent)
-      const allow = ['skill', 'bash', 'pwsh', 'read', 'read_image', 'job_output', 'job_list', 'job_kill']
-        .filter(name => agent.ctx.tools.get(name, parent))
+      const allow = ['skill'].filter(name => agent.ctx.tools.get(name, parent))
       binding.disposers.push(agent.ctx.tools.restrict({ allow }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+        agent.ctx.tools.guard(({ name }) => ROUTER_DENIED_TOOLS.has(name) ? ROUTER_TOOL_REFUSAL : undefined))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
     }
-  }
-  /**
-   * Whether a Session runs the router preset: as DSH's preset registry last selected it, read through the session projection
-   * on a DSH whose registry has no `presetForSession`, else as it was created; `standard`, the safer caps, when unreadable.
-   */
-  private routed(agent: Agent): boolean {
-    try {
-      const presets = this.ctx.get('agentPresets') as { presetForSession?: (session: Agent['session']) => string | null } | undefined
-      const projections = this.ctx.get('sessionProjections') as { stateOf?: (session: Agent['session'], key: string) => unknown } | undefined
-      const selected = typeof presets?.presetForSession === 'function' ? presets.presetForSession(agent.session)
-        : projections?.stateOf?.(agent.session, 'agentPreset')
-      return (selected ?? agent.session.header.agentPreset) === ROUTER_PRESET
-    } catch { return false }
   }
   /**
    * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
