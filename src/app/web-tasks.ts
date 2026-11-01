@@ -6,8 +6,10 @@ import type { Health } from '../sources/host.ts'
 import type { SourceKind } from '../sources/kind.ts'
 import { SourcePolicySchema } from '../policy.ts'
 import type { Store } from './store.ts'
+import type { ArtifactRegistry, TaskArtifact } from './artifacts.ts'
 
-export interface WebMessage { id: string; role: 'user' | 'assistant'; text: string; at: string }
+export interface WebMessageArtifact { id: string; ticketId: string; name: string; size: number; kind: TaskArtifact['kind'] }
+export interface WebMessage { id: string; role: 'user' | 'assistant'; text: string; at: string; artifacts?: WebMessageArtifact[] }
 export interface WebTaskSummary {
   id: string; title: string; createdAt: string; updatedAt: string
   status: 'queued' | 'working' | 'person' | 'done' | 'idle' | 'paused'
@@ -21,6 +23,7 @@ interface WebTaskHost {
   configured(): boolean
   health(): Readonly<Record<string, Health>>
   failure?(ticketIds: string[]): { message: string; at: string } | undefined
+  artifacts?: Pick<ArtifactRegistry, 'verify'>
   receive(trigger: Trigger): ReceiveResult
   requestPass(): void
 }
@@ -63,6 +66,18 @@ export class WebTasks {
       next_offset: offset + limit < tasks.length ? offset + limit : null }
   }
   get(id: string): WebTaskView { this.requireMode(); return this.view(this.record(id)) }
+  /** Returns a verified snapshot only when an assistant message in this conversation has already delivered it. */
+  async artifact(conversation: string, id: string): Promise<TaskArtifact> {
+    this.requireWritable()
+    const task = this.record(conversation)
+    const delivered = task.messages.filter(message => message.role === 'assistant').flatMap(message => message.artifacts ?? []).find(item => item.id === id)
+    if (!delivered || !this.host.artifacts) throw new WebTaskError(404, '交付文件不存在。')
+    const artifact = await this.host.artifacts.verify(id, delivered.ticketId)
+    if (artifact.name !== delivered.name || artifact.size !== delivered.size || artifact.kind !== delivered.kind) {
+      throw new WebTaskError(404, '交付文件不存在。')
+    }
+    return artifact
+  }
   create(input: unknown): WebTaskView {
     this.requireWritable()
     const { text, requestId } = WebMessageRequest.parse(input)
@@ -132,7 +147,11 @@ export class WebTasks {
 }
 
 /** Channel delivery is persisted atomically and idempotently before the outbox marks the reply sent. */
-export function webSource(store: Store, personal: () => boolean): SourceKind<Record<string, never>> {
+export function webSource(store: Store, personal: () => boolean, artifacts?: Pick<ArtifactRegistry, 'verify'>): SourceKind<Record<string, never>> {
+  const authorized = (): boolean => {
+    const settings = store.settings()
+    return personal() && settings.sources.web?.enabled !== false && !!settings.policy.sources.web?.allowed.some(actor => actor.id === 'owner')
+  }
   return {
     kind: 'web', title: { zh: 'Web 任务', en: 'Web tasks' },
     description: { zh: '从本机 Web 面板交办任务，并在原对话查看回复与结果。', en: 'Submit tasks and read replies in the local Web panel.' },
@@ -154,18 +173,50 @@ export function webSource(store: Store, personal: () => boolean): SourceKind<Rec
       },
     },
     channel: {
-      allowed: address => personal() && !!store.get(taskKey(address.conversation ?? '')),
+      artifacts: true,
+      allowed: address => authorized() && !!store.get(taskKey(address.conversation ?? '')),
       link: () => ({ url: '', label: { zh: 'Web 任务', en: 'Web task' } }),
-      send: async (_host, message) => store.atomic(() => {
-        const task = store.get(taskKey(message.channel.address.conversation ?? ''))
+      send: async (_host, message) => {
+        if (!authorized()) return 'gone'
+        const taskId = message.channel.address.conversation ?? ''
+        const task = store.get(taskKey(taskId))
         if (!task) return 'gone'
-        if (!task.messages.some(item => item.id === message.id)) {
-          const at = new Date().toISOString()
-          task.messages.push({ id: message.id, role: 'assistant', text: message.text, at }); task.updatedAt = at
-          store.set(taskKey(task.id), task)
+        const artifactIds = [...new Set(message.artifacts ?? [])]
+        const sameDeliveredArtifacts = (existing: WebMessage | undefined): boolean => {
+          const delivered = existing?.artifacts ?? []
+          return JSON.stringify(delivered.map(item => item.id)) === JSON.stringify(artifactIds)
+            && delivered.every(item => item.ticketId === message.ticketId)
         }
-        return 'sent'
-      }),
+        const previous = task.messages.find(item => item.id === message.id)
+        if (previous) {
+          if (previous.role !== 'assistant' || previous.text !== message.text || !sameDeliveredArtifacts(previous)) throw new Error('Web message ID was reused for different content')
+          return 'sent'
+        }
+        let descriptors: WebMessageArtifact[] | undefined
+        if (artifactIds.length) {
+          if (!message.ticketId || !artifacts) throw new Error('Web artifact delivery requires its originating ticket and durable artifact registry')
+          descriptors = await Promise.all(artifactIds.map(async id => {
+            const artifact = await artifacts.verify(id, message.ticketId)
+            return { id: artifact.id, ticketId: artifact.ticketId, name: artifact.name, size: artifact.size, kind: artifact.kind }
+          }))
+          if (!authorized()) return 'gone'
+        }
+        return store.atomic(() => {
+          if (!authorized()) return 'gone'
+          const current = store.get(taskKey(taskId))
+          if (!current) return 'gone'
+          const raced = current.messages.find(item => item.id === message.id)
+          if (raced) {
+            if (raced.role !== 'assistant' || raced.text !== message.text || !sameDeliveredArtifacts(raced)) throw new Error('Web message ID was reused for different content')
+            return 'sent'
+          }
+          const at = new Date().toISOString()
+          current.messages.push({ id: message.id, role: 'assistant', text: message.text, at, ...descriptors?.length ? { artifacts: descriptors } : {} })
+          current.updatedAt = at
+          store.set(taskKey(current.id), current)
+          return 'sent'
+        })
+      },
     },
   }
 }

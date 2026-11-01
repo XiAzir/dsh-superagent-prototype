@@ -7,6 +7,7 @@ import type { DshSuperagentKey } from './locales.ts'
 import { usePanel } from './provider.tsx'
 import { errorText, valueLabel, when } from './text.ts'
 import { Hint, LoadState, MarkdownLite, PageHead, Section } from './widgets.tsx'
+import { ArtifactDownload } from './artifacts.tsx'
 
 const statusKey = (status: WebTaskSummary['status']): DshSuperagentKey => `webTask.status.${status}`
 const statusTone = (status: WebTaskSummary['status']) => status === 'done' ? 'success'
@@ -111,6 +112,9 @@ function TaskThread({ task, onUpdated }: { task: WebTaskView; onUpdated: (task: 
             <time dateTime={message.at}>{when(message.at, t('lang'))}</time></div>
           {message.role === 'assistant' ? <MarkdownLite text={message.text} />
             : <div className="dt-web-task-user-text">{message.text}</div>}
+          {!!message.artifacts?.length && <ul className="dt-web-task-artifacts">
+            {message.artifacts.map(artifact => <li key={artifact.id}><ArtifactDownload conversation={task.id} artifact={artifact} /></li>)}
+          </ul>}
         </li>)}
       </ol>}
     </Section>

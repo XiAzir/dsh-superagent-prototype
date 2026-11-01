@@ -65,6 +65,9 @@ Web 来源由插件内置，随个人模式创建默认配置。消息的个人�
 | `POST /orchestrator/api/web/tasks` | 交办新的任务 |
 | `GET /orchestrator/api/web/tasks/:id` | 读取完整对话和关联工单 |
 | `POST /orchestrator/api/web/tasks/:id/messages` | 在原任务中继续交办或追问 |
+| `GET /orchestrator/api/web/tasks/:id/artifacts/:artifact` | 下载原对话中已交付的产物快照 |
 
 发送正文为 `{ "text": "任务描述", "requestId": "唯一请求编号" }`。
 身份、来源和工单权限由服务端生成与检查。
+
+Worker 通过 `orchestrator_report` 登记产物后，Router 的结果回复会在原任务中显示下载按钮。下载请求复用同源认证，并检查该文件确实交付到当前对话及当前 owner 授权；关闭 Web 来源或撤销授权后会拒绝下载。每个文件最多 50 MiB，返回前校验快照大小和 SHA-256，显示文件名保留中文。按钮显示下载进度状态，失败原因出现在按钮旁，可重新尝试。

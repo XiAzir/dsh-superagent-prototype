@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -8,6 +8,7 @@ import { WebTaskError, WebTasks, webSource } from '../src/app/web-tasks.ts'
 import { record } from '../src/kv.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
+import { ArtifactRegistry } from '../src/app/artifacts.ts'
 
 let directory: string
 let store: Store
@@ -15,6 +16,7 @@ let sources: SourceRegistry
 let engine: Engine
 let tasks: WebTasks
 let requestPass: ReturnType<typeof vi.fn<() => void>>
+let artifacts: ArtifactRegistry
 
 function enableWeb(allowed = true, enabled = true) {
   store.saveSettings(SettingsSchema.parse({
@@ -26,15 +28,16 @@ function enableWeb(allowed = true, enabled = true) {
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'web-tasks-'))
   store = new Store(join(directory, 'orchestrator.sqlite'))
+  artifacts = new ArtifactRegistry(store, directory)
   enableWeb()
   sources = new SourceRegistry(() => store.settings())
-  sources.register(webSource(store, () => true))
+  sources.register(webSource(store, () => true, artifacts))
   engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources),
     assessor: { request: vi.fn() }, executor: { start: async () => {}, deliver: async () => {}, stop: async () => {} },
     outbox: { send: () => {}, status: () => undefined, withdraw: () => {} } })
   requestPass = vi.fn(() => {})
   tasks = new WebTasks({ store, mode: () => 'personal', configured: () => true, health: () => ({}),
-    receive: trigger => engine.receive(trigger), requestPass })
+    receive: trigger => engine.receive(trigger), requestPass, artifacts })
 })
 
 afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
@@ -98,9 +101,61 @@ it('persists assistant replies once through the Web channel even when delivery i
 
   expect(await web.channel!.send({} as never, message)).toBe('sent')
   expect(await web.channel!.send({} as never, message)).toBe('sent')
+  expect(sources.channelAllowed({ source: 'web', address: { conversation: task.id } })).toBe(true)
   expect(tasks.get(task.id).messages.filter(item => item.id === message.id)).toEqual([
     expect.objectContaining({ role: 'assistant', text: '我开始整理。' }),
   ])
+})
+
+it('verifies, persists and serves only delivered Web artifacts under the current owner authorization', async () => {
+  const task = tasks.create({ text: '整理报告', requestId: id('artifact') })
+  const other = tasks.create({ text: '另一段对话', requestId: id('other') })
+  const work = join(directory, 'work', 'ticket-1')
+  mkdirSync(work, { recursive: true })
+  const source = join(work, 'report.txt')
+  writeFileSync(source, 'original snapshot bytes')
+  const artifact = await artifacts.stage('ticket-1', work, source, '交付报告.txt', 'file')
+  writeFileSync(source, 'edited after staging')
+  const message: OutboundMessage = { id: 'assistant-artifact-1', channel: { source: 'web', thread: `web:${task.id}`,
+    address: { conversation: task.id } }, text: '报告已完成。', kind: 'reply', ticketId: 'ticket-1', artifacts: [artifact.id] }
+  const web = sources.kind('web')!
+
+  expect(await web.channel!.send({} as never, message)).toBe('sent')
+  expect(await web.channel!.send({} as never, message)).toBe('sent')
+  expect(tasks.get(task.id).messages.filter(item => item.id === message.id)).toEqual([
+    expect.objectContaining({ role: 'assistant', text: '报告已完成。', artifacts: [{ id: artifact.id, ticketId: 'ticket-1', name: '交付报告.txt', size: artifact.size, kind: 'file' }] }),
+  ])
+  await expect(tasks.artifact(task.id, artifact.id)).resolves.toMatchObject({ id: artifact.id, path: artifact.path })
+  expect(readFileSync(artifact.path, 'utf8')).toBe('original snapshot bytes')
+  await expect(tasks.artifact(other.id, artifact.id)).rejects.toMatchObject({ status: 404 })
+  await expect(tasks.artifact(task.id, 'artifact_not-delivered')).rejects.toMatchObject({ status: 404 })
+
+  enableWeb(true, false)
+  expect(sources.channelAllowed({ source: 'web', address: { conversation: task.id } })).toBe(false)
+  await expect(tasks.artifact(task.id, artifact.id)).rejects.toMatchObject({ status: 409 })
+  enableWeb(false, true)
+  expect(sources.channelAllowed({ source: 'web', address: { conversation: task.id } })).toBe(false)
+  await expect(tasks.artifact(task.id, artifact.id)).rejects.toMatchObject({ status: 409 })
+})
+
+it('drops a Web artifact delivery when owner authorization is revoked during snapshot verification', async () => {
+  const task = tasks.create({ text: '生成草稿', requestId: id('artifact-race') })
+  const work = join(directory, 'work', 'ticket-race')
+  mkdirSync(work, { recursive: true })
+  const source = join(work, 'draft.txt')
+  writeFileSync(source, 'draft')
+  const artifact = await artifacts.stage('ticket-race', work, source)
+  const verify = artifacts.verify.bind(artifacts)
+  artifacts.verify = async (artifactId, ticketId) => {
+    const checked = await verify(artifactId, ticketId)
+    enableWeb(false, true)
+    return checked
+  }
+  const message: OutboundMessage = { id: 'assistant-artifact-race', channel: { source: 'web', thread: `web:${task.id}`,
+    address: { conversation: task.id } }, text: '生成完成', kind: 'reply', ticketId: 'ticket-race', artifacts: [artifact.id] }
+
+  await expect(sources.kind('web')!.channel!.send({} as never, message)).resolves.toBe('gone')
+  expect(tasks.get(task.id).messages.some(item => item.id === message.id)).toBe(false)
 })
 
 it('rejects creation after the Web source is disabled or owner authorization is revoked', () => {

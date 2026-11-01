@@ -35,7 +35,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   })
   ctx.effect(() => () => { clearTimeout(modeRestart) })
   const runtime = new Runtime(ctx, machine, restart)
-  ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal')))
+  ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal', runtime.artifacts)))
   const qq = runtime.qq = new QqBridge({ store: runtime.store, stateDir: machine.stateDir, artifacts: runtime.artifacts,
     configured: () => runtime.configured(), receive: trigger => runtime.receive(trigger),
     notify: message => runtime.outbox.send(message),

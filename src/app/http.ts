@@ -1,6 +1,8 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
@@ -22,6 +24,7 @@ import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
+import type { ArtifactRegistry } from './artifacts.ts'
 import { overview } from './views/overview.ts'
 import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
@@ -36,6 +39,7 @@ export interface HttpHost {
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
+  readonly artifacts?: Pick<ArtifactRegistry, 'verify'> | undefined
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
@@ -81,6 +85,8 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number):
   if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
   return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
 }
+const MAX_WEB_ARTIFACT_BYTES = 50 * 1024 * 1024
+const encodedFilename = (name: string): string => encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof QqSourceError) return [error.status, { error: error.message }]
@@ -279,6 +285,29 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        const artifactRoute = /^\/orchestrator\/api\/web\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
+        if (artifactRoute) {
+          if (req.method !== 'GET') throw new RouteError(404, 'Unknown operation')
+          const conversation = decoded(artifactRoute[1]!)
+          const id = decoded(artifactRoute[2]!)
+          const tasks = new WebTasks({ store: runtime.store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
+            health: () => runtime.health, artifacts: runtime.artifacts,
+            receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() } })
+          const artifact = await tasks.artifact(conversation, id)
+          if (artifact.size > MAX_WEB_ARTIFACT_BYTES) throw new RouteError(404, 'Delivered artifact exceeds the download limit')
+          const bytes = await readFile(artifact.path)
+          if (bytes.byteLength !== artifact.size || bytes.byteLength > MAX_WEB_ARTIFACT_BYTES
+            || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw new Error('Artifact spool content changed during Web delivery')
+          const current = await tasks.artifact(conversation, id)
+          if (current.ticketId !== artifact.ticketId || current.size !== artifact.size || current.sha256 !== artifact.sha256) {
+            throw new WebTaskError(404, '交付文件不存在。')
+          }
+          res.writeHead(200, { 'content-type': 'application/octet-stream',
+            'content-disposition': `attachment; filename="download"; filename*=UTF-8''${encodedFilename(artifact.name)}`,
+            'content-length': String(bytes.byteLength), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
+          res.end(bytes)
+          return
+        }
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)

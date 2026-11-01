@@ -87,6 +87,10 @@
 .dt-web-task-message-head time { margin-left: auto; }
 .dt-web-task-user-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 20px; }
 .dt-web-task-message .dt-md { overflow-wrap: anywhere; }
+.dt-web-task-artifacts { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+.dt-web-task-artifact { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.dt-web-task-artifact .dt-web-task-artifact-button { white-space: normal; text-align: left; overflow-wrap: anywhere; max-width: 100%; min-height: 44px; }
+.dt-web-task-artifact .dt-error { flex-basis: 100%; margin: 0; }
 .dt-web-task-results { display: flex; flex-direction: column; gap: 16px; }
 .dt-web-task-results article { padding: 12px 14px; border-radius: 10px; background: var(--dsw-alias-bg-module-platform); overflow-wrap: anywhere; }
 .dt-web-task-results h3 { margin: 0 0 8px; font-size: 13px; line-height: 20px; font-weight: 600; }
