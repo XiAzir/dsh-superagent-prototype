@@ -61,7 +61,7 @@ Web 来源由插件内置，随个人模式创建默认配置。消息的个人�
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /orchestrator/api/web/tasks` | 按更新时间分页列出对话 |
+| `GET /orchestrator/api/web/tasks` | 按更新时间和 ID 稳定排序分页列出对话；SQLite 持久摘要索引为列表提供摘要字段，消息正文仅在读取单个对话时加载。已有 KV 对话会在 Store 打开时一次性回填索引 |
 | `POST /orchestrator/api/web/tasks` | 交办新的任务 |
 | `GET /orchestrator/api/web/tasks/:id` | 读取完整对话和关联工单 |
 | `POST /orchestrator/api/web/tasks/:id/messages` | 在原任务中继续交办或追问 |

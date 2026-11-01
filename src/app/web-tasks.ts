@@ -60,10 +60,13 @@ export class WebTasks {
   }
   list(offset = 0, limit = 50): { items: WebTaskSummary[]; next_offset: number | null } {
     this.requireMode()
-    const tasks = this.host.store.keys(PREFIX).map(name => this.host.store.get(record<WebTaskRecord>(name))!)
-      .map(task => this.view(task)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
-    return { items: tasks.slice(offset, offset + limit).map(({ messages: _messages, error: _error, ...summary }) => summary),
-      next_offset: offset + limit < tasks.length ? offset + limit : null }
+    const rows = this.host.store.webTasks.page(offset, limit + 1)
+    const page = rows.slice(0, limit)
+    const items = page.map(row => {
+      const { messages: _messages, error: _error, ...summary } = this.view({ ...row, messages: [] }, row.lastUserAt)
+      return summary
+    })
+    return { items, next_offset: rows.length > limit ? offset + limit : null }
   }
   get(id: string): WebTaskView { this.requireMode(); return this.view(this.record(id)) }
   /** Returns a verified snapshot only when an assistant message in this conversation has already delivered it. */
@@ -111,15 +114,16 @@ export class WebTasks {
       actor: { source: 'web', id: 'owner' }, human: true, addressed: 'direct', text, at,
       channel: { source: 'web', thread: `web:${task.id}`, address: { conversation: task.id } }, meta: { conversation: task.id } }
     this.host.store.atomic(() => {
-      task.messages.push({ id, role: 'user', text, at }); task.updatedAt = at
+      task.messages.push({ id, role: 'user', text, at }); task.updatedAt = task.updatedAt < at ? at : task.updatedAt
       this.host.store.set(taskKey(task.id), task)
+      this.host.store.webTasks.save({ id: task.id, title: task.title, createdAt: task.createdAt, updatedAt: task.updatedAt, lastUserAt: at })
       const result = this.host.receive(trigger)
       if (result === 'filtered') throw new WebTaskError(409, 'Web 任务来源已暂停接收，请检查来源设置。')
       this.host.store.threads.describe(`web:${task.id}`, { label: task.title })
     })
     this.host.requestPass()
   }
-  private view(task: WebTaskRecord): WebTaskView {
+  private view(task: WebTaskRecord, indexedLastUserAt?: string): WebTaskView {
     const store = this.host.store, thread = store.threads.get(`web:${task.id}`)
     const tickets = [...new Set(thread?.subscriptions ?? [])].flatMap(id => {
       const ticket = store.tickets.get(id)
@@ -134,7 +138,7 @@ export class WebTasks {
       : working ? 'working' : queued ? 'queued' : tickets.some(ticket => ticket.derived.stage === 'person') ? 'person'
         : tickets.length && !open ? 'done' : tickets.length ? 'idle' : latestDecision ? 'idle' : 'queued'
     const updatedAt = [task.updatedAt, ...tickets.map(ticket => ticket.updatedAt), latestDecision?.at ?? ''].sort().at(-1)!
-    const userAt = task.messages.findLast(message => message.role === 'user')?.at ?? task.createdAt
+    const userAt = indexedLastUserAt ?? task.messages.findLast(message => message.role === 'user')?.at ?? task.createdAt
     const failure = this.host.failure?.(tickets.map(ticket => ticket.id))
     const error = this.host.health().runtime?.state === 'error' ? this.host.health().runtime?.detail
       : failure && failure.at >= userAt && status !== 'done' ? failure.message
@@ -212,8 +216,10 @@ export function webSource(store: Store, personal: () => boolean, artifacts?: Pic
           }
           const at = new Date().toISOString()
           current.messages.push({ id: message.id, role: 'assistant', text: message.text, at, ...descriptors?.length ? { artifacts: descriptors } : {} })
-          current.updatedAt = at
+          current.updatedAt = current.updatedAt < at ? at : current.updatedAt
           store.set(taskKey(current.id), current)
+          store.webTasks.save({ id: current.id, title: current.title, createdAt: current.createdAt, updatedAt: current.updatedAt,
+            lastUserAt: [...current.messages].reverse().find(item => item.role === 'user')?.at ?? current.createdAt })
           return 'sent'
         })
       },

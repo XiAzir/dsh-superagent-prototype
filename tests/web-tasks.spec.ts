@@ -194,6 +194,9 @@ it('retains conversations after reopening the persistent Store and paginates by 
   const second = tasks.create({ text: '任务乙', requestId: id('pageb') })
   store.close()
   store = new Store(join(directory, 'orchestrator.sqlite'))
+  engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources),
+    assessor: { request: vi.fn() }, executor: { start: async () => {}, deliver: async () => {}, stop: async () => {} },
+    outbox: { send: () => {}, status: () => undefined, withdraw: () => {} } })
   tasks = new WebTasks({ store, mode: () => 'personal', configured: () => true, health: () => ({}),
     receive: trigger => engine.receive(trigger), requestPass })
 
@@ -201,6 +204,61 @@ it('retains conversations after reopening the persistent Store and paginates by 
   expect(tasks.get(second.id).messages[0]?.text).toBe('任务乙')
   expect(tasks.list(0, 1)).toMatchObject({ items: [{ id: second.id }], next_offset: 1 })
   expect(tasks.list(1, 1)).toMatchObject({ items: [{ id: first.id }], next_offset: null })
+})
+
+it('pages a 1,000-task history from the summary index without reading conversation records', () => {
+  const old = new Date(Date.parse('2020-01-01T00:00:00.000Z'))
+  store.atomic(() => {
+    for (let index = 0; index < 1000; index++) {
+      const taskId = `legacy-${String(index).padStart(4, '0')}`
+      const createdAt = new Date(old.getTime() + index).toISOString()
+      store.set(record(`web-task:${taskId}`), { id: taskId, title: `task ${index}`, createdAt, updatedAt: createdAt,
+        messages: [{ id: `message-${index}`, role: 'user', text: 'large body', at: createdAt }] })
+      store.webTasks.save({ id: taskId, title: `task ${index}`, createdAt, updatedAt: createdAt, lastUserAt: createdAt })
+    }
+  })
+  const get = vi.spyOn(store, 'get')
+
+  expect(tasks.list(0, 1)).toMatchObject({ items: [{ id: 'legacy-0999' }], next_offset: 1 })
+  expect(get.mock.calls.filter(([name]) => String(name).startsWith('web-task:'))).toHaveLength(0)
+})
+
+it('backfills the summary index from existing task KV records and updates order on appended messages', async () => {
+  const oldAt = '2024-01-01T00:00:00.000Z'
+  store.set(record(`web-task:legacy-task`), { id: 'legacy-task', title: '旧任务', createdAt: oldAt, updatedAt: oldAt,
+    messages: [{ id: 'old-user-message', role: 'user', text: '保留在正文', at: oldAt }] })
+  store.delete('web-task-summary-index-v2-ready')
+  store.close()
+  store = new Store(join(directory, 'orchestrator.sqlite'))
+  engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources),
+    assessor: { request: vi.fn() }, executor: { start: async () => {}, deliver: async () => {}, stop: async () => {} },
+    outbox: { send: () => {}, status: () => undefined, withdraw: () => {} } })
+  tasks = new WebTasks({ store, mode: () => 'personal', configured: () => true, health: () => ({}),
+    receive: trigger => engine.receive(trigger), requestPass })
+
+  expect(tasks.list(0, 1).items[0]).toMatchObject({ id: 'legacy-task', title: '旧任务' })
+  const first = tasks.create({ text: '先创建', requestId: id('sorta') })
+  await new Promise(resolve => setTimeout(resolve, 2))
+  tasks.followup('legacy-task', { text: '追加消息后应排到前面', requestId: id('sortb') })
+  expect(tasks.list(0, 1).items[0]?.id).toBe('legacy-task')
+  expect(tasks.get('legacy-task').messages.map(message => message.text)).toEqual(['保留在正文', '追加消息后应排到前面'])
+  expect(tasks.get(first.id).messages).toHaveLength(1)
+})
+
+it('uses the ordered summary index for pages and advances task order when a subscribed Ticket changes', () => {
+  const older = tasks.create({ text: '较早任务', requestId: id('ticket-order1') })
+  const newer = tasks.create({ text: '较新任务', requestId: id('ticket-order2') })
+  const thread = store.threads.get(`web:${older.id}`)!
+  const ticketId = 'ticket-web-sort'
+  store.threads.save({ ...thread, pending: [], subscriptions: [ticketId] })
+  store.tickets.save({ id: ticketId, title: 'indexed task', updatedAt: '9999-01-01T00:00:00.000Z', assignments: [],
+    ended: { at: '9999-01-01T00:00:00.000Z', by: 'worker', outcome: 'done' } } as never)
+
+  expect(tasks.list(0, 1).items[0]).toMatchObject({ id: older.id, status: 'done', updatedAt: '9999-01-01T00:00:00.000Z' })
+  expect(newer.id).not.toBe(older.id)
+  const plan = store.db.prepare(`EXPLAIN QUERY PLAN SELECT id, title, created_at AS createdAt, updated_at AS updatedAt, last_user_at AS lastUserAt
+    FROM web_task_summary ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`).all(1, 0).map(row => String(row.detail)).join('\n')
+  expect(plan).toContain('web_task_summary_updated')
 })
 
 it('reports paused tasks as queued work while the executor is paused', () => {
