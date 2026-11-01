@@ -29,8 +29,8 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await click(find(zh['tab.settings'], '.dt-status-head button'))
   await click(zh['mode.auto'])
   await type(field<HTMLInputElement>(zh.evalTimeout), '180')
-  const [provider, model] = all('.dt-model input')
-  await type(provider as HTMLInputElement, 'worker-provider'); await type(model as HTMLInputElement, 'worker-model')
+  await type(field<HTMLSelectElement>(zh.modelProvider), 'worker-provider')
+  await type(field<HTMLInputElement>(zh.modelName), 'worker-model')
   await click(zh.save)
   expect(server.settings.eval).toEqual({ mode: 'auto', timeoutSeconds: 180, model: { provider: 'worker-provider', model: 'worker-model' } })
   await click(find(zh['promptPart.runtime/work'], '.dt-settings-link'))
@@ -48,9 +48,9 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await click('DSH_SUPERAGENT_DIR')
   expect(field<HTMLTextAreaElement>(zh.prepareCommand).value).toBe('git worktree add "$DSH_SUPERAGENT_DIR"')
   await type(field<HTMLInputElement>(zh.blockedCommands), 'gh-personal  gh.other')
-  const [workerProvider, workerModel, effort] = all('.dt-model input')
-  await type(workerProvider as HTMLInputElement, 'worker-provider'); await type(workerModel as HTMLInputElement,
-    'worker-model'); await type(effort as HTMLInputElement, 'high')
+  await type(field<HTMLSelectElement>(zh.modelProvider), 'worker-provider')
+  await type(field<HTMLInputElement>(zh.modelName), 'worker-model')
+  await type(field<HTMLInputElement>(zh.modelEffort), 'high')
   expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
   await click(zh.save)
   expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work',
@@ -72,6 +72,43 @@ it('loads configuration history on demand with localized changes, Source field l
   await click(zh.configHistory)
   for (const expected of ['第 3 次保存 · 从群同步', '生成策略版本 abcdef12', '接单模式：关闭 → 仅观察', '飞书 · 能发起工作的飞书用户 新增：Bob', '飞书 · 同步来源群：未设置 → oc_team',
     '因策略变更通知了 1 个进行中的工单：修复回归']) expect(text()).toContain(expected)
+})
+
+it.each(['eval', 'execution'] as const)('shows every provider in %s settings even when one provider is already selected', async group => {
+  const ids = ['deepseek-account', 'yunqing-gm', 'yunqing-gpt', 'yunqing-gemini', 'az-ds']
+  server.models = { default: { provider: 'deepseek-account', model: 'default' }, routableProviders: ids, failures: [],
+    groups: ids.map(id => ({ id, name: id, models: [{ id: `${id}-model`, name: `${id}-model` }] })) }
+  const current = { provider: 'yunqing-gm', model: 'deepseek-v4.1-flash', reasoningEffort: 'high' }
+  server.settings.eval.model = { ...current }; server.settings.executor.model = { ...current }
+  await mount()
+  await click(zh[group === 'eval' ? 'tab.eval' : 'tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const provider = field<HTMLSelectElement>(zh.modelProvider)
+  expect(provider.tagName).toBe('SELECT')
+  expect(provider.value).toBe('yunqing-gm')
+  expect([...provider.options].map(option => option.value).filter(value => ids.includes(value))).toEqual(ids)
+  expect(text()).toContain(zh[group === 'eval' ? 'assessorModel' : 'executorModel'])
+  await type(provider, 'yunqing-gpt')
+  expect(field<HTMLInputElement>(zh.modelName).value).toBe('')
+  expect(field<HTMLInputElement>(zh.modelEffort).value).toBe('')
+  await type(provider, '')
+  await click(zh.save)
+  expect(server.settings[group === 'eval' ? 'eval' : 'executor'].model).toBeNull()
+  expect(server.settings[group === 'eval' ? 'executor' : 'eval'].model).toEqual(current)
+})
+
+it('preserves a manually configured provider outside the catalog and still offers all listed providers', async () => {
+  server.settings.executor.model = { provider: 'private-route', model: 'private-model', reasoningEffort: 'high' }
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const provider = field<HTMLSelectElement>(zh.modelProvider)
+  expect([...provider.options].some(option => option.value === 'worker-provider')).toBe(true)
+  expect(field<HTMLInputElement>(zh.modelProviderId).value).toBe('private-route')
+  expect(field<HTMLInputElement>(zh.modelName).value).toBe('private-model')
+  await type(field<HTMLInputElement>(zh.modelProviderId), 'another-private-route')
+  await click(zh.save)
+  expect(server.settings.executor.model).toEqual({ provider: 'another-private-route', model: 'private-model', reasoningEffort: 'high' })
 })
 
 it('shows save and discard only while a settings block has edits, at the end of that block', async () => {

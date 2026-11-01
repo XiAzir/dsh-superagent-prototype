@@ -123,6 +123,7 @@
 .dt-rule-dot[data-enabled] { background: var(--dsw-alias-brand-primary); }
 .dt-rule-body { display: flex; flex-direction: column; gap: 12px; padding: 8px 0 8px 28px; }
 .dt-model { display: flex; flex-direction: column; gap: 6px; }
+.dt-model-provider { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .dt-grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .dt-changes { display: flex; flex-direction: column; gap: 2px; font-size: 13px; line-height: 20px; }
 .dt-changes li::before { content: '· '; color: var(--dsw-alias-label-caption); }
