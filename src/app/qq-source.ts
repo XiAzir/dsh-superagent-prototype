@@ -74,6 +74,10 @@ export class QqBridge {
   private readonly threads: QqThreads
   private client?: OneBotClient
   private timer?: ReturnType<typeof setInterval>
+  private loginRetryTimer?: ReturnType<typeof setTimeout>
+  private loginAbort?: AbortController
+  private loginSequence = 0
+  private loginRetryAttempt = 0
   private checking?: Promise<void>
   private events: Promise<void> = Promise.resolve()
   private fingerprint = ''
@@ -126,13 +130,39 @@ export class QqBridge {
   }
   async stop(): Promise<void> {
     this.downloads.abort()
-    this.stopped = true; clearInterval(this.timer); await this.checking
+    this.stopped = true; clearInterval(this.timer); this.cancelLoginInfo(); await this.checking
     await this.client?.stop(); this.client = undefined; await this.events; await this.attachments.idle()
   }
   private setState(state: QqStatus['state'], detail: string): void {
     this.state = state; this.detail = safeFailureMessage(detail)
     this.host.report({ state: state === 'connected' ? 'ready' : state === 'error' ? 'error' : state === 'disabled' ? 'paused' : 'starting',
       detail: this.detail, at: new Date().toISOString() })
+  }
+  private cancelLoginInfo(): void {
+    clearTimeout(this.loginRetryTimer); this.loginRetryTimer = undefined
+    this.loginSequence++
+    this.loginAbort?.abort(); this.loginAbort = undefined
+  }
+  private queryLoginInfo(client: OneBotClient): void {
+    if (this.client !== client || !client.connected || this.stopped || this.loginAbort || this.loginRetryTimer) return
+    const sequence = ++this.loginSequence, controller = new AbortController()
+    this.loginAbort = controller
+    void client.getLoginInfo(controller.signal).then(info => {
+      if (sequence !== this.loginSequence || this.client !== client || !client.connected || this.stopped) return
+      this.loginRetryAttempt = 0
+      this.selfId = info.user_id; this.setState('connected', `OneBot 已连接，QQ ${info.user_id}。`)
+    }, error => {
+      if (sequence !== this.loginSequence || this.client !== client || !client.connected || this.stopped) return
+      this.setState('error', safeFailureMessage(error))
+      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.loginRetryAttempt++, 5))
+      this.loginRetryTimer = setTimeout(() => {
+        this.loginRetryTimer = undefined
+        this.queryLoginInfo(client)
+      }, delay)
+      this.loginRetryTimer.unref?.()
+    }).finally(() => {
+      if (this.loginAbort === controller) this.loginAbort = undefined
+    })
   }
   private check(): Promise<void> {
     if (this.stopped) return Promise.resolve()
@@ -145,6 +175,7 @@ export class QqBridge {
     const fingerprint = key(JSON.stringify(config), String(enabled), token)
     if (this.stopped || fingerprint === this.fingerprint) return
     this.fingerprint = fingerprint
+    this.cancelLoginInfo(); this.loginRetryAttempt = 0
     const previous = this.client; this.client = undefined; this.selfId = undefined; await previous?.stop()
     if (this.stopped) return
     if (!enabled) { this.setState('disabled', this.enabled() ? '等待个人助理启动。' : 'QQ 来源已关闭。'); return }
@@ -154,13 +185,12 @@ export class QqBridge {
       onState: (state, detail) => {
         if (this.client !== client || this.stopped) return
         if (state === 'connected') {
+          this.cancelLoginInfo(); this.loginRetryAttempt = 0
           this.selfId = undefined
           this.setState('connecting', '正在确认 NapCat 登录账号。')
-          void client.getLoginInfo().then(info => {
-            if (this.client !== client || !client.connected || this.stopped) return
-            this.selfId = info.user_id; this.setState('connected', `OneBot 已连接，QQ ${info.user_id}。`)
-          }, error => { if (this.client === client) this.setState('error', safeFailureMessage(error)) })
+          this.queryLoginInfo(client)
         } else {
+          this.cancelLoginInfo()
           this.selfId = undefined
           this.setState(state, detail ?? (state === 'connecting' ? '等待 NapCat WebSocket 连接。' : 'OneBot 连接已断开，等待重新连接。'))
         }

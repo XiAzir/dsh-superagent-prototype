@@ -20,6 +20,8 @@ let confirmed: { action: string; text: string; params: Record<string, unknown> }
 let failSendNumber: number | undefined
 let sendCount = 0
 let rpcHandlers: Record<string, (params: Record<string, unknown>) => unknown> = {}
+let loginInfoCalls = 0
+let loginInfoTimes: number[] = []
 
 afterEach(async () => {
   await bridge?.stop(); bridge = undefined
@@ -31,10 +33,10 @@ afterEach(async () => {
     server = undefined
   }
   authHeaders = []; sent = []; confirmed = []; failSendNumber = undefined; sendCount = 0
-  rpcHandlers = {}
+  rpcHandlers = {}; loginInfoCalls = 0; loginInfoTimes = []
 })
 
-async function startQq(options: Record<string, unknown> = {}) {
+async function startQq(options: Record<string, unknown> = {}, waitConnected = true) {
   host = await startRuntime()
   server = new WebSocketServer({ port: 0 })
   server.on('connection', (socket, request) => {
@@ -42,7 +44,13 @@ async function startQq(options: Record<string, unknown> = {}) {
     socket.on('message', raw => {
       const packet = JSON.parse(raw.toString()) as { action: string; params?: Record<string, unknown>; echo: string }
       if (packet.action === 'get_login_info') {
-        socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { user_id: Number(selfId) }, echo: packet.echo }))
+        loginInfoCalls++; loginInfoTimes.push(Date.now())
+        let result: unknown
+        try { result = rpcHandlers.get_login_info?.(packet.params ?? {}) ?? { user_id: Number(selfId) } }
+        catch { socket.send(JSON.stringify({ status: 'failed', retcode: 1200, data: {}, echo: packet.echo })); return }
+        Promise.resolve(result).then(data => {
+          socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
+        }, () => socket.send(JSON.stringify({ status: 'failed', retcode: 1200, data: {}, echo: packet.echo })))
       } else if (rpcHandlers[packet.action]) {
         Promise.resolve(rpcHandlers[packet.action]!(packet.params ?? {})).then(data => {
           socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
@@ -76,7 +84,7 @@ async function startQq(options: Record<string, unknown> = {}) {
   unregister = host.runtime.sources.register(bridge.kind)
   token = 'integration-token'
   await bridge.start()
-  await waitFor(async () => (await bridge!.status()).state === 'connected')
+  if (waitConnected) await waitFor(async () => (await bridge!.status()).state === 'connected')
   return { runtime: host.runtime, store, bridge, url }
 }
 
@@ -95,7 +103,7 @@ async function push(value: unknown): Promise<void> {
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  const expires = Date.now() + 3000
+  const expires = Date.now() + 6000
   while (Date.now() < expires) {
     if (await predicate()) return
     await new Promise(resolve => setTimeout(resolve, 10))
@@ -108,6 +116,50 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('retries a failed login lookup on the same connection and recovers on that connection', async () => {
+    let attempts = 0
+    rpcHandlers.get_login_info = () => { if (++attempts === 1) throw new Error('temporary login lookup failure'); return { user_id: Number(selfId) } }
+    const { bridge: qq } = await startQq()
+    expect(attempts).toBe(2)
+    expect(authHeaders).toHaveLength(1)
+    expect(await qq.status()).toMatchObject({ state: 'connected', selfId })
+  })
+
+  it('backs off across consecutive login lookup failures', async () => {
+    let attempts = 0
+    rpcHandlers.get_login_info = () => { if (++attempts <= 2) throw new Error('temporary login lookup failure'); return { user_id: Number(selfId) } }
+    await startQq()
+    expect(attempts).toBe(3)
+    expect(loginInfoTimes[1]! - loginInfoTimes[0]!).toBeGreaterThanOrEqual(900)
+    expect(loginInfoTimes[2]! - loginInfoTimes[1]!).toBeGreaterThanOrEqual(1800)
+    expect(authHeaders).toHaveLength(1)
+  })
+
+  it('cancels a pending login lookup on config change and ignores its late result', async () => {
+    let resolveOld!: (value: unknown) => void
+    rpcHandlers.get_login_info = () => loginInfoCalls === 1
+      ? new Promise(resolve => { resolveOld = resolve }) : { user_id: Number(selfId) }
+    const { bridge: qq } = await startQq({}, false)
+    await waitFor(() => loginInfoCalls === 1)
+    await qq.setToken('replacement-token')
+    await waitFor(async () => (await qq.status()).state === 'connected')
+    resolveOld({ user_id: 11111 })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(authHeaders).toHaveLength(2)
+    expect(await qq.status()).toMatchObject({ state: 'connected', selfId })
+  })
+
+  it('cancels scheduled login retries when stopped', async () => {
+    const { bridge: qq } = await startQq()
+    rpcHandlers.get_login_info = () => { throw new Error('temporary login lookup failure') }
+    ;[...server!.clients][0]!.terminate()
+    await waitFor(() => loginInfoCalls >= 2 && qq.status().then(status => status.state === 'error'))
+    await qq.stop()
+    const callsAtStop = loginInfoCalls
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(loginInfoCalls).toBe(callsAtStop)
+  })
+
   it('routes unquoted private tasks independently and lets the selected worker read a nearby source file', async () => {
     const { runtime, store } = await startQq()
     expect(QqConfigSchema.parse({}).privateFollowups).toBe('semantic')

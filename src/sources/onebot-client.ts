@@ -75,8 +75,8 @@ export class OneBotClient {
     })
   }
 
-  async getLoginInfo(): Promise<Record<string, unknown> & { user_id: string }> {
-    const info = await this.call<Record<string, unknown>>('get_login_info')
+  async getLoginInfo(signal?: AbortSignal): Promise<Record<string, unknown> & { user_id: string }> {
+    const info = await this.call<Record<string, unknown>>('get_login_info', {}, signal)
     const id = normalizePositiveId(info && info.user_id)
     if (!id) throw new Error('OneBot get_login_info returned an invalid user_id')
     this.loginSelfId = id
