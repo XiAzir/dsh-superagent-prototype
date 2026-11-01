@@ -91,9 +91,10 @@ export function watchdogSnapshot(host: WatchdogHost, options: { now?: Date; cand
   const now = options.now ?? new Date()
   const maxTickets = Math.min(200, Math.max(1, options.maxTickets ?? 100))
   const all = host.store.tickets.list()
-  const byActivity = (a: Ticket, b: Ticket) => b.updatedAt.localeCompare(a.updatedAt)
-  const active = all.filter(liveTicket).sort(byActivity)
-  const recentEnded = all.filter(ticket => !liveTicket(ticket) && Date.parse(ticket.ended?.at ?? '') >= now.getTime() - 86_400_000).sort(byActivity)
+  const stableActiveOrder = (a: Ticket, b: Ticket) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+  const recentEndOrder = (a: Ticket, b: Ticket) => (Date.parse(b.ended?.at ?? '') - Date.parse(a.ended?.at ?? '')) || a.id.localeCompare(b.id)
+  const active = all.filter(liveTicket).sort(stableActiveOrder)
+  const recentEnded = all.filter(ticket => !liveTicket(ticket) && Date.parse(ticket.ended?.at ?? '') >= now.getTime() - 86_400_000).sort(recentEndOrder)
   const eligible = [...active, ...recentEnded]
   const offset = eligible.length ? Math.min(eligible.length - 1, Math.max(0, Math.floor(options.offset ?? 0))) : 0
   const selected = eligible.slice(offset, offset + maxTickets)

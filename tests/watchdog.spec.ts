@@ -62,6 +62,8 @@ it('prioritizes every live ticket and exposes a bounded round-robin cursor acros
   const host = { store: { tickets: { list: () => tickets as never }, settings: () => ({ paused: false, executor: { maxWorkers: 3 } }) },
     health: {}, executor: { activeCount: () => 1 }, machine: {}, configured: () => true }
   const first = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z') })
+  const firstIds = new Set(first.tickets.map(ticket => ticket.id))
+  for (const ticket of tickets) if (!firstIds.has(ticket.id)) ticket.updatedAt = '2026-11-01T00:00:00.000Z'
   const second = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z'), offset: first.page!.nextOffset })
   const third = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z'), offset: second.page!.nextOffset })
   expect(first.tickets).toHaveLength(100)
@@ -119,9 +121,9 @@ it('sends only snapshot review facts to a stub assessor and suppresses identical
       }, emit: async (value: unknown) => { outputs.push(value) } }
     const first = await watchdogOnce(options)
     const second = await watchdogOnce(options)
-    expect(first.changed).toBe(true)
+    expect(first.changed).toBe(false)
     expect(second.changed).toBe(false)
-    expect(outputs).toHaveLength(1)
+    expect(outputs).toHaveLength(0)
     expect(assessorInputs[0]).toContain('Elapsed time only selected review candidates')
     expect(assessorInputs[0]).not.toContain('source-message-body')
     expect(JSON.parse(await readFile(join(directory, 'state.json'), 'utf8')).snapshotOffset).toBe(0)
@@ -227,19 +229,59 @@ it('does not report changing healthy work summaries but reports completion and h
     ticket.report!.summary = 'Step two'
     value.infrastructure.health.runtime.at = 'second'
     await watchdogOnce(options)
-    expect(outputs).toHaveLength(1)
+    expect(outputs).toHaveLength(0)
     ticket.status = 'completed'
     ticket.ended = { at: '2026-10-31T00:01:00Z', outcome: 'completed' }
     await watchdogOnce(options)
-    expect(outputs).toHaveLength(2)
+    expect(outputs).toHaveLength(1)
     ticket.status = 'waiting_person'
     ticket.attention = 'Need owner decision'
     await watchdogOnce(options)
-    expect(outputs).toHaveLength(3)
+    expect(outputs).toHaveLength(2)
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-it('waits for a timed-out child process to close before rejecting', async () => {
+it('tracks alert fingerprints per rotating snapshot page while keeping healthy pages quiet', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-watchdog-pages-'))
+  const outputs: unknown[] = []
+  let requests = 0
+  const options = { url: 'http://127.0.0.1:3082', stateFile: join(directory, 'state.json'), now: () => 1_800_000_000_000,
+    fetchImpl: async (url: string) => {
+      const offset = Number(new URL(url).searchParams.get('offset'))
+      requests++
+      const page = offset === 0 ? { offset: 0, limit: 100, total: 200, nextOffset: 100 } : { offset: 100, limit: 100, total: 200, nextOffset: 0 }
+      const ticket = offset === 0 ? { id: 'completed', status: 'completed', stage: 'completed', repeatedErrors: 0,
+        ended: { at: '2026-10-31T00:00:00Z', outcome: 'completed' } }
+        : { id: 'waiting', status: 'waiting_person', stage: 'person', repeatedErrors: 0 }
+      return { ok: true, json: async () => ({ schema: 1, observedAt: '2026-10-31T00:00:00Z', page,
+        infrastructure: { configured: true, paused: false, health: {}, setup: [] }, executor: { activeWorkers: 0, maxWorkers: 2 },
+        tickets: [ticket], candidates: [] }) }
+    }, emit: async (report: unknown) => { outputs.push(report) } }
+  try {
+    const results = []
+    for (let i = 0; i < 4; i++) results.push(await watchdogOnce(options))
+    expect(requests).toBe(4)
+    expect(results.map(result => result.changed)).toEqual([true, true, false, false])
+    expect(outputs).toHaveLength(2)
+    const quiet = await watchdogOnce({ ...options, stateFile: join(directory, 'healthy-state.json'),
+      fetchImpl: async () => ({ ok: true, json: async () => ({ schema: 1, observedAt: '2026-10-31T00:00:00Z',
+        page: { offset: 0, limit: 100, total: 0, nextOffset: 0 }, infrastructure: { configured: true, paused: false, health: {}, setup: [] },
+        executor: { activeWorkers: 0, maxWorkers: 2 }, tickets: [], candidates: [] }) }), emit: async () => { throw new Error('healthy first page should be quiet') } })
+    expect(quiet.changed).toBe(false)
+    const infraOutputs: unknown[] = []
+    const infraOptions = { ...options, stateFile: join(directory, 'infra-state.json'),
+      fetchImpl: async (url: string) => {
+        const response = await options.fetchImpl(url)
+        const value = await response.json()
+        return { ok: true, json: async () => ({ ...value, infrastructure: { ...value.infrastructure,
+          health: { runtime: { state: 'error', detail: 'same host failure on every page' } } } }) }
+      }, emit: async (report: unknown) => { infraOutputs.push(report) } }
+    for (let i = 0; i < 4; i++) await watchdogOnce(infraOptions)
+    expect(infraOutputs).toHaveLength(1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+it('rejects a timed-out command after bounded process-tree cleanup', async () => {
   const started = Date.now()
   await expect(runCommand([process.execPath, '-e', 'setTimeout(()=>{},10000)'], { timeoutMs: 100 })).rejects.toThrow('timed out')
   expect(Date.now() - started).toBeLessThan(2000)
@@ -274,6 +316,50 @@ it('terminates real descendant processes on timeout and output overflow within a
         try { process.kill(-tree.parent, 'SIGKILL') } catch {}
         try { process.kill(tree.child, 'SIGKILL') } catch {}
       }
+    }
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+it.skipIf(process.platform === 'win32')('releases command streams and the child handle when a detached descendant keeps pipes open', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-watchdog-detached-'))
+  const pidFile = join(directory, 'tree.json')
+  const source = 'const{spawn}=require("node:child_process");const fs=require("node:fs");const p=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"inherit"});fs.writeFileSync(process.argv[1],JSON.stringify({parent:process.pid,child:p.pid}));setInterval(()=>{},1000)'
+  let tree: { parent: number; child: number } | undefined
+  try {
+    const started = Date.now()
+    await expect(runCommand([process.execPath, '-e', source, pidFile], { timeoutMs: 150 })).rejects.toThrow('timed out')
+    tree = JSON.parse(await readFile(pidFile, 'utf8')) as { parent: number; child: number }
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(() => process.kill(tree!.child, 0)).not.toThrow()
+  } finally {
+    if (tree) {
+      try { process.kill(-tree.parent, 'SIGKILL') } catch {}
+      try { process.kill(tree.child, 'SIGKILL') } catch {}
+    }
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+it('releases command streams and the child handle when tree termination fails', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-watchdog-kill-failure-'))
+  const pidFile = join(directory, 'pid.txt')
+  const source = 'require("node:fs").writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)'
+  let pid: number | undefined
+  try {
+    const started = Date.now()
+    await expect(runCommand([process.execPath, '-e', source, pidFile], { timeoutMs: 150, terminateTree: async () => {} }))
+      .rejects.toThrow('timed out')
+    pid = Number(await readFile(pidFile, 'utf8'))
+    expect(Date.now() - started).toBeLessThan(1000)
+    expect(() => process.kill(pid!, 0)).not.toThrow()
+  } finally {
+    if (pid) {
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        await Promise.race([once(killer, 'close'), new Promise(resolvePromise => setTimeout(resolvePromise, 1000))])
+        try { process.kill(pid) } catch {}
+      } else try { process.kill(pid, 'SIGKILL') } catch {}
     }
     await rm(directory, { recursive: true, force: true })
   }

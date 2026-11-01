@@ -59,7 +59,7 @@ function redactSnapshot(value) {
   return value
 }
 
-export async function runCommand(command, { input = '', timeoutMs = 30_000, maxOutput = MAX_OUTPUT, signal, env } = {}) {
+export async function runCommand(command, { input = '', timeoutMs = 30_000, maxOutput = MAX_OUTPUT, signal, env, terminateTree: injectedTreeTermination } = {}) {
   if (!Array.isArray(command) || command.length < 1 || command.some(part => typeof part !== 'string' || part.length > 8192)) {
     throw new Error('Command must be a non-empty argv array')
   }
@@ -74,6 +74,7 @@ export async function runCommand(command, { input = '', timeoutMs = 30_000, maxO
         let killer
         try {
           killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+          killer.unref()
           await new Promise(resolveDone => {
             const deadline = setTimeout(() => { killer.kill(); resolveDone() }, 750)
             killer.once('error', () => { clearTimeout(deadline); resolveDone() })
@@ -91,7 +92,13 @@ export async function runCommand(command, { input = '', timeoutMs = 30_000, maxO
       if (settled || stopError) return
       stopError = error
       if (child.pid === undefined) { finish(error); return }
-      termination = terminateTree(child.pid).finally(() => finish(error))
+      termination = Promise.resolve().then(() => (injectedTreeTermination ?? terminateTree)(child.pid)).catch(() => {}).finally(() => {
+        child.stdin.destroy()
+        child.stdout.destroy()
+        child.stderr.destroy()
+        child.unref()
+        finish(error)
+      })
     }
     const aborted = () => terminate(new Error('Command was aborted'))
     const collect = target => chunk => { if (stopError || settled) return; bytes += chunk.length; if (bytes > maxOutput) { terminate(new Error('Command output exceeded its limit')); return }
@@ -148,7 +155,7 @@ function assessorEnvironment() {
   }))
 }
 
-function fingerprint(snapshot, assessment) {
+function fingerprintParts(snapshot, assessment) {
   const health = Object.fromEntries(Object.entries(snapshot.infrastructure?.health ?? {}).map(([name, item]) => [name,
     { state: item.state, ...(item.state === 'error' ? { detail: item.detail } : {}) }]))
   const infrastructure = snapshot.infrastructure ? { configured: snapshot.infrastructure.configured, paused: snapshot.infrastructure.paused,
@@ -159,10 +166,24 @@ function fingerprint(snapshot, assessment) {
       ? { report: ticket.report && { state: ticket.report.state, summary: ticket.report.summary }, attention: ticket.attention,
         ended: ticket.ended, repeatedErrors: ticket.repeatedErrors, deliveryError: ticket.deliveryError } : { reportState: ticket.report?.state }) }))
   const findings = assessment.findings?.some(item => item.status !== 'healthy') || assessment.status !== 'healthy' ? assessment.findings : []
-  const stable = { infrastructure, capacityFull: (snapshot.executor?.maxWorkers ?? 0) > 0
-      && snapshot.executor.activeWorkers >= snapshot.executor.maxWorkers,
-    tickets, status: assessment.status, semanticReview: assessment.semanticReview, findings }
-  return createHash('sha256').update(JSON.stringify(stable)).digest('hex')
+  return { infrastructure, capacityFull: (snapshot.executor?.maxWorkers ?? 0) > 0
+      && snapshot.executor.activeWorkers >= snapshot.executor.maxWorkers, tickets,
+    status: assessment.status, semanticReview: assessment.semanticReview, findings }
+}
+function hash(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex') }
+function fingerprint(snapshot, assessment) { return hash(fingerprintParts(snapshot, assessment)) }
+function globalFingerprint(snapshot, assessment, error, errorKind) {
+  const { infrastructure, capacityFull, semanticReview } = fingerprintParts(snapshot ?? { infrastructure: { error }, tickets: [], candidates: [] }, assessment)
+  return hash({ infrastructure, capacityFull, semanticReview, ...(error ? { error: { kind: errorKind, value: error } } : {}) })
+}
+function pageFingerprint(snapshot, assessment) {
+  const { tickets, status, semanticReview, findings } = fingerprintParts(snapshot, assessment)
+  return hash({ tickets, status, semanticReview, findings })
+}
+function hasPageSignal(snapshot, assessment, error) {
+  const parts = fingerprintParts(snapshot ?? { infrastructure: {}, tickets: [], candidates: [] }, assessment)
+  return !!error || assessment.status !== 'healthy' || assessment.findings?.some(item => item.status !== 'healthy') === true
+    || parts.tickets.length > 0
 }
 
 async function readState(path) {
@@ -261,13 +282,24 @@ export async function watchdogOnce(options) {
     } catch (caught) { nudgeResults.push({ ticketId, requested: false, error: redactText(String(caught)).slice(0, 500) }) }
   }
   const key = fingerprint(snapshot ?? { infrastructure: { error }, tickets: [], candidates: [] }, assessment)
-  const failureFingerprint = error ? `${errorKind}:${key}` : undefined
+  const globalKey = globalFingerprint(snapshot, assessment, error, errorKind)
+  const pageKey = String(snapshot?.page?.offset ?? 0)
+  const pageKeyValue = snapshot ? pageFingerprint(snapshot, assessment) : undefined
+  const globalProblem = !!error || Object.values(infrastructure?.health ?? {}).some(health => health.state === 'error')
+    || !infrastructure?.configured || !!infrastructure?.paused || !!infrastructure?.setup?.length
+  const globalChanged = state.globalFingerprint !== globalKey && (globalProblem || state.globalFingerprint !== undefined || state.fingerprint !== undefined)
+  const pageFingerprints = state.pageFingerprints ?? (state.pageFingerprints = {})
+  const pageChanged = !!snapshot && pageFingerprints[pageKey] !== pageKeyValue
+  const pageAlert = !!snapshot && !globalProblem && hasPageSignal(snapshot, assessment, error)
+  const failureFingerprint = error ? `${errorKind}:${globalKey}` : undefined
   const recoveredFrom = state.failureFingerprint && !error ? state.failureFingerprint : undefined
   const recoveryNotice = recovery.skipped ? String(recovery.skipped) : recovery.attempted ? `attempt:${recovery.attempt}` : undefined
-  const changed = state.fingerprint !== key || (!!error && state.failureFingerprint !== failureFingerprint) || !!recoveredFrom || recovery.attempted
+  const changed = globalChanged || (pageChanged && pageAlert) || (!!error && state.failureFingerprint !== failureFingerprint) || !!recoveredFrom || recovery.attempted
     || (!!recoveryNotice && state.lastRecoveryNotice !== recoveryNotice)
     || nudgeResults.some(result => result.requested === true)
   state.fingerprint = key
+  state.globalFingerprint = globalKey
+  if (snapshot && !globalProblem) pageFingerprints[pageKey] = pageKeyValue
   state.failureFingerprint = failureFingerprint
   state.failureKind = errorKind
   state.lastRecoveryNotice = recoveryNotice
