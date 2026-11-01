@@ -97,6 +97,104 @@ export function usePoll<T>(load: () => Promise<T>, deps: readonly unknown[], int
   return { data: state.data, error: state.error, reload }
 }
 
+/** Poll the first page and append later pages, keeping pagination scoped to the current filter. */
+export function usePagedPoll<T extends { items: { id: string }[]; next_offset: number | null }>(
+  load: (offset: number) => Promise<T>, deps: readonly unknown[], intervalMs = 5000,
+) {
+  const key = JSON.stringify(deps)
+  const [state, setState] = useState<{ key: string; data?: T; error?: Error; loadingMore: boolean }>({ key, loadingMore: false })
+  const loader = useRef(load)
+  loader.current = load
+  const stateRef = useRef(state)
+  stateRef.current = state
+  const actions = useRef<{ key: string; refresh: () => Promise<void>; loadMore: () => Promise<void> }>()
+  const visible: typeof state = state.key === key ? state : { key, loadingMore: false }
+  useEffect(() => {
+    let active = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let offsets = [0]
+    let queue = Promise.resolve()
+    const publish = (next: typeof state) => { if (active) { stateRef.current = next; setState(next) } }
+    const enqueue = (operation: () => Promise<void>) => {
+      const result = queue.then(async () => { if (active) await operation() })
+      queue = result.catch(() => {})
+      return result
+    }
+    const refresh = () => enqueue(async () => {
+      try {
+        const pages: T[] = []
+        const readOffsets = [...offsets]
+        for (const offset of readOffsets) {
+          const page = await loader.current(offset)
+          if (!active) return
+          pages.push(page)
+          if (page.next_offset == null) break
+        }
+        const last = pages.at(-1)
+        if (!last) return
+        offsets = readOffsets.slice(0, pages.length)
+        const seen = new Set<string>()
+        const items = pages.flatMap(page => page.items).filter(item => {
+          if (seen.has(item.id)) return false
+          seen.add(item.id); return true
+        })
+        const previous = stateRef.current
+        publish({ key, data: { ...last, items }, loadingMore: previous.key === key && previous.loadingMore })
+      } catch (failure) {
+        const previous = stateRef.current
+        publish({ key, ...(previous.key === key && previous.data ? { data: previous.data } : {}),
+          error: failure instanceof Error ? failure : new Error(String(failure)),
+          loadingMore: previous.key === key && previous.loadingMore })
+      }
+    })
+    const loadMore = () => {
+      const current = stateRef.current
+      if (!active || current.key !== key || !current.data || current.data.next_offset == null || current.loadingMore) return Promise.resolve()
+      publish({ ...current, loadingMore: true, error: undefined })
+      return enqueue(async () => {
+        const latest = stateRef.current
+        if (!active || latest.key !== key) return
+        if (!latest.data || latest.data.next_offset == null) {
+          publish({ ...latest, loadingMore: false })
+          return
+        }
+        const offset = latest.data.next_offset
+        try {
+          const page = await loader.current(offset)
+          if (!active) return
+          const seen = new Set(latest.data.items.map(item => item.id))
+          const added = page.items.filter(item => { if (seen.has(item.id)) return false; seen.add(item.id); return true })
+          if (!offsets.includes(offset)) offsets.push(offset)
+          publish({ key, data: { ...page, items: [...latest.data.items, ...added] }, loadingMore: false })
+        } catch (failure) {
+          publish({ ...latest, error: failure instanceof Error ? failure : new Error(String(failure)), loadingMore: false })
+        }
+      })
+    }
+    const schedule = async () => {
+      clearTimeout(timer)
+      await refresh()
+      if (active) {
+        clearTimeout(timer)
+        timer = setTimeout(() => { void schedule() }, document.hidden ? intervalMs * HIDDEN_FACTOR : intervalMs)
+      }
+    }
+    actions.current = { key, refresh: schedule, loadMore }
+    void schedule()
+    const shown = () => { if (!document.hidden) { clearTimeout(timer); void schedule() } }
+    document.addEventListener('visibilitychange', shown)
+    return () => {
+      active = false; clearTimeout(timer); document.removeEventListener('visibilitychange', shown)
+      if (actions.current?.key === key) actions.current = undefined
+    }
+  // The caller's query is represented by `key`; loader ref follows the latest call function.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, intervalMs])
+  const loadMore = useCallback(() => actions.current?.key === key ? actions.current.loadMore() : Promise.resolve(), [key])
+  const reload = useCallback(() => actions.current?.key === key ? actions.current.refresh() : Promise.resolve(), [key])
+  return { data: visible.data, error: visible.error, loading: !visible.data, loadingMore: visible.loadingMore, loadMore, reload }
+}
+
 export const DECISION_FILTERS = ['work', 'stop', 'ignore', 'unavailable', 'all'] as const
 export type DecisionFilter = typeof DECISION_FILTERS[number]
 export const DECISION_KINDS: Readonly<Record<DecisionFilter, string>> = { work: 'accept,reopen', stop: 'stop', ignore: 'ignore',

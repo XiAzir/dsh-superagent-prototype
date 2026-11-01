@@ -110,9 +110,10 @@ export function LoadState({ error, loading }: { error?: Error | undefined; loadi
   if (error) return <p className="dt-error" role="alert">{error.message}</p>
   return loading ? <Hint>{t('loading')}</Hint> : null
 }
-export function LoadMore({ onMore }: { onMore: () => void }) {
+export function LoadMore({ onMore, busy = false }: { onMore: () => void; busy?: boolean }) {
   const { t } = usePanel()
-  return <Button variant="outline" size="sm" icon={<Icon name="chevron-down" size={14} />} onClick={onMore}>{t('loadMore')}</Button>
+  return <Button variant="outline" size="sm" icon={<Icon name={busy ? 'running' : 'chevron-down'} size={14} />} disabled={busy}
+    aria-busy={busy} onClick={onMore}>{t('loadMore')}</Button>
 }
 
 export function StatusHead({ hint, settings }: { hint: string; settings?: SettingsGroup }) {

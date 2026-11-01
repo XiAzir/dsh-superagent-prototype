@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { ADMISSION_DEFAULTS, ADMISSION_OPTIONS, type Admission, type AdmissionCell } from '../admission.ts'
 import type { AdmissionRowView } from '../sources/kind.ts'
 import { LIMITS } from '../limits.ts'
-import { DECISION_FILTERS, DECISION_KINDS, usePoll, type DecisionFilter, type Settings, type SourceView } from './api.ts'
+import { DECISION_FILTERS, DECISION_KINDS, usePagedPoll, type DecisionFilter, type Settings, type SourceView } from './api.ts'
 import { Button, DisclosureRow, Icon, InfoTip, Input, Pill, SegmentedControl, Switch } from './controls.tsx'
 import { SaveBar } from './draft.tsx'
 import { useAction, usePanel } from './provider.tsx'
@@ -14,9 +14,8 @@ import { Hint, LabelValue, LoadMore, LoadState, Section, StatusHead } from './wi
 
 export function EvalStatus({ filter, window, paused }: { filter: DecisionFilter; window: '24h' | undefined; paused: boolean }) {
   const { t, call, navigate } = usePanel()
-  const [limit, setLimit] = useState(30)
-  const { data, error } = usePoll(() => call('GET decisions', { query: { limit, kind: DECISION_KINDS[filter],
-    ...window ? { window } : {} } }), [filter, limit, window])
+  const { data, error, loading, loadingMore, loadMore } = usePagedPoll(offset => call('GET decisions', { query: { limit: 30,
+    ...offset ? { offset } : {}, kind: DECISION_KINDS[filter], ...window ? { window } : {} } }), [filter, window])
   const show = (key: DecisionFilter, last24h: boolean) => navigate({ page: 'eval', query: { ...key === 'work' ? {} : { filter: key },
     ...last24h ? { window: '24h' } : {} } }, true)
   return <>
@@ -26,15 +25,15 @@ export function EvalStatus({ filter, window, paused }: { filter: DecisionFilter;
         onClick={() => navigate({ page: 'execution' })}>{t('resumeWhere')}</button>
     </p>}
     <div className="dt-filters">
-      {DECISION_FILTERS.map(key => <Pill key={key} active={filter === key} onClick={() => { setLimit(30); show(key, !!window) }}>
+      {DECISION_FILTERS.map(key => <Pill key={key} active={filter === key} onClick={() => show(key, !!window)}>
         {t(`decisionFilter.${key}`)}
       </Pill>)}
       {window && <><span className="dt-filter-gap" /><Pill active onClick={() => show(filter, false)}>{t('lastDayOnly')}</Pill></>}
     </div>
-    <LoadState error={error} loading={!data} />
+    <LoadState error={error} loading={loading} />
     {data && (data.items.length ? <ul className="dt-list">{data.items.map(decision => <DecisionLine key={decision.id}
       decision={decision} />)}</ul> : <Hint>{t('none')}</Hint>)}
-    {data?.next_offset != null && <LoadMore onMore={() => setLimit(limit + 30)} />}
+    {data?.next_offset != null && <LoadMore busy={loadingMore} onMore={() => { void loadMore() }} />}
   </>
 }
 
