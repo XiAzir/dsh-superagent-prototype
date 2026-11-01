@@ -242,8 +242,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           : host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
             ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
             ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
-        await host.sendReplies()
-        return { status: host.store.replyStatus(reply.id) ?? reply.status, ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
+        return { receipt_id: reply.id, status: host.store.replyStatus(reply.id) ?? reply.status, ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
       },
     }),
     tool({

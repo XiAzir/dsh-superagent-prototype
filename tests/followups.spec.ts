@@ -48,9 +48,11 @@ it('answers an explicit human status question from its ticket snapshot without a
     text: '状态更新。' })).rejects.toThrow(/trigger_id/)
   const receipt = await h.runTool(h.runtime.masterId, 'orchestrator_reply', { purpose: 'status', trigger_id: message.id,
     ticket_id: ticket.id, text: '解析器已更新，目前正在检查边界情况。' })
-  expect(receipt).toMatchObject({ status: 'sent', snapshot: { ticket_id: ticket.id, stage: { stage: 'working' },
+  expect(receipt).toMatchObject({ receipt_id: expect.any(String), status: 'pending', snapshot: { ticket_id: ticket.id, stage: { stage: 'working' },
     assignment: { report: { state: 'progress', summary: '已更新解析器，正在检查边界情况。' } } } })
   expect(h.deliveries).not.toHaveBeenCalled()
+  await h.runtime.idle()
+  expect(h.runtime.store.replyStatus(String(receipt.receipt_id))).toBe('sent')
 })
 
 it('sends a person\'s message that reaches no ticket, such as only one a person stopped, to Eval as before', async () => {

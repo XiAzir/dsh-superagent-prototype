@@ -171,6 +171,7 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     await writeFile(output, png); await writeFile(video, 'video transport fixture')
     await host!.runTool(workerId, 'orchestrator_report', { state: 'ready', summary: '媒体产物已准备。', artifacts: [{ path: output }, { path: video }] })
     await host!.runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'result', ticket_id: ticketId, text: '请查收媒体。' })
+    await runtime.sendReplies()
     const media = sent.flatMap(item => item.params.message as { type: string; data: { file?: string } }[]).filter(item => ['image', 'video'].includes(item.type))
     expect(media.map(item => item.type)).toEqual(['image', 'video'])
     expect(media.every(item => item.data.file?.startsWith('file:///'))).toBe(true)
@@ -214,6 +215,7 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     expect(reported.artifacts).toHaveLength(1)
     await writeFile(output, 'changed after reporting')
     await host!.runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'result', ticket_id: ticketId, text: '十月排休表已完成，请查收。' })
+    await runtime.sendReplies()
     expect(uploads).toBe(1)
     expect(sent.at(-1)?.text).toBe('十月排休表已完成，请查收。')
     const receipt = store.db.prepare('SELECT value FROM outbox WHERE json_extract(value, \'$.ticketId\')=? AND json_extract(value, \'$.kind\')=\'reply\'').get(ticketId) as { value: string }

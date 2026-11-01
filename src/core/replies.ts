@@ -159,7 +159,7 @@ export class Replies extends EnginePart {
       ...(ticket.delivery ? { delivery_failure: { at: ticket.delivery.at, error: ticket.delivery.error } } : {}),
       ...(ticket.attention ? { attention: { question: ticket.attention.question } } : {}),
     }
-    this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'reply', ticketId: ticket.id })
+    this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'reply', ticketId: ticket.id, delivery: 'interactive' })
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined, snapshot }
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */

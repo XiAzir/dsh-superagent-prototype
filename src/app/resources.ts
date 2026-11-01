@@ -31,6 +31,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
+  { name: 'receipt/<id>', holds: 'the current pending, sent, or dropped status of an outbound reply by its receipt_id' },
   { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
     + 'report, and its inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
@@ -168,6 +169,13 @@ const ROUTES: readonly Route[] = [
     const decision = main(read).store.decisions.get(read.rest)
     if (!decision) throw new Error('Unknown decision')
     return decisionDetails(decision)
+  }],
+  ['receipt/', read => {
+    const id = read.rest
+    if (!id || id.includes('/')) throw new Error('Choose one reply receipt id')
+    const status = main(read).store.replyStatus(id)
+    if (!status) throw new Error('Unknown reply receipt')
+    return { receipt_id: id, status }
   }],
   ['settings', read => main(read).settings.view()],
   ['settings/', read => text(read, JSON.stringify(main(read).settings.block(read.rest)))],
