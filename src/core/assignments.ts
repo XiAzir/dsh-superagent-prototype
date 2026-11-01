@@ -98,9 +98,12 @@ export class Assignments extends EnginePart {
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,
    * or a question/answer referencing a non-human or unreached trigger.
    */
-  report(ticketId: string, report: WorkerReport): Ticket {
+  report(ticketId: string, report: WorkerReport, expectedAssignmentId?: string): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    // Executor reports may finish after an asynchronous artifact snapshot. Bind those reports to the Assignment
+    // that created the tool call, and reject them before any attention, reply, or ticket state is changed.
+    if (expectedAssignmentId !== undefined && latestAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
     if (report.question && (report.state === 'ready' || report.answers)) throw new UserError('questionWithResult')
     if (report.askedBy && !report.question) throw new UserError('askerWithoutQuestion')
     const person = (id: string, channel: boolean) => {
@@ -109,7 +112,9 @@ export class Assignments extends EnginePart {
     }
     if (report.askedBy && !person(report.askedBy, true)) throw new UserError('notAsker')
     if (report.answers && !person(report.answers, false)) throw new UserError('notAnswerable')
-    const assignment = runningAssignment(ticket) ?? latestAssignment(ticket)
+    const assignment = expectedAssignmentId
+      ? ticket.assignments.find(item => item.id === expectedAssignmentId)
+      : runningAssignment(ticket) ?? latestAssignment(ticket)
     if (!assignment) throw new UserError('unknownAssignment')
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()

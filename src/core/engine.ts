@@ -248,15 +248,18 @@ export class Engine {
     return this.repo.atomic(() => this.evals.handback(ticketId, triggerId, reason))
   }
   /**
-   * Record a report on an open ticket's current Assignment. Its question for a person (`attention`) is asked, kept, or
+   * Record a report on an open ticket's Assignment. Executor callers pass the Assignment ID captured before any async
+   * artifact or PR read; the report is refused if a retry replaced it before this transaction. Its question for a person (`attention`) is asked, kept, or
    * cleared (`null` or a `ready` report), and a replaced attention question whose reply has not been sent yet is withdrawn
    * from the outbox. A `blocked` or `failed` report holds back automated inputs until a human message arrives. A `dropped`
    * report ends the ticket, and a `ready` report ends it: `completed` without followed Threads, else with the `followsDone`
    * outcome once `followsDone` holds.
-   * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
+   * @throws UserError for an unknown or ended ticket, a replaced or ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport, expectedAssignmentId?: string): Ticket {
+    return this.repo.atomic(() => this.assignments.report(ticketId, report, expectedAssignmentId))
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
@@ -286,5 +289,8 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
-export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+export type EngineForExecutor = Omit<Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>, 'report'> & {
+    /** A report is bound to the Assignment whose worker produced it, including reports that finish after asynchronous reads. */
+    report(ticketId: string, report: WorkerReport, expectedAssignmentId: string): Ticket
+  }

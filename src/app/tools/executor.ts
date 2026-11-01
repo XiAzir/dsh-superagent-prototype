@@ -1,6 +1,6 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { liveTicket, runningAssignment, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
@@ -90,6 +90,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        // Bind this call before artifact or PR reads yield; registrations survive retries with the worker Session.
+        const assignmentId = runningAssignment(current)?.id
         if (args.pr_number != null && (!host.github.deployment.github || !host.github.deployment.repository)) {
           throw new Error('PR reporting requires a configured GitHub Source; omit pr_number when this task has no GitHub PR')
         }
@@ -107,7 +109,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             ...artifacts.length ? { artifacts: artifacts.map(item => item.id) } : {},
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
-          const updated = host.engine.report(ticketId, report)
+          if (!assignmentId) throw new Error('No running Assignment owns this report')
+          const updated = host.engine.report(ticketId, report, assignmentId)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'

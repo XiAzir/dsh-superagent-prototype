@@ -832,6 +832,26 @@ describe('worker reports', () => {
     expect(report({ answers: '4' })).toThrow(new UserError('notAnswerable'))
     expect(report({ answers: '1' })()).toMatchObject({ answers: ['1'] })
   })
+  it('rejects reports from a replaced assignment and accepts a launch failure for the pending assignment', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const oldAssignmentId = h.repo.tickets.get(ticketId)!.assignments.at(-1)!.id
+    h.engine.deliveryFailed(ticketId, oldAssignmentId, 'Session busy')
+    h.engine.retryTicket(ticketId)
+    const pending = h.repo.tickets.get(ticketId)!.assignments.at(-1)!
+    expect(pending).toMatchObject({ state: 'pending' })
+    expect(pending.id).not.toBe(oldAssignmentId)
+
+    expect(() => h.engine.report(ticketId, { state: 'ready', summary: 'late result' }, oldAssignmentId))
+      .toThrow(new UserError('assignmentEnded'))
+    const afterLateReport = h.repo.tickets.get(ticketId)!
+    expect(afterLateReport.ended).toBeUndefined()
+    expect(afterLateReport.assignments.at(-1)).toMatchObject({ id: pending.id, state: 'pending' })
+
+    h.engine.report(ticketId, { state: 'failed', summary: 'launch failed' }, pending.id)
+    expect(h.repo.tickets.get(ticketId)!.assignments.at(-1)).toMatchObject({ state: 'pending',
+      report: { state: 'failed', summary: 'launch failed' } })
+  })
   it('refuses a report on an ended ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
