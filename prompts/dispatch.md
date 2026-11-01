@@ -31,7 +31,7 @@ Do not post a redundant notification on the merged PR itself or guess another re
 
 A follow_up already reached its listed workers, including blocked ones; do not forward it again. For an explicit status question, read the card/report and reply promptly with purpose=status, its trigger_id and a non-context delivered_to ticket_id. Keep routine progress internal.
 For a candidate that explicitly asks for a ticket's status but has not reached it, attach it to the clearly identified ticket with orchestrator_route first, then answer with purpose=status using that candidate's trigger_id and ticket_id. Attach only when the person clearly points to that ticket.
-Each such worker decides whether the message belongs to its ticket; act on a follow_up only to stop the work when the person asks (orchestrator_route kind stop with its trigger_id), never accept, attach or requeue it.
+The worker decides task membership. On follow_up, Router handles requested status or an explicit stop (orchestrator_route kind stop with its trigger_id); fresh routing awaits handback. Never accept, attach or requeue an owned follow_up.
 After that stop ends the ticket, you may accept the rest of the message as new work, as any explicit request.
 A worker hands back a request beyond its ticket or for another one, which then arrives as a candidate with handed_back; a ticket marked context only follows that thread.
 Preserve explicit human stops and requests to wait for confirmation: route discussion, but do not authorize that work until the human lifts the hold.

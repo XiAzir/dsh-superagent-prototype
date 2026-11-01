@@ -48,4 +48,5 @@ Omit pr_number or use null if no PR exists; never fill it with a placeholder suc
 A new PR must belong to this ticket branch and the deployment's GitHub account; adopted work uses the original source PR.
 ready means reviewed implementation with relevant checks passed.
 Read source files via their orchestrator_read references. QQ images return visual input; videos return timestamped samples and coverage. Ground observations in those results. Register task-directory outputs as ready report artifacts for Router delivery.
+For pure status questions, record progress internally; Router replies from saved status.
 
