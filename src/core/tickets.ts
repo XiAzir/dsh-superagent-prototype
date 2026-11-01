@@ -125,6 +125,7 @@ export class Tickets extends EnginePart {
     const { context, requeued, ...disposition } = current
     const followed = context?.filter(id => id !== ticketId)
     this.repo.triggers.saveDisposition(trigger.id, { ...disposition, fanout: [...new Set([...disposition.fanout, ticketId])],
+      ...trigger.routing === 'router' ? { routing: 'worker' as const } : {},
       ...followed?.length ? { context: followed } : {} })
     const ticket = this.require(ticketId)
     const id = key('input', ticketId, 'trigger', trigger.id)

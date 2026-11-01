@@ -208,9 +208,9 @@ export class Evals extends EnginePart {
    * End the Eval that holds a Trigger routed to a ticket, since the ticket has it now: one that holds other Triggers too
    * queues them again for a fresh Eval without it.
    */
-  routed(triggerId: string, ticketId: string): void {
+  routed(triggerId: string, ticketId: string, readOnly = false): void {
     const held = this.holding(triggerId)
-    const reason: Reason = { code: 'routed', values: { ticket: ticketId } }
+    const reason: Reason = { code: readOnly ? 'statusRead' : 'routed', values: { ticket: ticketId } }
     if (held?.evaluating?.triggerIds.length === 1) this.finish(held, held.evaluating, { kind: 'ignore', reason: [reason] })
     else if (held) this.reassess(held, { ...reason, triggerId }, [triggerId])
   }

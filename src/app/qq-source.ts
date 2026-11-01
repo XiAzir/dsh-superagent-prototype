@@ -214,7 +214,7 @@ export class QqBridge {
     const channel = { source: 'qq', thread: `qq:${resolved.threadId}`, address: { self_id: message.selfId, message_type: message.messageType,
       recipient_id: chat, user_id: message.userId, message_id: message.id, thread_id: resolved.threadId } }
     const trigger: Trigger = { id: eventId, source: 'qq', threads: [{ source: 'qq', id: resolved.threadId }],
-      actor: { source: 'qq', id: message.userId }, human: true,
+      actor: { source: 'qq', id: message.userId }, human: true, routing: 'router',
       ...message.messageType === 'private' ? { addressed: 'direct' as const } : addressed || resolved.replyKnown ? { addressed: 'mention' as const } : {},
       at: message.at, text, channel, meta: { selfId: message.selfId, userId: message.userId, groupId: message.groupId,
         messageType: message.messageType, messageId: message.id, threadId: resolved.threadId, replyTo: message.replyTo,

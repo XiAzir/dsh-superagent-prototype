@@ -111,6 +111,12 @@ export class Engine {
       // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
       const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
       if (handedBack) throw new UserError('handedBackHere')
+      // A retried Router-first attachment must not re-deliver work after the tool's response was lost.
+      const disposition = this.repo.triggers.disposition(triggerId)
+      if (disposition?.routing === 'worker' && disposition.fanout.includes(ticketId)) {
+        const existing = this.repo.tickets.get(ticketId)
+        if (existing?.inputs.some(input => input.kind === 'trigger' && input.triggerId === triggerId)) return existing
+      }
       const trigger = this.tickets.attachable(ticketId, triggerId)
       this.evals.withdraw(trigger)
       this.tickets.attach(ticketId, trigger, note)
@@ -125,6 +131,8 @@ export class Engine {
    * @throws UserError when the ticket is unknown.
    */
   requestStatus(ticketId: string): boolean { return this.repo.atomic(() => this.tickets.requestStatus(ticketId)) }
+  /** Read the requester's saved task status before composing a reply; leaves assignments and subscriptions untouched. */
+  status(ticketId: string, triggerId: string): TicketStatusSnapshot { return this.replies.statusSnapshot(ticketId, triggerId) }
   /**
    * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
    * written, attention where the message that raised the question was, else, like a result, to the conversation the ticket
@@ -132,7 +140,19 @@ export class Engine {
    * @throws UserError when the ticket or trigger is unknown or the purpose's rule refuses it, such as a result of a ticket that
    * is not ready, completed, merged, or dropped.
    */
-  reply(request: ReplyRequest): Reply { return this.repo.atomic(() => this.replies.reply(request)) }
+  reply(request: ReplyRequest): Reply {
+    return this.repo.atomic(() => {
+      const reply = this.replies.reply(request)
+      if (request.purpose === 'status') {
+        const trigger = this.repo.triggers.get(request.triggerId)!
+        const disposition = this.repo.triggers.disposition(trigger.id)
+        if (disposition?.routing === 'pending') this.repo.triggers.saveDisposition(trigger.id, { ...disposition, routing: 'handled' })
+        this.evals.withdraw(trigger)
+        this.evals.routed(trigger.id, request.ticketId, true)
+      }
+      return reply
+    })
+  }
 
   // People, through the panel or the main Session
 
@@ -260,7 +280,7 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'status' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

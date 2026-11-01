@@ -107,7 +107,7 @@ export class WebTasks {
       return
     }
     const at = new Date().toISOString()
-    const trigger: Trigger = { id, source: 'web', threads: [{ source: 'web', id: task.id }],
+    const trigger: Trigger = { id, source: 'web', routing: 'router', threads: [{ source: 'web', id: task.id }],
       actor: { source: 'web', id: 'owner' }, human: true, addressed: 'direct', text, at,
       channel: { source: 'web', thread: `web:${task.id}`, address: { conversation: task.id } }, meta: { conversation: task.id } }
     this.host.store.atomic(() => {

@@ -447,6 +447,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cache.spec.ts` | `TextCache` |
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
+| `tests/conversational-status.spec.ts` | Router-first conversations: read-only status for working/completed/stopped tickets, requester access, mixed requests and attachment retries |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/session-failures.spec.ts` | Durable Session failure restoration, clearing on a later turn, live updates, credential redaction and message length limits |

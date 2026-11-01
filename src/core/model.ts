@@ -32,6 +32,8 @@ export interface Trigger {
   actor: ActorRef
   /** Source-declared: the event was written by a person rather than a bot, CI, or this agent. */
   human: boolean
+  /** Conversational sources ask the Router to distinguish a read-only query from executable work before delivery. */
+  routing?: 'router'
   /** Source-declared: the sender addressed the agent, by mentioning it or in a direct message to it. */
   addressed?: 'mention' | 'direct'
   at: string
@@ -47,6 +49,10 @@ export interface Trigger {
 
 /** Where a trigger went after intake; it grants nothing, but decides who decides a person's follow-up (see `followupOwners`). */
 export interface TriggerDisposition {
+  /** Router-first conversations stay pending until explicitly attached as work or answered without worker delivery. */
+  routing?: 'pending' | 'worker' | 'handled'
+  /** Related subscriptions found before Router intent selection; matching creates no worker Input. */
+  matched?: string[]
   /** Rejected by the source scope filter before entering the domain, for the Source's reason. */
   filtered?: Reason
   evalId?: string
@@ -82,7 +88,7 @@ export interface FollowupRecords {
 export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'>, records: FollowupRecords): string[] {
   if (!trigger.human) return []
   const disposition = records.triggers.disposition(trigger.id)
-  if (!disposition || disposition.requeued) return []
+  if (!disposition || disposition.requeued || (disposition.routing && disposition.routing !== 'worker')) return []
   // The disposition alone rules most messages out, so a Thread or a ticket is read only for one that may have an owner.
   const returned = new Set(disposition.handbacks?.map(item => item.ticketId))
   const reached = disposition.fanout.filter(id => !returned.has(id) && !disposition.context?.includes(id))

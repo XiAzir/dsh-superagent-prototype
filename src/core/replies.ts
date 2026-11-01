@@ -124,25 +124,30 @@ export class Replies extends EnginePart {
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }
-  /** Send a current status only to the human trigger that actually reached the explicitly named ticket. */
-  private status(request: Extract<ReplyRequest, { purpose: 'status' }>): Reply {
-    const ticket = this.require(request.ticketId)
-    const trigger = this.repo.triggers.get(request.triggerId)
+  /** Read a saved status for a reached ticket, or the requester's own ticket selected by the Router. No Input or subscription is created. */
+  statusSnapshot(ticketId: string, triggerId: string): TicketStatusSnapshot {
+    const ticket = this.require(ticketId)
+    const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     const disposition = this.repo.triggers.disposition(trigger.id)
-    if (!trigger.human || !trigger.channel || !disposition?.fanout.includes(ticket.id)
-      || disposition.context?.includes(ticket.id) || !reached(ticket, trigger, key => this.repo.threads.get(key), false)) {
+    const onThread = (disposition?.fanout.includes(ticket.id) || disposition?.matched?.includes(ticket.id)) && !disposition.context?.includes(ticket.id)
+      && reached(ticket, trigger, key => this.repo.threads.get(key), false)
+    const ownTicket = trigger.routing === 'router' && ticket.mandate.actor.source === trigger.actor.source
+      && ticket.mandate.actor.id === trigger.actor.id && !disposition?.context?.includes(ticket.id)
+    if (!trigger.human || !trigger.channel || disposition?.filtered || (!onThread && !ownTicket)
+      || !this.options.scope.scope(trigger).listened) {
       throw new UserError('notReached')
     }
-    const id = key('status-reply', trigger.id, ticket.id)
-    const existing = this.options.outbox.status(id)
+    const thread = this.thread(trigger.threads[0]!)
+    const gate = this.policy().gate(trigger, thread, this.ticketsOnThread(thread))
+    if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
     const assignment = latestAssignment(ticket)
     const report = assignment?.report
     const reportAssignment = ticket.assignments.findLast(item => item.report)
     const latest = reportAssignment?.report
     const brief = (value: StoredReport, assignmentId: string): SnapshotReport => ({ state: value.state, at: value.at,
       summary: value.summary.slice(0, 600), chars: value.summary.length, read: `ticket/${ticket.id}/report/${assignmentId}` })
-    const snapshot: TicketStatusSnapshot = {
+    return {
       ticket_id: ticket.id,
       title: ticket.title,
       stage: ticketStage(ticket),
@@ -159,7 +164,14 @@ export class Replies extends EnginePart {
       ...(ticket.delivery ? { delivery_failure: { at: ticket.delivery.at, error: ticket.delivery.error } } : {}),
       ...(ticket.attention ? { attention: { question: ticket.attention.question } } : {}),
     }
-    this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'reply', ticketId: ticket.id, delivery: 'interactive' })
+  }
+  /** Queue the requested status using saved evidence, without touching the worker's lifecycle. */
+  private status(request: Extract<ReplyRequest, { purpose: 'status' }>): Reply {
+    const snapshot = this.statusSnapshot(request.ticketId, request.triggerId)
+    const trigger = this.repo.triggers.get(request.triggerId)!
+    const id = key('status-reply', trigger.id, request.ticketId)
+    const existing = this.options.outbox.status(id)
+    this.options.outbox.send({ id, channel: trigger.channel!, text: request.text, kind: 'reply', ticketId: request.ticketId, delivery: 'interactive' })
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined, snapshot }
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */

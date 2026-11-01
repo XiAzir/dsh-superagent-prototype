@@ -13,7 +13,8 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
     preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}`,
     ...(disposition ? { disposition: { ...(disposition.filtered ? { filtered: reasonText(disposition.filtered) } : {}),
       ...(disposition.decisionId ? { decision_id: disposition.decisionId } : {}),
-      delivered_to: disposition.fanout } } : {}) }
+      ...disposition.routing && disposition.routing !== 'worker' ? { matched_tickets: disposition.matched ?? [], routing: disposition.routing }
+        : { delivered_to: disposition.fanout } } } : {}) }
 }
 /** The states a ticket card shows: an open ticket's stage (docs/003), and an ended ticket's outcome. */
 export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',

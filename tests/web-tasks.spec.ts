@@ -93,6 +93,30 @@ it('adds follow-up messages to the same thread and keeps every message aligned w
   expect(requestPass).toHaveBeenCalledTimes(2)
 })
 
+it('routes a Web status follow-up through Router and reads a completed Ticket without changing worker state', () => {
+  const task = tasks.create({ text: '完成个人报告', requestId: id('router-start') })
+  const accepted = engine.decide(task.messages[0]!.id, { kind: 'accept', title: '个人报告', scope: 'small', reason: 'explicit request' })
+  const ticketId = accepted.ticketId!
+  const assignment = store.tickets.get(ticketId)!.assignments[0]!
+  engine.assignmentStarted(ticketId, assignment.id)
+  engine.report(ticketId, { state: 'ready', summary: '报告已完成。' })
+  const before = store.tickets.get(ticketId)!
+  const threadBefore = store.threads.get(`web:${task.id}`)!
+
+  const followed = tasks.followup(task.id, { text: '现在进度到哪了？', requestId: id('router-status') })
+  const trigger = store.triggers.get(followed.messages.at(-1)!.id)!
+  expect(trigger.routing).toBe('router')
+  expect(store.triggers.disposition(trigger.id)).toMatchObject({ routing: 'pending', matched: [ticketId], fanout: [] })
+  expect(engine.status(ticketId, trigger.id)).toMatchObject({ ticket_id: ticketId, stage: { stage: 'ended' }, outcome: 'completed' })
+
+  const reply = engine.reply({ purpose: 'status', ticketId, triggerId: trigger.id, text: '任务已完成。' })
+  expect(reply).toMatchObject({ status: 'pending', snapshot: { ticket_id: ticketId, outcome: 'completed' } })
+  expect(store.tickets.get(ticketId)).toEqual(before)
+  expect(store.threads.get(`web:${task.id}`)?.subscriptions).toEqual(threadBefore.subscriptions)
+  expect(store.tickets.get(ticketId)?.inputs).toEqual(before.inputs)
+  expect(store.tickets.get(ticketId)?.ended).toEqual(before.ended)
+})
+
 it('persists assistant replies once through the Web channel even when delivery is retried', async () => {
   const task = tasks.create({ text: '整理文档', requestId: id('reply') })
   const web = sources.kind('web')!

@@ -136,7 +136,11 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     expect(host!.relays(runtime.masterId).some(item => item.trigger_id === another.id && item.kind === 'candidate')).toBe(true)
     await push(event(94, 'private', owner, [{ type: 'reply', data: { id: '92' } }, { type: 'text', data: { text: '补充文件任务' } }]))
     await waitFor(() => qqTriggers(runtime).length === 4)
-    expect(store.triggers.disposition(qqTriggers(runtime)[3]!.id)?.fanout).toEqual([ticketId])
+    const followup = qqTriggers(runtime)[3]!
+    expect(store.triggers.disposition(followup.id)).toMatchObject({ matched: [ticketId], fanout: [], routing: 'pending' })
+    await host!.route({ kind: 'attach', trigger_id: followup.id, ticket_id: ticketId })
+    await runtime.idle()
+    expect(store.triggers.disposition(followup.id)?.fanout).toEqual([ticketId])
     expect(store.tickets.list()).toHaveLength(1)
   })
   it('renders downloaded image bytes as multimodal tool output and sends media artifacts with QQ native segments', async () => {
@@ -266,6 +270,31 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     await waitFor(() => qqTriggers(runtime).length === 3)
     expect(qqTriggers(runtime)[2]?.meta.threadId).toBe(trigger.meta.threadId)
     expect(store.triggers.get(trigger.id)).toBeDefined()
+  })
+
+  it('routes a quoted QQ status query without resuming its completed worker', async () => {
+    const { runtime, store } = await startQq()
+    await push(event(90, 'private', owner, [{ type: 'text', data: { text: '整理这份资料' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const trigger = qqTriggers(runtime)[0]!
+    const accepted = await host!.route({ kind: 'accept', trigger_id: trigger.id, title: '整理资料', worktree_name: 'qq-status', acknowledgement: '收到，整理资料。' })
+    await runtime.idle()
+    const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+    await host!.runTool(`worker-${ticketId}`, 'orchestrator_report', { state: 'ready', summary: '资料已经整理完成。' })
+    const before = store.tickets.get(ticketId)!
+    host!.deliveries.mockClear()
+    await push(event(91, 'private', owner, [{ type: 'reply', data: { id: '90' } }, { type: 'text', data: { text: '任务现在什么状态？' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 2)
+    await runtime.pump(); await runtime.idle()
+    const question = qqTriggers(runtime)[1]!
+    expect(question).toMatchObject({ routing: 'router', meta: { threadId: trigger.meta.threadId } })
+    const read = await host!.route({ kind: 'status', trigger_id: question.id, ticket_id: ticketId })
+    expect(read).toMatchObject({ snapshot: { outcome: 'completed', latest_report: { state: 'ready' } } })
+    await host!.runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'status', trigger_id: question.id, ticket_id: ticketId, text: '资料已整理完成。' })
+    await runtime.sendReplies()
+    expect(store.tickets.get(ticketId)).toEqual(before)
+    expect(host!.relays(`worker-${ticketId}`)).toEqual([])
+    expect(sent.at(-1)?.text).toBe('资料已整理完成。')
   })
 
   it('sends confirmed chunks once across a failed retry and refuses delivery after source or owner access is revoked', async () => {

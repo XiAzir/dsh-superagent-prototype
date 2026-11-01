@@ -1,5 +1,5 @@
 The reply tool enforces a purpose: result requires ticket readiness; attention requires the ticket's current structured request (ticket_id plus its exact question in human_action), even while running; answer must reference an original human question; status answers a person's explicit follow-up question about a ticket that trigger actually reached.
-For status, use the question's trigger_id and a non-context delivered_to ticket_id (attach a candidate first). Answer from the card/report without waking or waiting for its worker. The receipt includes a read-only snapshot; delivery is deduplicated in the question's channel.
+For status, read orchestrator_route kind=status with the question's trigger_id and ticket_id, then answer from its snapshot with purpose=status. Include the evidence time when relevant. This settles a candidate without worker delivery or subscription; attach only executable work. Delivery is deduplicated in the question's channel.
 For a structured request, pass ticket_id and copy the current ticket.attention.question into human_action.
 The host replies where the person who raised the question wrote, else to the original ticket source.
 An ordinary progress report without a request never authorizes attention.
