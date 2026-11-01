@@ -2,7 +2,7 @@
 
 The Watchdog is an independent process for checking a running dsh-superagent profile. It reads a bounded local snapshot and can send it to an assessor command that represents a separately hosted model session. Without that command, it reports infrastructure errors and legitimate human waits; it does not infer that an old activity timestamp means a task has stopped progressing.
 
-The snapshot contains component health, setup state, executor capacity, each live or recently ended ticket's report and lifecycle state, the last five assignment report summaries, input counts, repeated blocked/failed reports, and elapsed-time review candidates. It omits source message bodies, environment values, and credentials. An elapsed-time candidate is only a prompt for review. The assessor must use task reports and execution evidence to distinguish progress, a human wait, a stall, or a divergence.
+The snapshot contains component health, setup state, executor capacity, each live or recently ended ticket's report and lifecycle state, the last five assignment report summaries, input counts, repeated blocked/failed reports, and elapsed-time review candidates. It omits source message bodies, environment values, and credentials. Live tickets appear before recently ended tickets. Snapshots contain at most 100 tickets and include a cursor; each check stores the next cursor so later checks continue through the remaining pages and then wrap around. Infrastructure health and executor totals are included on every page. An elapsed-time candidate is only a prompt for review. The assessor must use task reports and execution evidence to distinguish progress, a human wait, a stall, or a divergence.
 
 ## Read-only check
 
@@ -14,7 +14,7 @@ node scripts/dsh-superagent-watchdog.mjs --once
 
 The default target is `http://127.0.0.1:3082`. Override it with `--url` or `DSH_SUPERAGENT_URL`; only HTTP loopback origins are accepted. `--profile` or `DSH_SUPERAGENT_PROFILE` selects the profile. The process writes a small state file under `.artifacts/control/profiles/<profile>/watchdog.json` and prints JSON only for a changed assessment, a failure or recovery, or a recovery action that needs attention. Repeated identical states stay quiet.
 
-For continuous checks, omit `--once`; the default interval is five minutes. `SIGINT` and `SIGTERM` cancel the loop. Network requests and assessor processes have a five-second timeout by default; use `--timeout-ms` to adjust it.
+For continuous checks, omit `--once`; the default interval is five minutes. `SIGINT` and `SIGTERM` cancel the loop. Network requests and assessor processes have a five-second timeout by default; use `--timeout-ms` to adjust it. Use `--candidate-after-ms` to set the minimum elapsed time used to select review candidates (default: 30 minutes); the value is sent with each snapshot request.
 
 ## Model assessor
 

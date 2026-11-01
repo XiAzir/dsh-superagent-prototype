@@ -191,8 +191,10 @@ function routes(runtime: HttpHost): Routes {
     'POST web/tasks': async ({ body }) => web().create(await body()),
     'POST web/tasks/:id/messages': async ({ params, body }) => web().followup(params.id, await body()),
     'GET state': () => stateView(runtime),
-    'GET watchdog/snapshot': () => {
-      const snapshot = watchdogSnapshot(runtime)
+    'GET watchdog/snapshot': ({ query }) => {
+      const parsed = z.object({ offset: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(100).default(100),
+        candidateAfterMs: z.coerce.number().int().min(60_000).max(30 * 24 * 60 * 60_000).default(30 * 60_000) }).parse(query)
+      const snapshot = watchdogSnapshot(runtime, { offset: parsed.offset, maxTickets: parsed.limit, candidateAfterMs: parsed.candidateAfterMs })
       return { ...snapshot, baseline: baselineAssessment(snapshot) }
     },
     'POST watchdog/tickets/:id/request-status': ({ params }) => {

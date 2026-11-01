@@ -109,8 +109,9 @@ export async function runCommand(command, { input = '', timeoutMs = 30_000, maxO
   })
 }
 
-async function getSnapshot(url, timeoutMs, fetchImpl, signal) {
-  const response = await fetchImpl(`${url}/orchestrator/api/watchdog/snapshot`, { headers: { 'x-orchestrator-request': '1' },
+async function getSnapshot(url, timeoutMs, fetchImpl, signal, { offset = 0, candidateAfterMs = 30 * 60_000 } = {}) {
+  const query = new URLSearchParams({ offset: String(offset), limit: '100', candidateAfterMs: String(candidateAfterMs) })
+  const response = await fetchImpl(`${url}/orchestrator/api/watchdog/snapshot?${query}`, { headers: { 'x-orchestrator-request': '1' },
     signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]) })
   if (!response.ok) throw new Error(`Snapshot request failed with HTTP ${response.status}`)
   const value = await response.json()
@@ -220,7 +221,9 @@ export async function watchdogOnce(options) {
   const state = await readState(merged.stateFile)
   let snapshot, assessment, error, errorKind
   try {
-    snapshot = await getSnapshot(merged.url, merged.timeoutMs, merged.fetchImpl, merged.signal)
+    snapshot = await getSnapshot(merged.url, merged.timeoutMs, merged.fetchImpl, merged.signal,
+      { offset: state.snapshotOffset ?? 0, candidateAfterMs: merged.candidateAfterMs })
+    state.snapshotOffset = snapshot.page?.nextOffset ?? 0
   } catch (caught) {
     if (merged.signal?.aborted) return { report: { status: 'waiting', cancelled: true }, changed: false, exitCode: 0 }
     error = redactText(String(caught instanceof Error ? caught.message : caught))

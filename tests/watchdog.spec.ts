@@ -51,6 +51,27 @@ it('builds bounded snapshots that distinguish completion, human waits, stops and
   expect(JSON.stringify(snapshot)).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz123456')
 })
 
+it('prioritizes every live ticket and exposes a bounded round-robin cursor across pages', () => {
+  const at = '2026-10-31T00:00:00.000Z'
+  const make = (id: string, ended = false) => ({ id, title: id, decisionId: 'd',
+    mandate: { strength: 'explicit', policyVersion: 'v', basis: { via: 'addressed', addressed: 'mention' }, actor: { source: 'qq', id: 'x' }, scope: 's' },
+    channels: [], assignments: [{ id: `a-${id}`, state: ended ? 'ended' : 'running', createdAt: at, startedAt: at,
+      report: { state: 'progress', summary: 'work', at } }], inputs: [], undelivered: [], createdAt: at, updatedAt: at,
+    origin: { triggerId: 't', triggerIds: ['t'] }, ...(ended ? { ended: { at, by: 'executor', outcome: 'completed' } } : {}) })
+  const tickets = [...Array.from({ length: 105 }, (_, i) => make(`live-${i}`)), ...Array.from({ length: 100 }, (_, i) => make(`done-${i}`, true))]
+  const host = { store: { tickets: { list: () => tickets as never }, settings: () => ({ paused: false, executor: { maxWorkers: 3 } }) },
+    health: {}, executor: { activeCount: () => 1 }, machine: {}, configured: () => true }
+  const first = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z') })
+  const second = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z'), offset: first.page!.nextOffset })
+  const third = watchdogSnapshot(host, { now: new Date('2026-10-31T02:00:00Z'), offset: second.page!.nextOffset })
+  expect(first.tickets).toHaveLength(100)
+  expect(first.tickets.every(ticket => ticket.status === 'working')).toBe(true)
+  expect(second.tickets.filter(ticket => ticket.status === 'working')).toHaveLength(5)
+  expect(second.page).toMatchObject({ offset: 100, total: 205, nextOffset: 200 })
+  expect(third.page?.nextOffset).toBe(0)
+  expect(new Set([...first.tickets, ...second.tickets, ...third.tickets].map(ticket => ticket.id)).size).toBe(205)
+})
+
 it('classifies infrastructure errors while keeping human waits as waiting', () => {
   const empty = { schema: 1 as const, observedAt: '', infrastructure: { configured: true, paused: false,
     health: { runtime: { state: 'error', detail: 'database unavailable' } }, setup: [] }, executor: { activeWorkers: 0, maxWorkers: 2 }, tickets: [], candidates: [] }
@@ -83,13 +104,14 @@ it('exposes a same-origin snapshot and a worker-status-only nudge route', async 
 
 it('sends only snapshot review facts to a stub assessor and suppresses identical reports', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-watchdog-'))
-  const server = await listen((_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ schema: 1,
+  const requestedUrls: string[] = []
+  const server = await listen((req, res) => { requestedUrls.push((req as { url?: string }).url ?? ''); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ schema: 1,
     observedAt: new Date().toISOString(), infrastructure: { configured: true, paused: false, health: {}, setup: [] },
     executor: { activeWorkers: 1, maxWorkers: 3 }, tickets: [{ id: 'w1', status: 'working', title: 'task', trace: [{ state: 'progress', summary: 'made progress' }] }],
     candidates: [{ ticketId: 'w1', reason: 'elapsed-time candidate' }] })) })
   try {
     const outputs: unknown[] = [], assessorInputs: string[] = []
-    const options = { url: `http://${hostName}:${(server.address() as { port: number }).port}`, stateFile: join(directory, 'state.json'),
+    const options = { url: `http://${hostName}:${(server.address() as { port: number }).port}`, stateFile: join(directory, 'state.json'), candidateAfterMs: 60_000,
       assessorCommand: ['stub'], commandRunner: async (_command: string[], call: { input: string }) => {
         assessorInputs.push(call.input)
         return { stdout: JSON.stringify({ status: 'healthy', findings: [{ ticketId: 'w1', status: 'healthy', evidence: ['recent report says progress'],
@@ -102,6 +124,8 @@ it('sends only snapshot review facts to a stub assessor and suppresses identical
     expect(outputs).toHaveLength(1)
     expect(assessorInputs[0]).toContain('Elapsed time only selected review candidates')
     expect(assessorInputs[0]).not.toContain('source-message-body')
+    expect(JSON.parse(await readFile(join(directory, 'state.json'), 'utf8')).snapshotOffset).toBe(0)
+    expect(new URL(requestedUrls[0]!, 'http://127.0.0.1').searchParams.get('candidateAfterMs')).toBe('60000')
   } finally { await close(server); await rm(directory, { recursive: true, force: true }) }
 })
 

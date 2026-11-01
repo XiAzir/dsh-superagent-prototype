@@ -27,6 +27,7 @@ export interface WatchdogSnapshot {
   executor: { activeWorkers: number; maxWorkers: number }
   tickets: WatchdogTicket[]
   candidates: { ticketId: string; reason: string; lastActivityAt?: string }[]
+  page?: { offset: number; limit: number; total: number; nextOffset: number }
 }
 export interface WatchdogTicket {
   id: string
@@ -86,11 +87,16 @@ function ticketProjection(ticket: Ticket): WatchdogTicket {
  * Build a read-only snapshot with task content bounded and no source-message bodies, execution environment values, or credentials.
  * Elapsed time only selects review candidates; it never labels a ticket stalled.
  */
-export function watchdogSnapshot(host: WatchdogHost, options: { now?: Date; candidateAfterMs?: number; maxTickets?: number } = {}): WatchdogSnapshot {
+export function watchdogSnapshot(host: WatchdogHost, options: { now?: Date; candidateAfterMs?: number; maxTickets?: number; offset?: number } = {}): WatchdogSnapshot {
   const now = options.now ?? new Date()
   const maxTickets = Math.min(200, Math.max(1, options.maxTickets ?? 100))
-  const all = host.store.tickets.list().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-  const selected = all.filter(ticket => liveTicket(ticket) || Date.parse(ticket.ended?.at ?? '') >= now.getTime() - 86_400_000).slice(0, maxTickets)
+  const all = host.store.tickets.list()
+  const byActivity = (a: Ticket, b: Ticket) => b.updatedAt.localeCompare(a.updatedAt)
+  const active = all.filter(liveTicket).sort(byActivity)
+  const recentEnded = all.filter(ticket => !liveTicket(ticket) && Date.parse(ticket.ended?.at ?? '') >= now.getTime() - 86_400_000).sort(byActivity)
+  const eligible = [...active, ...recentEnded]
+  const offset = eligible.length ? Math.min(eligible.length - 1, Math.max(0, Math.floor(options.offset ?? 0))) : 0
+  const selected = eligible.slice(offset, offset + maxTickets)
   const tickets = selected.map(ticketProjection)
   const threshold = Math.max(60_000, options.candidateAfterMs ?? 30 * 60_000)
   const candidates = tickets.flatMap(ticket => {
@@ -102,7 +108,8 @@ export function watchdogSnapshot(host: WatchdogHost, options: { now?: Date; cand
   const settings = host.store.settings()
   const setup = [host.setupProblem, host.feishuProblem].filter(Boolean).map(problem => compact(`${problem!.place ?? ''} ${problem!.code ?? ''} ${problem!.detail ?? ''}`, 300))
   return { schema: 1, observedAt: now.toISOString(), infrastructure: { configured: host.configured(), paused: settings.paused,
-    health: safeHealth(host.health), setup }, executor: { activeWorkers: host.executor.activeCount(), maxWorkers: settings.executor.maxWorkers }, tickets, candidates }
+    health: safeHealth(host.health), setup }, executor: { activeWorkers: host.executor.activeCount(), maxWorkers: settings.executor.maxWorkers }, tickets, candidates,
+  page: { offset, limit: maxTickets, total: eligible.length, nextOffset: offset + tickets.length >= eligible.length ? 0 : offset + tickets.length } }
 }
 
 /** Baseline classification when no model assessor command is configured. */
