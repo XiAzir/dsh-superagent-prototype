@@ -1,4 +1,6 @@
 import { once } from 'node:events'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket, { WebSocketServer } from 'ws'
 import type { OutboundMessage, Trigger } from '../src/core/index.ts'
@@ -16,6 +18,7 @@ let sent: { action: string; text: string; params: Record<string, unknown> }[] = 
 let confirmed: { action: string; text: string; params: Record<string, unknown> }[] = []
 let failSendNumber: number | undefined
 let sendCount = 0
+let rpcHandlers: Record<string, (params: Record<string, unknown>) => unknown> = {}
 
 afterEach(async () => {
   await bridge?.stop(); bridge = undefined
@@ -27,6 +30,7 @@ afterEach(async () => {
     server = undefined
   }
   authHeaders = []; sent = []; confirmed = []; failSendNumber = undefined; sendCount = 0
+  rpcHandlers = {}
 })
 
 async function startQq(options: Record<string, unknown> = {}) {
@@ -38,6 +42,10 @@ async function startQq(options: Record<string, unknown> = {}) {
       const packet = JSON.parse(raw.toString()) as { action: string; params?: Record<string, unknown>; echo: string }
       if (packet.action === 'get_login_info') {
         socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { user_id: Number(selfId) }, echo: packet.echo }))
+      } else if (rpcHandlers[packet.action]) {
+        Promise.resolve(rpcHandlers[packet.action]!(packet.params ?? {})).then(data => {
+          socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
+        })
       } else if (packet.action === 'send_private_msg' || packet.action === 'send_group_msg') {
         sendCount++
         const params = packet.params ?? {}
@@ -61,7 +69,8 @@ async function startQq(options: Record<string, unknown> = {}) {
   settings.policy.sources.qq = { allowed: [{ id: owner, name: 'Owner' }], admission: {} }
   store.saveSettings(SettingsSchema.parse(settings))
   token = 'integration-token'
-  bridge = new QqBridge({ store, configured: () => true, receive: trigger => host!.runtime.receive(trigger),
+  bridge = new QqBridge({ store, stateDir: host.runtime.machine.stateDir, artifacts: host.runtime.artifacts,
+    configured: () => true, receive: trigger => host!.runtime.receive(trigger),
     report: () => {}, resolveToken: async () => token, writeToken: async (_name, value) => { token = value } })
   unregister = host.runtime.sources.register(bridge.kind)
   token = 'integration-token'
@@ -98,6 +107,53 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('exposes a source file as a durable authorized read reference and delivers an immutable task artifact through the Outbox', async () => {
+    const { runtime, bridge: qq, store } = await startQq()
+    const original = join(runtime.machine.stateDir, 'napcat-source.xlsx')
+    await writeFile(original, 'original sheet bytes')
+    let fetches = 0, uploads = 0
+    rpcHandlers.get_file = params => {
+      expect(params).toEqual({ file: 'source-file-id' }); fetches++
+      return { file: original, file_name: '8月排休表.xlsx', file_size: 20 }
+    }
+    rpcHandlers.upload_private_file = async params => {
+      expect(params.user_id).toBe(owner)
+      expect(params.name).toBe('10月排休表.xlsx')
+      expect(await readFile(String(params.file), 'utf8')).toBe('October sheet bytes')
+      uploads++
+      return { file_id: 'uploaded-file-id' }
+    }
+    await push(event(80, 'private', owner, [{ type: 'file', data: { file: '8月排休表.xlsx', file_id: 'source-file-id', file_size: 20 } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const trigger = qqTriggers(runtime)[0]!
+    expect(trigger.attachments?.[0]).toMatchObject({ name: '8月排休表.xlsx', type: 'file', status: 'pending' })
+    const accepted = await host!.route({ kind: 'accept', trigger_id: trigger.id, title: 'October sheet', worktree_name: 'october-sheet', acknowledgement: '收到，制作十月排休表。' })
+    await runtime.idle()
+    const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+    const workerId = `worker-${ticketId}`
+    const attachment = trigger.attachments![0]!
+    const downloaded = await host!.runTool(workerId, 'orchestrator_read', { resource: attachment.read })
+    expect(downloaded.status).toBe('downloaded')
+    expect(await readFile(String(downloaded.path), 'utf8')).toBe('original sheet bytes')
+    await host!.runTool(workerId, 'orchestrator_read', { resource: attachment.read })
+    expect(fetches).toBe(1)
+    expect(host!.deliveries.mock.calls.some(([item]) => item.sessionId === workerId && item.text.includes(attachment.read))).toBe(true)
+    const ticket = store.tickets.get(ticketId)!
+    await mkdir(ticket.execution!.directory, { recursive: true })
+    const output = join(ticket.execution!.directory, '10月排休表.xlsx')
+    await writeFile(output, 'October sheet bytes')
+    const reported = await host!.runTool(workerId, 'orchestrator_report', { state: 'ready', summary: '十月表格已校验。', artifacts: [{ path: output, name: '10月排休表.xlsx' }] })
+    expect(reported.artifacts).toHaveLength(1)
+    await writeFile(output, 'changed after reporting')
+    await host!.runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'result', ticket_id: ticketId, text: '十月排休表已完成，请查收。' })
+    expect(uploads).toBe(1)
+    expect(sent.at(-1)?.text).toBe('十月排休表已完成，请查收。')
+    const receipt = store.db.prepare('SELECT value FROM outbox WHERE json_extract(value, \'$.ticketId\')=? AND json_extract(value, \'$.kind\')=\'reply\'').get(ticketId) as { value: string }
+    await qq.kind.channel!.send({} as never, JSON.parse(receipt.value))
+    expect(uploads).toBe(1)
+    const revoked = store.settings(); revoked.policy.sources.qq!.allowed = []; store.saveSettings(revoked)
+    await expect(qq.kind.attachments!.read(trigger, attachment.id, undefined, new AbortController().signal)).rejects.toThrow('authorized')
+  })
   it('keeps QQ connection and receiving settings under the management panel authority', async () => {
     const { runtime } = await startQq()
     const revision = runtime.store.blockRevision('source:qq')

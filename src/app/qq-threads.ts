@@ -1,6 +1,6 @@
 import { record } from '../kv.ts'
 import type { Store } from './store.ts'
-import type { ContextMessage, ContextPart } from '../sources/kind.ts'
+import type { ContextMessage, ContextPart, SourceAttachmentRef } from '../sources/kind.ts'
 import type { NormalizedOneBotMessage } from '../sources/onebot-message.ts'
 
 const MESSAGE_PREFIX = 'qq-message:'
@@ -59,7 +59,7 @@ export class QqThreads {
     return undefined
   }
 
-  recordIncoming(message: NormalizedOneBotMessage, threadId: string, triggerId: string): void {
+  recordIncoming(message: NormalizedOneBotMessage, threadId: string, triggerId: string, attachments: SourceAttachmentRef[] = []): void {
     const identity = identityOf(message)
     if (!identity || !validTime(message.at)) return
     this.store.atomic(() => {
@@ -72,6 +72,7 @@ export class QqThreads {
         text: message.text, ...(message.replyTo ? { replyTo: message.replyTo } : {}) }
       this.store.set(record<MessageLink>(mapKey), link)
       this.append(threadId, thread, { id: message.id, from: message.userId, at: message.at, text: message.text,
+        ...attachments.length ? { attachments } : {},
         ...(message.replyTo ? { reply_to: message.replyTo } : {}) })
       const key = activeKeyOf(identity, message.userId)
       const current = this.store.get(record<ActiveThread>(key))

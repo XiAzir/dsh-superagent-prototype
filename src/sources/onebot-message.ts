@@ -1,5 +1,10 @@
 export interface OneBotAttachment {
   type: 'image' | 'file' | 'record' | 'video'
+  /** OneBot/NapCat opaque locator. Never treat this as a local filesystem path. */
+  file_id?: string
+  id?: string
+  file_name?: string
+  file_size?: number
   file?: string
   url?: string
   name?: string
@@ -50,8 +55,11 @@ function timestamp(value: unknown): string | undefined {
 function attachment(type: string, data: Record<string, unknown>): OneBotAttachment | undefined {
   if (type !== 'image' && type !== 'file' && type !== 'record' && type !== 'video') return undefined
   const result: OneBotAttachment = { type }
-  for (const key of ['file', 'url', 'name'] as const) if (typeof data[key] === 'string' && data[key]) result[key] = data[key] as string
-  if (typeof data.size === 'number' && Number.isFinite(data.size) && data.size >= 0) result.size = data.size
+  for (const key of ['file_id', 'id', 'file', 'file_name', 'url', 'name'] as const) if (typeof data[key] === 'string' && data[key]) result[key] = data[key] as string
+  for (const key of ['file_size', 'size'] as const) {
+    const value = typeof data[key] === 'string' && /^\d+(?:\.\d+)?$/.test(data[key] as string) ? Number(data[key]) : data[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) result[key] = value
+  }
   return result
 }
 

@@ -347,6 +347,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/qq-source.ts` | QQ Source connection lifecycle and credential-backed status |
+| `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
+| `src/app/artifacts.ts` | Immutable ticket-scoped deliverable snapshots and digest verification |
 | `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
 | `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
 | `src/app/api.ts` | `Api`, including `GET qq/status` and `PUT qq/token`, every route's parameters, query, body and response, and the list filters; it imports only types, so the panel bundles it |
@@ -371,6 +373,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/onebot-client.ts` | OneBot v11 forward and reverse WebSocket clients, connection lifecycle, and outbound requests |
 | `src/sources/onebot-message.ts` | OneBot v11 event decoding, QQ message segments, attachment markers, and message normalization |
+| `src/sources/qq-attachments.ts` | Bounded credential-backed NapCat attachment resolution and byte transfer |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
@@ -424,6 +427,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/onebot-client.spec.ts`, `tests/onebot-message.spec.ts` | OneBot v11 connection behavior and normalized QQ events, replies, and attachment metadata |
 | `tests/qq-source.spec.ts` | QQ admission, source policy, reply delivery, credentials, and the live connection lifecycle |
+| `tests/qq-attachments.spec.ts` | NapCat file resolution, download limits, cancellation and source validation |
+| `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
 | `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |

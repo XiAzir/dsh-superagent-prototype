@@ -9,6 +9,8 @@ import { OneBotClient, type OneBotState } from '../sources/onebot-client.ts'
 import { normalizeOneBotMessage } from '../sources/onebot-message.ts'
 import { QqThreads } from './qq-threads.ts'
 import { safeFailureMessage } from './session-failures.ts'
+import { QqAttachmentStore } from './qq-attachment-store.ts'
+import type { ArtifactRegistry } from './artifacts.ts'
 import type { Store } from './store.ts'
 
 const qqId = z.string().trim().regex(/^[1-9]\d{3,19}$/, '有效的 QQ 号或群号')
@@ -36,12 +38,14 @@ export interface QqStatus {
   received: number; lastMessageAt?: string
 }
 interface QqHost {
+  stateDir: string
+  artifacts?: Pick<ArtifactRegistry, 'verify'>
   store: Store; configured(): boolean; receive(trigger: Trigger): ReceiveResult; report(health: Health): void
   notify?(message: OutboundMessage): void
   resolveToken(name: string): Promise<string | undefined>; writeToken(name: string, value: string): Promise<void>
 }
 interface QqStats { received: number; lastMessageAt?: string }
-interface Delivery { chunks: { text: string; messageId: string }[] }
+interface Delivery { chunks: { text: string; messageId: string }[]; artifacts?: { id: string; fileId: string | null }[] }
 const statsKey = record<QqStats>('qq-stats')
 const deliveryKey = (id: string) => record<Delivery>(`qq-delivery:${id}`)
 const triggerId = (self: string, type: string, chat: string, message: string) => `qq-message-${key(self, type, chat, message)}`
@@ -74,7 +78,18 @@ export class QqBridge {
   private state: QqStatus['state'] = 'disabled'
   private detail = 'QQ 来源已关闭。'
   private selfId?: string
+  private downloads = new AbortController()
+  readonly attachments: QqAttachmentStore
   constructor(private readonly host: QqHost) {
+    this.attachments = new QqAttachmentStore({ store: host.store, stateDir: host.stateDir, signal: () => this.downloads.signal,
+      allowed: trigger => trigger.source === 'qq' && !!trigger.channel && this.canSend(trigger.channel.address)
+        && (!this.selfId || trigger.meta.selfId === this.selfId),
+      call: async (action, params, signal) => {
+        if (!this.client?.connected || !this.selfId) throw new Error('NapCat 尚未连接，附件可在恢复连接后重试读取')
+        return this.client.call(action, params, signal)
+      },
+      localPeer: () => { const config = this.config(); return config.connection === 'reverse'
+        || ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(config.url).hostname) } })
     this.threads = new QqThreads(host.store)
     const settings = host.store.settings(); let changed = false
     if (!settings.sources.qq) { settings.sources.qq = { enabled: false, config: {} }; changed = true }
@@ -102,12 +117,14 @@ export class QqBridge {
   }
   async start(): Promise<void> {
     if (!this.stopped) return
+    if (this.downloads.signal.aborted) this.downloads = new AbortController()
     this.stopped = false; await this.check()
     this.timer = setInterval(() => { void this.check() }, 2000); this.timer.unref?.()
   }
   async stop(): Promise<void> {
+    this.downloads.abort()
     this.stopped = true; clearInterval(this.timer); await this.checking
-    await this.client?.stop(); this.client = undefined; await this.events
+    await this.client?.stop(); this.client = undefined; await this.events; await this.attachments.idle()
   }
   private setState(state: QqStatus['state'], detail: string): void {
     this.state = state; this.detail = safeFailureMessage(detail)
@@ -198,8 +215,10 @@ export class QqBridge {
       at: message.at, text, channel, meta: { selfId: message.selfId, userId: message.userId, groupId: message.groupId,
         messageType: message.messageType, messageId: message.id, threadId: resolved.threadId, replyTo: message.replyTo,
         senderName: message.senderName, attachments: message.attachments } }
+    const attachments = this.attachments.references(trigger)
+    if (attachments.length) trigger.attachments = attachments
     return this.host.store.atomic(() => {
-      this.threads.recordIncoming(message, resolved.threadId, eventId)
+      this.threads.recordIncoming(message, resolved.threadId, eventId, attachments)
       const result = this.host.receive(trigger)
       if (result === 'stored') {
         this.host.store.delete(resetKey)
@@ -224,6 +243,21 @@ export class QqBridge {
     const chunks = qqReplyChunks(message.text, config.replyChunkSize)
     if (chunks.length > config.maxReplyChunks) throw new Error('回复超过 QQ 分段上限，请在来源设置中提高最大分段数。')
     let delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
+    for (const id of message.artifacts ?? []) {
+      if (delivery.artifacts?.some(item => item.id === id)) continue
+      if (!this.host.artifacts || !message.ticketId) throw new Error('Artifact delivery requires its originating task and durable artifact registry')
+      const artifact = await this.host.artifacts.verify(id, message.ticketId)
+      if (!this.canSend(address)) return 'gone'
+      const reply = await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
+        { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file: artifact.path, name: artifact.name })
+      // NapCat confirms file uploads with file_id, not the message_id used for text replies.
+      if (!reply || !Object.hasOwn(reply, 'file_id') || (reply.file_id !== null && typeof reply.file_id !== 'string')) throw new Error('NapCat did not confirm the file upload')
+      this.host.store.atomic(() => {
+        delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
+        delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: reply.file_id ?? null }]
+        this.host.store.set(deliveryKey(message.id), delivery)
+      })
+    }
     if (delivery.chunks.some((chunk, index) => chunk.text !== chunks[index])) throw new Error('QQ 回复分段配置发生变化，请恢复原分段大小后重试。')
     for (let index = delivery.chunks.length; index < chunks.length; index++) {
       if (!this.canSend(address)) return 'gone'
@@ -246,9 +280,11 @@ export class QqBridge {
     return { kind: 'qq', title: { zh: 'QQ · NapCat', en: 'QQ · NapCat' },
       description: { zh: '通过 NapCat / OneBot v11 接收 QQ 私聊和群聊任务，并回复原会话。', en: 'Receive QQ tasks through NapCat / OneBot v11 and reply in the original chat.' },
       schema: QqConfigSchema, health: ['qq'], fields: qqFields(),
+      attachments: { references: trigger => this.attachments.references(trigger),
+        read: (trigger, id, _agent, signal) => this.attachments.read(trigger, id, signal) },
       scope: ({ meta }, config) => (meta.messageType === 'private' ? config.privateMessages : config.groups.some(group => group.id === meta.groupId))
         ? { listened: true, observed: false } : { listened: false, reason: 'source_disabled' },
-      channel: { allowed: address => this.canSend(address), send: (_host, message) => this.send(message), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },
+      channel: { artifacts: true, allowed: address => this.canSend(address), send: (_host, message) => this.send(message), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },
       policy: { schema: SourcePolicySchema, fields: [{ key: 'allowed', type: 'rows', label: { zh: '允许交办任务的 QQ 账号', en: 'Allowed QQ senders' },
         columns: [{ key: 'id', type: 'text', pattern: '[1-9][0-9]{3,19}', label: { zh: 'QQ 号', en: 'QQ ID' } }, { key: 'name', type: 'text', optional: true, label: { zh: '名称', en: 'Name' } }] }],
         explicit: { zh: '已授权的私聊、群内 @ 机器人、命令前缀和引用已知任务消息可直接交办。', en: 'Authorized private messages, mentions, command prefixes and quoted task replies are direct requests.' } },

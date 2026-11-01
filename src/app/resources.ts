@@ -15,6 +15,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { Sessions } from './sessions.ts'
+import type { ArtifactRegistry } from './artifacts.ts'
+import type { SourceAttachmentRef } from '../sources/kind.ts'
 import type { Settings } from './settings.ts'
 import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
@@ -22,6 +24,7 @@ import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
+  { name: 'attachment/<trigger-id>/<id>', holds: 'one authorized source attachment: status, file name, bytes and its saved local path; copy the read reference from the source message', executor: true },
   { name: 'tickets', holds: 'ticket cards, newest first; a card\'s state is person/review after a ready report, person/blocked or person/failed after those reports, person/answer with a question, person/delivery when an input could not reach the worker, working or working/queued while it works, idle once the worker ended its turn without a report, else how the ticket ended' },
   { name: 'triggers', holds: 'trigger cards with where each went, newest first' },
   { name: 'threads', holds: 'subscribed threads, newest activity first, with their labels, tickets, current assessment and polling errors' },
@@ -57,6 +60,9 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
 
 export interface ResourceHost {
+  readonly artifacts?: ArtifactRegistry
+  attachmentReferences?(trigger: Trigger): SourceAttachmentRef[]
+  readAttachment?(trigger: Trigger, id: string, sessionId: string, signal: AbortSignal): Promise<unknown>
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
@@ -116,6 +122,13 @@ async function transcript(host: ResourceHost, ticketId: string) {
 }
 
 const ROUTES: readonly Route[] = [
+  ['attachment/', async read => {
+    const [triggerId, id, ...rest] = read.rest.split('/')
+    if (!triggerId || !id || rest.length) throw new Error('Choose an attachment resource from the original message')
+    const found = trigger(read.host, triggerId, read.ticketId)
+    if (!read.host.readAttachment) throw new Error('Source attachment reading is unavailable')
+    return read.host.readAttachment(found, id, read.sessionId, read.signal ?? new AbortController().signal)
+  }],
   ['tickets', read => {
     const host = main(read), tickets = host.store.tickets.list()
     const card = (ticket: Ticket) => ({ ...ticketCard(ticket), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
@@ -224,7 +237,9 @@ const ROUTES: readonly Route[] = [
     const repliedTo = shown(parent ? host.store.triggers.get(feishuTriggerId(parent)) : undefined)
     const neighbours = host.store.read.neighbours(threadKey(found.threads[0]!), found.at, found.id)
     const around = { before: shown(neighbours.before), after: shown(neighbours.after) }
-    return { ...card, ...await host.sourceLink(found, signal), acknowledgement: host.store.replyStatus(key('ack', found.id)) ?? 'not_requested',
+    const attachments = host.attachmentReferences?.(found) ?? []
+    return { ...card, ...await host.sourceLink(found, signal), ...attachments.length ? { attachments } : {},
+      acknowledgement: host.store.replyStatus(key('ack', found.id)) ?? 'not_requested',
       ...(ref ? { context: feishuReferences(ref) } : {}),
       ...(offset === 0 ? {
         ...repliedTo ? { replied_to: triggerLine(repliedTo) } : {},
@@ -249,7 +264,12 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      const artifacts = latestReport(ticket)?.artifacts?.flatMap(id => {
+        const item = host.artifacts?.get(id, ticket.id)
+        return item ? [{ id: item.id, name: item.name, size: item.size, kind: item.kind }] : []
+      })
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry,
+        ...artifacts?.length ? { artifacts } : {} }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

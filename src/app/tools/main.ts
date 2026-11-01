@@ -229,9 +229,11 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         purpose: z.enum(['answer', 'result', 'attention']),
         human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
         text: z.string().min(1).max(20000),
+        artifacts: z.array(z.string().min(1)).max(8).optional().describe('With purpose=result: IDs from this ticket\'s ready report. Omit to deliver all reported artifacts through the source channel.'),
       }).strict(),
       execute: async args => {
-        const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
+        const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
+          ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
           ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
         await host.sendReplies()
         return { status: host.store.replyStatus(reply.id) ?? reply.status }

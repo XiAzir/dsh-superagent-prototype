@@ -47,6 +47,7 @@ import type { ResourceHost } from './resources.ts'
 import type { QqBridge } from './qq-source.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
+import { ArtifactRegistry } from './artifacts.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -60,6 +61,7 @@ const now = (): string => new Date().toISOString()
 export class Runtime extends Service implements SourceHost {
   qq?: QqBridge
   readonly store: Store
+  readonly artifacts: ArtifactRegistry
   readonly setup: Setup
   readonly prompts: Prompts
   readonly effects: Effects
@@ -98,6 +100,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      this.artifacts = new ArtifactRegistry(store, machine.stateDir)
       if ((machine.mode ?? 'repository') === 'personal') {
         const initial = store.settings()
         let changed = false
@@ -127,6 +130,8 @@ export class Runtime extends Service implements SourceHost {
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+        artifacts: this.artifacts, attachmentReferences: trigger => sources.attachmentReferences(trigger),
+        readAttachment: (trigger, id, sessionId, signal) => sources.readAttachment(trigger, id, ctx.agents.get(sessionId as SessionId), signal),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,

@@ -36,7 +36,8 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   ctx.effect(() => () => { clearTimeout(modeRestart) })
   const runtime = new Runtime(ctx, machine, restart)
   ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal')))
-  const qq = runtime.qq = new QqBridge({ store: runtime.store, configured: () => runtime.configured(), receive: trigger => runtime.receive(trigger),
+  const qq = runtime.qq = new QqBridge({ store: runtime.store, stateDir: machine.stateDir, artifacts: runtime.artifacts,
+    configured: () => runtime.configured(), receive: trigger => runtime.receive(trigger),
     notify: message => runtime.outbox.send(message),
     report: value => runtime.sources.healthEntries(['qq']).get('qq')?.set(value),
     resolveToken: async name => (await ctx.get('credentials')?.resolve(credentialRef(name)))?.value ?? process.env[name],

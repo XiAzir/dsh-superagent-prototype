@@ -7,6 +7,10 @@ export interface ActorRef { source: string; id: string }
 export interface ThreadRef { source: string; id: string }
 /** Write-only address on a thread; the address format belongs to the source. */
 export interface ChannelRef { source: string; thread: string; address: Record<string, string> }
+/** Bounded media handles linked to their original event; bytes stay behind an authorized source read. */
+export interface AttachmentReference {
+  id: string; type: 'file' | 'image' | 'video' | 'record'; name?: string; size?: number; status: string; read: string
+}
 
 /** Stable key of a thread across the whole domain. */
 export const threadKey = (ref: ThreadRef): string => `${ref.source}:${ref.id}`
@@ -32,6 +36,7 @@ export interface Trigger {
   addressed?: 'mention' | 'direct'
   at: string
   text: string
+  attachments?: AttachmentReference[]
   channel?: ChannelRef
   url?: string
   /** Source-native details for adapters; the core never interprets them. */
@@ -222,7 +227,7 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string }
+  report?: { state: ReportState; summary: string; at: string; artifacts?: string[] }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**

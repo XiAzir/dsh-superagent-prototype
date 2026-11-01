@@ -1008,6 +1008,19 @@ describe('automatic input', () => {
   })
 })
 describe('replies', () => {
+  it('delivers only artifacts registered in the current ready report and preserves result retry identity', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2'))
+    expect(() => h.engine.reply({ purpose: 'answer', ticketId, triggerId: '2', text: 'x', artifacts: ['foreign'] })).toThrow('artifacts')
+    h.engine.report(ticketId, { state: 'ready', summary: 'Done', artifacts: ['artifact-a'] })
+    expect(() => h.engine.reply({ purpose: 'result', ticketId, text: 'Done', artifacts: ['foreign'] })).toThrow('artifacts')
+    const first = h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })
+    expect(h.outbox.at(-1)?.artifacts).toEqual(['artifact-a'])
+    expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toEqual({ ...first, reused: true })
+    h.engine.reply({ purpose: 'result', ticketId, text: 'Text only', artifacts: [] })
+    expect(h.outbox.at(-1)).not.toHaveProperty('artifacts')
+  })
   it('acknowledges a person\'s message that reached an open ticket once, and refuses others', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!

@@ -11,6 +11,8 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  /** Host-validated immutable task artifacts available for the Router to deliver. */
+  artifacts?: string[]
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
@@ -119,7 +121,7 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    assignment.report = { state: report.state, summary: report.summary, at }
+    assignment.report = { state: report.state, summary: report.summary, at, ...report.artifacts?.length ? { artifacts: report.artifacts } : {} }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)

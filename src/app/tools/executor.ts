@@ -83,6 +83,9 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           ? `The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`
           : 'The ticket\'s GitHub PR number; only available when a GitHub Source is configured. Omit when the task has no PR.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+        artifacts: z.array(z.object({ path: z.string().min(1), name: z.string().optional(),
+          kind: z.enum(['file', 'image', 'video']).default('file') }).strict()).max(8).optional()
+          .describe('With state=ready: output files inside this task directory. The host snapshots them and the Router delivers them through the original source; do not call QQ or handle its credentials yourself.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
@@ -90,19 +93,26 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         if (args.pr_number != null && (!host.github.deployment.github || !host.github.deployment.repository)) {
           throw new Error('PR reporting requires a configured GitHub Source; omit pr_number when this task has no GitHub PR')
         }
+        if (args.artifacts?.length && args.state !== 'ready') throw new Error('Report deliverable artifacts only with state=ready')
+        const artifacts = args.artifacts?.length ? await Promise.all(args.artifacts.map(async item => {
+          if (!host.resources.artifacts || !current.execution?.directory) throw new Error('Task artifact storage is unavailable')
+          return host.resources.artifacts.stage(ticketId, current.execution.directory, item.path, item.name, item.kind, signal)
+        })) : []
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+            ...artifacts.length ? { artifacts: artifacts.map(item => item.id) } : {},
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
-          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          return { reported: true, notification, ...artifacts.length ? { artifacts: artifacts.map(({ id, name, size }) => ({ id, name, size })) } : {},
+            ...(updated.attention ? { attention: updated.attention } : {}) }
         })
       },
     }),

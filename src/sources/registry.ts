@@ -1,6 +1,7 @@
 /** Registry of installed Source kinds, their configured instances, and the Engine's SourceScope implementation. */
 import type { ChannelRef, OutboundMessage, ScopeResult, SourceScope, Trigger } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { HealthBoard, type HealthEntry } from '../infra/health.ts'
 import { AdmissionTableSchema, type Settings } from '../policy.ts'
 import type { ChannelLink, ChannelLinks, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
@@ -95,6 +96,7 @@ export class SourceRegistry implements SourceScope {
   async send(message: OutboundMessage, commands: Commands): Promise<'sent' | 'gone' | 'waiting'> {
     const kind = this.kinds.get(message.channel.source)
     if (!kind) return 'waiting'
+    if (message.artifacts?.length && !kind.channel?.artifacts) throw new Error(`The ${kind.kind} source has no artifact delivery adapter`)
     return kind.channel ? kind.channel.send({ commands }, message) : 'gone'
   }
   link(channel: ChannelRef, links: ChannelLinks): ChannelLink {
@@ -106,6 +108,12 @@ export class SourceRegistry implements SourceScope {
     return { threads: [...new Set(found.flatMap(item => item.threads))], terms: [...new Set(found.flatMap(item => item.terms))] }
   }
   repliesTo(trigger: Trigger): string | undefined { return this.kinds.get(trigger.source)?.repliesTo?.(trigger) }
+  attachmentReferences(trigger: Trigger) { return this.kinds.get(trigger.source)?.attachments?.references(trigger) ?? [] }
+  async readAttachment(trigger: Trigger, id: string, agent: Agent | undefined, signal: AbortSignal): Promise<unknown> {
+    const media = this.kinds.get(trigger.source)?.attachments
+    if (!media || !trigger.channel || !this.channelAllowed(trigger.channel)) throw new Error('Source attachment access is unavailable')
+    return media.read(trigger, id, agent, signal)
+  }
   threadContext(trigger: Trigger, settings = this.settings()): TriggerContext | undefined {
     const kind = this.kinds.get(trigger.source)
     const context = kind?.threadContext

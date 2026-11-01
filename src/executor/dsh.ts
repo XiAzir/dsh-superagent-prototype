@@ -120,11 +120,13 @@ const capped = (text: string, limit: number, read: string) =>
  */
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
-    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
+    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link,
+    ...trigger.attachments?.length ? { attachments: trigger.attachments } : {}, ...(note ? { routing_note: note } : {}),
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
 /** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */
 export const batchLine = (trigger: Trigger) => ({ trigger_id: trigger.id, from: trigger.actor.id, at: trigger.at,
+  ...trigger.attachments?.length ? { attachments: trigger.attachments } : {},
   preview: trigger.text.replace(/\s+/g, ' ').slice(0, 160), read: `trigger/${trigger.id}` })
 /** Returns the other triggers in a ticket's origin batch (excluding the primary `origin.triggerId`), oldest first. */
 export const batchOf = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger[] => ticket.origin.triggerIds
