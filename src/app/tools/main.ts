@@ -28,7 +28,7 @@ export interface MainToolsHost {
   readonly resources: ResourceHost
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
-  sendReplies(): Promise<void>
+  sendReplies(receiptId?: string): Promise<void>
   /** Runs an Engine command initiated by the main Session without emitting self-notifications. */
   quietly<T>(run: () => T): T
 }

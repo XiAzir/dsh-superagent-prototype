@@ -115,3 +115,25 @@ it('lets a different ticket in the same conversation send while another ticket h
   await h.runtime.sendReplies()
   expect(h.runtime.outbox.status('ticket-a-attachment')).toBe('sent')
 })
+
+it('lets a worker acknowledge its own request without waiting for an unrelated slow upload', async () => {
+  const { sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const hold = deferred<void>()
+  const started: string[] = []
+  const probe: SourceKind<Record<string, never>> = { kind: 'probe', title: { zh: '探针', en: 'Probe' }, description: { zh: '', en: '' }, health: [],
+    schema: z.object({}).strict(), fields: [], channel: { send: async (_host, message) => {
+      started.push(message.id); await hold.promise; return 'sent'
+    }, link: () => ({ url: '', label: { zh: '探针', en: 'Probe' } }) } }
+  h.runtime.sources.register(probe)
+  try {
+    h.runtime.outbox.send({ id: 'unrelated-upload', channel: { source: 'probe', thread: 'probe:other', address: {} }, text: 'slow artifact', kind: 'reply' })
+    await vi.waitFor(() => expect(started).toContain('unrelated-upload'))
+    const message = feishu('2', '补充要求', { root_id: 'om_1', mentions: [] })
+    h.runtime.receive(message)
+    let result: Record<string, unknown> | undefined
+    const acknowledged = h.runTool(sessionId, 'orchestrator_ack', { trigger_id: message.id, text: '收到，也处理补充要求。' }).then(value => { result = value })
+    await vi.waitFor(() => expect(result).toMatchObject({ acknowledgement: 'sent' }))
+    expect(h.runtime.outbox.status('unrelated-upload')).toBe('pending')
+    await acknowledged
+  } finally { hold.resolve(); await h.runtime.sendReplies() }
+})

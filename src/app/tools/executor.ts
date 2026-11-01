@@ -17,7 +17,7 @@ export interface ExecutorToolsHost {
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
-  sendReplies(): Promise<void>
+  sendReplies(receiptId?: string): Promise<void>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
@@ -34,7 +34,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       }).strict(),
       execute: async args => {
         const reply = host.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: args.trigger_id, text: args.text })
-        if (reply.status !== 'sent') await host.sendReplies()
+        if (reply.status !== 'sent') await host.sendReplies(reply.id)
         return { trigger_id: args.trigger_id, acknowledgement: host.store.replyStatus(reply.id)!, reused: reply.reused }
       },
     }),

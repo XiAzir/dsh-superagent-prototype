@@ -45,7 +45,7 @@ export class Outbox implements OutboxPort {
     const { store, effects } = this.host
     store.atomic(() => { if (store.receipts.withdraw(id)) effects.cancel('reply', id) })
   }
-  sent(): Promise<void> { return this.host.effects.idle('reply') }
+  sent(id?: string): Promise<void> { return this.host.effects.idle('reply', id) }
   private async deliver(id: string): Promise<void> {
     const { store, sources, commands } = this.host
     const receipt = store.receipts.get(id)

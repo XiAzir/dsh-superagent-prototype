@@ -92,11 +92,11 @@ export class Effects {
     this.scheduled = true
     queueMicrotask(() => { this.scheduled = false; this.dispatch() })
   }
-  /** Resolves once no effect of `kind` (or of any kind) is running and none can start because none is due or `limit()` has no room. */
-  async idle(kind?: EffectKind): Promise<void> {
+  /** Wait for running attempts of `kind`, optionally one `key`; delayed or capacity-blocked rows remain durably queued. */
+  async idle(kind?: EffectKind, key?: string): Promise<void> {
     for (;;) {
       this.dispatch()
-      const running = [...this.tasks].filter(task => kind === undefined || task.kind === kind).map(task => task.done)
+      const running = [...this.tasks].filter(task => (kind === undefined || task.kind === kind) && (key === undefined || task.key === key)).map(task => task.done)
       if (!running.length) return
       await Promise.allSettled(running)
     }
