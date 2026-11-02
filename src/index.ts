@@ -5,6 +5,7 @@ import type {} from '@deepseek-ai/dsh-settings'
 import { Runtime } from './app/runtime.ts'
 import { Config, machineOf, type DeploymentConfig } from './deployment.ts'
 import { protectStateDirectory } from './infra/private-directory.ts'
+import { configureHttpNoReuse } from './infra/http-compat.ts'
 import { webSource } from './app/web-tasks.ts'
 import { QqBridge, QqSourceError } from './app/qq-source.ts'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -13,6 +14,7 @@ export const name = 'dsh-superagent'
 export const inject = ['agents', 'sessionController', 'sessionPersistence', 'workspaceRegistry', 'permissionPresets', 'tools', 'systemPrompt', 'skills', 'webServer', 'llm', 'subprocess']
 export { Config }
 export async function apply(ctx: Context, config: DeploymentConfig): Promise<void> {
+  ctx.effect(() => configureHttpNoReuse(ctx.webServer, process.env.DSH_SUPERAGENT_HTTP_CLOSE === '1'))
   const machine = machineOf(config)
   protectStateDirectory(machine.stateDir)
   // The management panel provides its own settings UI, so disable DSH's auto-generated settings page.

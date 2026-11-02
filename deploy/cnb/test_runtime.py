@@ -206,6 +206,14 @@ class RuntimeTests(unittest.TestCase):
         stop_dsh.assert_called_once()
         self.assertFalse(supervisor.dsh_started)
 
+    def test_cnb_dsh_launch_opts_into_http_no_reuse(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        child = type("Process", (), {"returncode": 0, "poll": lambda self: self.returncode})()
+        with patch.object(runtime.subprocess, "Popen", return_value=child) as spawn, \
+             patch.object(supervisor, "is_paused", return_value=False):
+            supervisor.start_dsh()
+        self.assertEqual(spawn.call_args.kwargs["env"]["DSH_SUPERAGENT_HTTP_CLOSE"], "1")
+
     def test_fenced_stop_uses_short_deadline_then_only_kills_verified_profile_pids(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.dsh_started = True

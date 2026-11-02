@@ -319,7 +319,8 @@ class Supervisor:
         if self.is_paused():
             self.intentional = True
             return
-        env = {**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL}
+        env = {**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL,
+               'DSH_SUPERAGENT_HTTP_CLOSE': '1'}
         command = [sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'start', '--profile', PROFILE,
                    '--url', URL, '--timeout', str(READY_TIMEOUT)]
         self.dsh_started = True
