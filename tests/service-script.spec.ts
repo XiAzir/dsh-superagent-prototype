@@ -85,6 +85,17 @@ posixIt('takes no `dsh plugin` command of the profile for its service', async ()
     `${service} node node /opt/my tools/dsh --profile superagent --no-open`)
   expect(await status('superagent')).toMatchObject({ pids: [service] })
 })
+posixIt('recognizes the Node 24 MainThread process when its argv names the DSH launcher', async () => {
+  const pid = sleeper()
+  processes(`${pid} MainThread node /usr/local/bin/dsh --profile superagent --no-open`)
+  expect(await status('superagent')).toMatchObject({ pids: [pid] })
+})
+posixIt('rejects non-Node and unrelated Node processes that only carry the profile option', async () => {
+  const notNode = sleeper(), otherNode = sleeper()
+  processes(`${notNode} MainThread python /usr/local/bin/dsh --profile superagent --no-open`,
+    `${otherNode} MainThread node /usr/local/bin/other-agent --profile superagent --no-open`)
+  expect(await status('superagent')).toMatchObject({ pids: [] })
+})
 posixIt('records the service PID at start, and still refuses a second instance the scan finds', async () => {
   const url = await answering()
   const pid = sleeper()
