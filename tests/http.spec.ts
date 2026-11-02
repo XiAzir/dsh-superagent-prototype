@@ -32,8 +32,8 @@ it('protects the QQ credential endpoint with the same origin check and accepts o
 })
 
 it('serves bounded local schedule CRUD and immediate-run responses with revision conflicts', async () => {
-  const config = { name: 'Local mail check', enabled: true, program: 'C:\\tools\\python.exe', args: ['C:\\tasks\\mail.py', '--once'],
-    cwd: 'C:\\tasks', intervalSeconds: 300, timeoutSeconds: 120 }
+  const config = { name: 'Local mail check', enabled: true, program: process.execPath, args: ['--version'],
+    cwd: tmpdir(), intervalSeconds: 300, timeoutSeconds: 120 }
   const item = { id: 'schedule-1', revision: 2, config, nextRunAt: '2026-11-01T10:05:00.000Z', running: false }
   const schedules = {
     list: () => ({ revision: 3, items: [item] }),

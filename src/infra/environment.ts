@@ -139,7 +139,8 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const guard = (name: string): string => `node -e ${shellQuote(CREDENTIAL_GUARD_PROGRAM)} ${shellQuote(name)} "$@" || exit $?`
+  // Resolve Node before removing the shim directory from PATH; deployments may provide a PATH that omits Node itself.
+  const guard = (name: string): string => `${shellQuote(process.execPath)} -e ${shellQuote(CREDENTIAL_GUARD_PROGRAM)} ${shellQuote(name)} "$@" || exit $?`
   const run = (name: string, program: string): string => `${withoutShims}\n${guard(name)}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', github ? run('gh', github.cli) : fail('gh is unavailable: this installation has no GitHub Source.'), github ? { program: github.cli } : { message: 'gh is unavailable: this installation has no GitHub Source.' })

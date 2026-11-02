@@ -59,8 +59,8 @@ describe('worker shims', () => {
   })
   itPosix('blocks GitHub credential export/account changes and Lark auth/config before the configured CLI runs', async () => {
     const marker = join(dir, 'called')
-    const gh = program(join(dir, 'gh-agent'), `printf '%s\\n' "$*" >> '${marker}'`)
-    const lark = program(join(dir, 'lark-bot'), `printf '%s\\n' "$*" >> '${marker}'`)
+    const gh = program(join(dir, 'gh-agent'), `printf '%s\\n' "$*"; printf '%s\\n' "$*" >> '${marker}'`)
+    const lark = program(join(dir, 'lark-bot'), `printf '%s\\n' "$*"; printf '%s\\n' "$*" >> '${marker}'`)
     const base = testDeployment()
     await writeEnvironment(testDeployment({ stateDir: dir, github: { ...base.github!, cli: gh }, feishu: { ...base.feishu!, cli: lark } }), [])
     const bin = workerBin(dir)
@@ -77,12 +77,12 @@ describe('worker shims', () => {
     }
     const refusal = await exec(join(bin, 'gh'), ['auth', 'login', '--with-token', 'credential-fixture-must-not-echo']).catch((error: unknown) => error as { stderr?: string })
     expect(refusal.stderr).not.toContain('credential-fixture-must-not-echo')
-    await expect(exec(join(bin, 'gh'), ['--hostname', 'github.com', 'auth', 'status'])).resolves.toMatchObject({ stdout: 'auth status\n' })
+    await expect(exec(join(bin, 'gh'), ['--hostname', 'github.com', 'auth', 'status'])).resolves.toMatchObject({ stdout: '--hostname github.com auth status\n' })
     await expect(exec(join(bin, 'gh'), ['pr', 'list'])).resolves.toMatchObject({ stdout: 'pr list\n' })
     await expect(exec(join(bin, 'gh'), ['api', 'user'])).resolves.toMatchObject({ stdout: 'api user\n' })
     await expect(exec(join(bin, 'lark-cli'), ['api', 'GET', '/open-apis/bot/v3/info'])).resolves.toMatchObject({ stdout: 'api GET /open-apis/bot/v3/info\n' })
     expect(readFileSync(marker, 'utf8').trim().split('\n')).toEqual([
-      'auth status', 'pr list', 'api user', 'api GET /open-apis/bot/v3/info',
+      '--hostname github.com auth status', 'pr list', 'api user', 'api GET /open-apis/bot/v3/info',
     ])
   })
   itPosix('replace only what dsh-superagent wrote and refuse anything else in its places', async () => {
