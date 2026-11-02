@@ -370,6 +370,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/platform.ts` | Native path, argument and environment adapters for Windows and Unix |
 | `src/infra/private-directory.ts` | Protect the state directory with Unix modes or a Windows owner-only inheritable DACL |
 | `src/infra/http-compat.ts` | Opt-in CNB SSH transport adapter: one HTTP request per socket while preserving WebSocket upgrades |
+| `src/infra/persistent-path.ts` | Opt-in CNB storage coverage checks for state, worker and schedule directories, including cache exclusions and symlink ancestors |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
@@ -475,6 +476,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/service-windows.spec.ts` | Native Windows service management with fixture processes |
 | `tests/private-directory.spec.ts` | Native state-directory permissions and inherited Windows file access |
+| `tests/persistent-path.spec.ts` | CNB archived-path containment, future directories, generated caches, symlink buckets and unchanged non-CNB behavior |
 | `tests/windows-config.spec.ts` | Windows execution paths and reserved command-name protection |
 | `tests/linux-setup.spec.ts` | Linux profile creation, YAML path encoding and preservation of existing configuration |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |

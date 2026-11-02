@@ -29,6 +29,23 @@ pwsh -File scripts/connect-cnb.ps1
 
 首次部署使用新的云端 profile，保留本机现有服务。后续在云端配置的模型凭据、QQ配置、会话、定时任务数据库与工作文件均随快照保存，归档应按敏感数据管理。NapCat等独立应用的运行目录需另行规划。`node_modules`、缓存及已知运行日志会被排除，依赖锁文件保留；恢复后自动重新安装 profile 依赖。
 
+### 应用数据目录
+
+CNB 应用的持久数据统一位于 `/workspace/.superagent-runtime/data`：
+
+| 子目录 | 保存内容 |
+|---|---|
+| `dsh-home` | DSH profile、模型配置、会话与附件 |
+| `state` | Superagent SQLite、任务、定时任务、QQ附件、默认Worker工作目录 |
+| `work` | DSH默认工作目录与手工保存的工作文件 |
+| `home` | 应用HOME；工具配置、XDG数据、浏览器profile等 |
+
+监督器显式设置HOME/XDG相关变量，并在复用tmux会话时更新每个新pane的环境。临时文件与运行socket位于同一workspace下的`control/tmp`和`control/run`。归档服务兼容较早仅包含dsh-home/state/work的快照。
+
+CNB设置`DSH_SUPERAGENT_DATA_ROOT`后，插件stateDir、Worker目录和定时任务cwd会检查归档覆盖范围及已有符号链接。自定义命令的输出路径也应指向上述持久目录。此开关只由CNB监督器设置，普通Windows/Linux安装保持原路径行为。
+
+普通项目中的`cache/caches/.cache`目录会保存；可重建的`home/.cache`、`home/.local/share/pnpm`和依赖目录`node_modules/.pnpm-store`按规则排除。CONTROL中的租约和隧道凭据由部署配置恢复，应用数据与Git源码分开管理。受控停机会先停止应用、再保存末次快照；突发环境丢失以最近一次成功上传为恢复点。
+
 ## 启停与恢复
 
 ```sh
@@ -38,7 +55,7 @@ python3 deploy/cnb/runtime.py stop        # 人工停机，外部恢复保持暂
 python3 deploy/cnb/runtime.py shutdown    # 环境结束时保存快照，允许外部重新拉起
 ```
 
-跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭会再保存一次快照。
+跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭及人工暂停会在应用停止后再保存一次快照。
 
 CNB监督器还设置 `DSH_SUPERAGENT_HTTP_CLOSE=1`：当前CNB SSH转发在远端HTTP keep-alive闲置关闭后可能保留失效socket，本适配器令DSH每个HTTP socket只处理一个请求，响应显式带 `Connection: close`；WebSocket与SSE继续工作。普通本机启动默认沿用DSH原连接策略。适配器涉及固定版本DSH的内部server字段，升级DSH时需运行真实HTTP/WebSocket回归测试。
 

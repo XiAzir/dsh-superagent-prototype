@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 
 export const SNAPSHOT_ROOTS = ['dsh-home', 'state', 'work', 'home'] as const
 
+/** Safe configuration error for a directory outside the deployment's snapshot coverage. */
 export class PersistentPathError extends Error {
   constructor() { super('Directory must be inside a snapshotted data area (dsh-home, state, work, or home).') }
 }
