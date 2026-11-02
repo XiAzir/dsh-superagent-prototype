@@ -1,5 +1,8 @@
 FROM node:24-bookworm
 
+# Docker is provided by CNB's service; only its client is needed in the workspace.
+COPY --from=docker:28-cli /usr/local/bin/docker /usr/local/bin/docker
+
 ENV LANG=C.UTF-8
 ENV LANGUAGE=C.UTF-8
 

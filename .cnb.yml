@@ -20,12 +20,13 @@ linux:
   # CNB provides SSH / WebIDE. Runtime data is restored from external storage.
   vscode:
     - runner:
-        cpus: 2
+        cpus: 4
       docker:
         build: .ide/Dockerfile
       imports:
         - https://cnb.cool/XiAzir/dsh-superagent-secrets/-/blob/main/runtime.json
       services:
+        - docker
         - name: vscode
           options:
             keepAliveTimeout: 18h
