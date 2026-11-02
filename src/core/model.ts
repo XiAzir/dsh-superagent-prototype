@@ -36,6 +36,8 @@ export interface Trigger {
   routing?: 'router'
   /** Source-declared: the sender addressed the agent, by mentioning it or in a direct message to it. */
   addressed?: 'mention' | 'direct'
+  /** Internal worker-to-worker context message; Sources must not set this field. */
+  collaboration?: { ticketId: string; requestId: string; assignmentId: string }
   at: string
   text: string
   attachments?: AttachmentReference[]
@@ -51,6 +53,8 @@ export interface Trigger {
 export interface TriggerDisposition {
   /** Router-first conversations stay pending until explicitly attached as work or answered without worker delivery. */
   routing?: 'pending' | 'worker' | 'handled'
+  /** An explicitly addressed human trigger delivered only to this ticket. */
+  directTicketId?: string
   /** Related subscriptions found before Router intent selection; matching creates no worker Input. */
   matched?: string[]
   /** Rejected by the source scope filter before entering the domain, for the Source's reason. */
@@ -187,6 +191,8 @@ export interface Thread {
   evaluating?: Evaluation
   /** How many Evals of its queued Triggers expired in a row, each of which queued them again; a Decision clears it. */
   expired?: number
+  /** Fixed-window budget shared by every Worker collaborating on this Thread. */
+  collaborationWindow?: { at: string; count: number }
   /**
    * Source-native attributes needed by channels or readers (for example a Feishu thread id). Its Source may also describe
    * the thread for people: `label`, a display name, and `facts`, a {@link ThreadFacts} map.
@@ -267,7 +273,7 @@ export type TicketInput =
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
   | { id: string; kind: 'text'; text: string; at: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
-  | { id: string; kind: 'note'; text: string; at: string }
+  | { id: string; kind: 'note'; text: string; at: string; collaborationTriggerId?: string }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -318,6 +324,10 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /** Parent and idempotency key for a Router-created sibling assignment. */
+  delegation?: { parentTicketId: string; requestId: string }
+  /** Idempotent child ids created by this ticket's Router delegation calls. */
+  delegations?: { requestId: string; ticketId: string; threadKey: string }[]
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it

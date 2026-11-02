@@ -54,6 +54,52 @@ export class Tickets extends EnginePart {
     this.options.executor.start(this.require(id), assignment)
     this.emit('ticket.created', { ticketId: id, decisionId, strength: mandate.strength })
   }
+  /** Create a sibling ticket under the same mandate, keyed durably by the parent's request id. */
+  delegate(parentId: string, requestId: string, title: string, threadKeyValue: string, assignmentId: string): Ticket {
+    const parent = this.require(parentId)
+    if (!liveTicket(parent)) throw new UserError('ticketEnded')
+    const thread = this.repo.threads.get(threadKeyValue)
+    const originThread = this.source(parent)?.threads.some(ref => threadKey(ref) === threadKeyValue)
+    if (!thread || (!thread.subscriptions.includes(parentId) && !originThread)) throw new UserError('notFollowing')
+    const prior = parent.delegations?.find(item => item.requestId === requestId)
+    if (prior) {
+      if (prior.threadKey !== threadKeyValue || this.repo.tickets.get(prior.ticketId)?.title !== title) {
+        throw new UserError('notAdmissible', { reason: 'requestId was reused with different delegation details' })
+      }
+      return this.require(prior.ticketId)
+    }
+    const id = key('ticket', 'delegate', parentId, requestId)
+    const decisionId = key('decision', 'delegate', parentId, requestId)
+    const at = this.now()
+    const triggerIds = [...parent.origin.triggerIds]
+    let child: Ticket = { id, title, decisionId, mandate: structuredClone(parent.mandate), channels: structuredClone(parent.channels), assignments: [], inputs: [],
+      undelivered: [], createdAt: at, updatedAt: at, origin: { triggerId: parent.origin.triggerId, triggerIds },
+      delegation: { parentTicketId: parentId, requestId } }
+    const outcome = { kind: 'accept' as const, title, name: `room-worker-${id.slice(0, 8)}`, scope: parent.mandate.scope,
+      reason: `Delegated by ${parentId}` }
+    child = this.options.prepareTicket?.(child, outcome) ?? child
+    const assignment = this.newAssignment(child)
+    child.inputs.push({ id: key('input', id, 'delegation', requestId), kind: 'note', text: `Delegated task: ${title}`, at })
+    child.undelivered.push(child.inputs[0]!.id)
+    this.repo.tickets.save(child)
+    if (!thread.subscriptions.includes(id)) thread.subscriptions.push(id)
+    this.repo.threads.save(thread)
+    parent.delegations = [...parent.delegations ?? [], { requestId, ticketId: id, threadKey: threadKeyValue }]
+    parent.updatedAt = at
+    this.repo.tickets.save(parent)
+    this.repo.decisions.save({ id: decisionId, evalId: `delegate:${requestId}:${assignmentId}`, threadKey: threadKeyValue, triggerIds,
+      policyVersion: parent.mandate.policyVersion, at, kind: 'accept', reason: [{ code: 'routed' }], strength: parent.mandate.strength,
+      ticketId: id, mandate: structuredClone(parent.mandate), audit: { delegatedFrom: parentId, requestId } })
+    this.options.executor.start(child, assignment)
+    this.emit('ticket.created', { ticketId: id, decisionId, strength: parent.mandate.strength })
+    return child
+  }
+  /** Persist and deliver an idempotent context-only collaboration note to one recipient. */
+  collaborationNote(ticketId: string, collaborationId: string, text: string, at: string, triggerId: string): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) return
+    this.addInput(ticket, { id: key('input', ticketId, 'collaboration', collaborationId), kind: 'note', text, at, collaborationTriggerId: triggerId })
+  }
   /**
    * Subscribes an open ticket to `thread` and records it in `ticket.follows` (`own` when opened by the ticket).
    * @throws UserError when the ticket is unknown or has ended.

@@ -1,6 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, liveTicket } from './model.ts'
+import { isoTime, liveTicket, runningAssignment, threadKey as threadKeyOf } from './model.ts'
+import { key } from './ids.ts'
 import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -15,6 +16,12 @@ export type { WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
 export type { Reply, ReplyRequest, TicketStatusSnapshot } from './replies.ts'
+
+const stableValue = (value: unknown): unknown => Array.isArray(value) ? value.map(stableValue)
+  : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, item]) => [name, stableValue(item)])) : value
+const COLLABORATION_WINDOW_MS = 60_000
+const COLLABORATION_WINDOW_LIMIT = 30
 
 /**
  * Single transactional entry point for mutating Triggers, Threads, Decisions, Tickets, and Assignments.
@@ -124,6 +131,117 @@ export class Engine {
       this.tickets.wake(ticketId)
       return this.repo.tickets.get(ticketId)!
     })
+  }
+  /** Deliver an explicitly addressed human message to one ticket without intake fan-out or Router evaluation. */
+  direct(ticketId: string, received: Trigger): Ticket {
+    return this.repo.atomic(() => {
+      const trigger = { ...received, at: isoTime(received.at) }
+      if (!trigger.human || !trigger.threads.length || !trigger.addressed || trigger.collaboration) throw new UserError('notAdmissible', { reason: 'direct delivery requires an addressed human message with a thread' })
+      const existing = this.repo.triggers.get(trigger.id)
+      const disposition = this.repo.triggers.disposition(trigger.id)
+      if (existing) {
+        const { at: _existingAt, ...existingContent } = existing
+        const { at: _receivedAt, ...receivedContent } = trigger
+        if (disposition?.directTicketId === ticketId && JSON.stringify(stableValue(existingContent)) === JSON.stringify(stableValue(receivedContent))) {
+          return this.repo.tickets.get(ticketId) ?? (() => { throw new UserError('unknownTicket') })()
+        }
+        throw new UserError('notAdmissible', { reason: 'trigger already has a different disposition' })
+      }
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket) throw new UserError('unknownTicket')
+      if (ticket.ended?.by === 'human') throw new UserError('ticketStopped')
+      if (!this.options.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+      if (this.options.policy().paused) throw new UserError('notAdmissible', { reason: 'processing is paused' })
+      const scope = this.options.scope.scope(trigger)
+      if (!scope.listened) throw new UserError('notAdmissible', { reason: scope.reason })
+      const thread = this.repo.threads.get(threadKeyOf(trigger.threads[0]!))
+      const gate = this.options.policy().gate(trigger, thread ?? { key: threadKeyOf(trigger.threads[0]!), ref: trigger.threads[0]!, createdAt: trigger.at, subscriptions: [], correlated: [], pending: [], meta: {} },
+        this.repo.tickets.list().filter(item => item.id === ticketId))
+      if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
+      this.repo.triggers.save(trigger)
+      this.repo.triggers.saveDisposition(trigger.id, { fanout: [], directTicketId: ticketId, at: this.options.now?.() ?? new Date().toISOString() })
+      this.tickets.attach(ticketId, trigger)
+      const saved = this.repo.triggers.disposition(trigger.id)!
+      this.repo.triggers.saveDisposition(trigger.id, { ...saved, directTicketId: ticketId })
+      this.tickets.wake(ticketId)
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
+  /** Send one idempotent context-only note to the other active tickets subscribed to a shared thread. */
+  collaborate(ticketId: string, threadKey: string, text: string, requestId: string, expectedAssignmentId: string): { id: string; at: string; thread: string; text: string; fromTicketId: string; recipients: string[] } {
+    return this.repo.atomic(() => {
+      const id = key('collaboration-trigger', threadKey, ticketId, requestId)
+      const thread = this.repo.threads.get(threadKey)
+      if (!thread?.subscriptions.includes(ticketId) || thread.context?.includes(ticketId)) throw new UserError('notFollowing')
+      const old = this.repo.triggers.get(id)
+      if (old) {
+        if (old.collaboration?.ticketId !== ticketId || old.text !== text) throw new UserError('notAdmissible', { reason: 'requestId was reused with different content' })
+        return { id: old.id, at: old.at, thread: threadKey, text: old.text, fromTicketId: ticketId,
+          recipients: this.repo.triggers.disposition(old.id)?.fanout ?? [] }
+      }
+      const sender = this.authorizedCollaborator(ticketId, expectedAssignmentId)
+      if (this.options.policy().paused) throw new UserError('notAdmissible', { reason: 'processing is paused' })
+      const recipients = thread.subscriptions.filter(id => id !== ticketId).filter(id => {
+        const ticket = this.repo.tickets.get(id)
+        const assignment = ticket?.assignments.at(-1)
+        return !!ticket && liveTicket(ticket) && assignment?.state !== 'ended' && this.options.policy().revalidate(ticket.mandate)
+      })
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const currentWindow = thread.collaborationWindow
+      const currentAt = Date.parse(at), windowAt = currentWindow ? Date.parse(currentWindow.at) : Number.NaN
+      const inWindow = !!currentWindow && Number.isFinite(currentAt) && Number.isFinite(windowAt)
+        && currentAt >= windowAt && currentAt - windowAt < COLLABORATION_WINDOW_MS
+      if (inWindow && currentWindow.count >= COLLABORATION_WINDOW_LIMIT) {
+        throw new UserError('notAdmissible', { reason: 'This thread reached 30 collaboration messages in 60 seconds. Combine messages and report key conclusions with orchestrator_report.' })
+      }
+      const trigger: Trigger = { id, source: thread.ref.source, threads: [thread.ref], actor: { source: 'worker', id: ticketId }, human: false,
+        at, text, meta: {}, collaboration: { ticketId, requestId, assignmentId: expectedAssignmentId } }
+      this.repo.triggers.save(trigger)
+      this.repo.triggers.saveDisposition(id, { fanout: [...recipients], at })
+      thread.collaborationWindow = inWindow ? { at: currentWindow!.at, count: currentWindow!.count + 1 } : { at, count: 1 }
+      if (!thread.lastAt || at > thread.lastAt) thread.lastAt = at
+      this.repo.threads.save(thread)
+      for (const recipient of recipients) this.tickets.collaborationNote(recipient, id, text, at, id)
+      return { id, at, thread: threadKey, text, fromTicketId: sender.id, recipients }
+    })
+  }
+  /** Create a Router-delegated sibling with the parent's mandate and a shared subscribed thread. */
+  delegate(ticketId: string, requestId: string, title: string, threadKey: string, expectedAssignmentId: string, scope?: string): Ticket {
+    return this.repo.atomic(() => {
+      const existingParent = this.repo.tickets.get(ticketId)
+      if (!existingParent) throw new UserError('unknownTicket')
+      const existing = existingParent.delegations?.find(item => item.requestId === requestId)
+      if (existing) {
+        const child = this.repo.tickets.get(existing.ticketId)
+        if (existing.threadKey !== threadKey || child?.title !== title || (scope !== undefined && scope !== existingParent.mandate.scope)) {
+          throw new UserError('notAdmissible', { reason: 'requestId was reused with different delegation details' })
+        }
+        if (!child) throw new UserError('unknownTicket')
+        return child
+      }
+      const parent = this.authorizedDelegator(ticketId, expectedAssignmentId)
+      if (scope !== undefined && scope !== parent.mandate.scope) throw new UserError('mandateRevoked')
+      return this.tickets.delegate(ticketId, requestId, title, threadKey, expectedAssignmentId)
+    })
+  }
+  private authorizedCollaborator(ticketId: string, expectedAssignmentId: string): Ticket {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket) throw new UserError('unknownTicket')
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!this.options.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+    if (this.options.policy().paused) throw new UserError('notAdmissible', { reason: 'processing is paused' })
+    if (runningAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+    return ticket
+  }
+  private authorizedDelegator(ticketId: string, expectedAssignmentId: string): Ticket {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket) throw new UserError('unknownTicket')
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!this.options.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+    if (this.options.policy().paused) throw new UserError('notAdmissible', { reason: 'processing is paused' })
+    const latest = ticket.assignments.at(-1)
+    if (!latest || latest.id !== expectedAssignmentId || latest.state === 'ended') throw new UserError('assignmentEnded')
+    return ticket
   }
   /**
    * Ask a running worker that waits in `waiting` state for its status; any other worker is left alone.
@@ -283,14 +401,14 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'status' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'direct' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Omit<Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>, 'report'> & {
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'reply'>, 'report'> & {
     /** A report is bound to the Assignment whose worker produced it, including reports that finish after asynchronous reads. */
     report(ticketId: string, report: WorkerReport, expectedAssignmentId: string): Ticket
   }
