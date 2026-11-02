@@ -5,6 +5,7 @@
 ## 目标规格与访问
 
 - `.cnb.yml` 的 `linux.vscode` 使用 2 核、4 GB，离线保留18小时。首次配置将 Worker 并发设为1；已有配置继续保留。资源吃紧时可调整到4核，CNB默认按每核2GB分配内存；更高内存规格需核对对应runner资源。
+- 本部署的公网 Web 入口为 `https://superagent.1994622.xyz/`，使用独立 HTTPS BasicAuth 登录；用户名 `azir`，密码保存在运维仓库已忽略的 `local/secrets.md` 对应条目。云端环境恢复后会自动重建反向隧道，日常访问直接使用域名。
 - Superagent web 服务监听 `127.0.0.1:13082`。客户端通过当前 CNB 工作区 SSH 目标建立隧道：
 
   ```sh
@@ -61,6 +62,18 @@ SUPERAGENT_ARCHIVE_PORT=9012
 
 Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工作区；它需要一枚限定目标仓库的启停PAT，以及单独的 `account-engage:r` workspace列表PAT。列表令牌只用于列举实例，启停令牌只作用于配置的仓库。PAT正文需存于VPS的0600文件，环境模板只填写文件路径。
 
+## 公网 Web 接入
+
+请求链路：浏览器 HTTPS → 武汉 Nginx BasicAuth → loopback 网关 13084 → 受限反向 SSH 13083 → CNB DSH 13082。
+
+`provision-web.py` 配置专用 SSH 账号与凭据，`web-sshd.conf` 仅允许该账号的固定反向监听。`web-nginx*.conf` 提供独立站点模板；证书与解析准备完成后，`install-web.sh` 安装网关和新版归档服务，进行 HTTP 就绪检查并保留回滚备份。网关固定服务当前部署域名。
+
+在 CNB 私有导入中设置 `SUPERAGENT_WEB_TUNNEL_KEY_B64`、`SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS` 和 `SUPERAGENT_WEB_TUNNEL_HOST`。监督器将密钥保存在快照之外的私有 CONTROL 目录，仅用于固定目标 SSH；应用子进程环境会剥离这些变量。隧道断开会自动重连。
+
+监督器从本地 DSH 启动日志兑换认证 cookie，再通过归档服务上报至当前租约。网关校验租约及会话归属；用户登录后访问根页面会取得 `Secure; HttpOnly; SameSite=Strict` cookie。API、WebSocket 与流式响应均经过同一登录入口，原始启动 token 留在云端。域名入口仍需云端模型配置才能执行模型任务。
+
+部署实录：[公网入口记录](../../docs/cnb-public-web-record.md)。
+
 ## API
 
 所有控制请求、`GET /status` 和备份读写都需要 Bearer token。路径均相对于 `/superagent-runtime`：
@@ -72,6 +85,7 @@ Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工
 | `POST /lease` | JSON `{"owner":"<CNB_BUILD_ID>"}` 获取180秒单实例租约。其他owner仍持有租约时返回409。 |
 | `POST /heartbeat` | JSON含`owner`、布尔`healthy`、可选布尔`paused`及受限阶段元数据；匹配owner后续租180秒。 |
 | `POST /release` | JSON含`owner`；人工暂停时附`"paused":true`，接收端会持久化暂停标记，后续新租约的健康心跳到达后清除。 |
+| `POST /web-session` | Bearer认证，JSON含当前`owner`和DSH cookie；仅持有活跃租约的owner可更新，公共状态响应隐藏此字段。 |
 | `PUT /backup` | Bearer认证，并带 `X-Superagent-Owner: <CNB_BUILD_ID>`。最多512 MiB，流式上传ZIP；owner必须仍持有有效租约。 |
 | `GET /backup` | Bearer认证，流式下载 `latest.zip`；无快照时返回404，成功时提供 `X-Archive-SHA256`。 |
 
@@ -84,6 +98,7 @@ Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工
 ```sh
 python -m unittest discover -s deploy/cnb -p 'test_*.py' -v
 python deploy/cnb/integration-test.py
+node --test deploy/cnb/test_web_gateway.mjs
 ```
 
 `test_archive.py`覆盖ZIP manifest生成、路径白名单、校验、哈希错误、归档大小限制及安全恢复；`test_archive_server.py`覆盖认证、watchdog健康schema、bootstrap宽限、心跳超时、暂停/续租/释放、服务重启后的租约持久化、过期owner拒绝、并发上限、分块/半截上传、latest/previous轮换以及下载SHA-256头。
