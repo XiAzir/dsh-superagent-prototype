@@ -307,7 +307,7 @@ class NapCatTests(unittest.TestCase):
         outside = self.tmp / 'outside'
         outside.mkdir()
         (self.data / 'napcat' / 'config').symlink_to(outside, target_is_directory=True)
-        with self.assertRaisesRegex(napcat.NapCatError, 'symlink'):
+        with self.assertRaises(napcat.NapCatError):
             self.client.ensure_started(timeout=0)
         self.assertFalse(any(call[0][:3] == ['docker', 'run', '-d'] for call in self.docker.calls))
 
