@@ -17,6 +17,7 @@ class FakeDocker:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.pulled = False
         self.info: dict | None = None
+        self.configured_mac = ''
 
     @staticmethod
     def result(code=0, stdout='', stderr=''):
@@ -40,10 +41,12 @@ class FakeDocker:
             return self.result(stdout=json.dumps([self.info]))
         if args[:3] == ['docker', 'run', '-d']:
             self.info = self._container_from_run(args, env)
+            self.configured_mac = self.info['NetworkSettings']['Networks']['bridge']['MacAddress']
             return self.result(stdout='container-id')
         if args[:2] == ['docker', 'start']:
             assert self.info is not None
             self.info['State']['Running'] = True
+            self.info['NetworkSettings']['Networks']['bridge']['MacAddress'] = self.configured_mac
             return self.result(stdout='superagent-napcat')
         if args[:2] == ['docker', 'stop']:
             assert self.info is not None
@@ -262,6 +265,27 @@ class NapCatTests(unittest.TestCase):
         with patch.object(self.client, '_ensure_alias'), self.assertRaises(napcat.NapCatError):
             self.client.ensure_started(timeout=0)
         self.assertFalse(any(call[0][:2] == ['docker', 'stop'] for call in self.docker.calls))
+
+    def test_stopped_docker_29_container_restores_and_rechecks_hidden_mac(self):
+        self.write_config({'enabled': True})
+        with patch.object(self.client, '_ensure_alias'), patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started(timeout=0)
+            self.client.stop()
+            self.docker.info['NetworkSettings']['Networks']['bridge']['MacAddress'] = ''
+            self.assertTrue(self.client.ensure_started(timeout=0)['webui_ready'])
+        self.assertEqual(sum(call[0][:3] == ['docker', 'run', '-d'] for call in self.docker.calls), 1)
+        self.assertTrue(self.docker.info['State']['Running'])
+
+    def test_changed_mac_after_start_stops_owned_container(self):
+        self.write_config({'enabled': True})
+        with patch.object(self.client, '_ensure_alias'), patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started(timeout=0)
+            self.client.stop()
+            self.docker.info['NetworkSettings']['Networks']['bridge']['MacAddress'] = ''
+            self.docker.configured_mac = '02:00:00:00:00:00'
+            with self.assertRaisesRegex(napcat.NapCatError, 'identity verification failed'):
+                self.client.ensure_started(timeout=0)
+        self.assertFalse(self.docker.info['State']['Running'])
 
     def test_owned_container_with_mismatched_config_is_rejected_without_removal(self):
         self.write_config({'enabled': True})

@@ -366,6 +366,9 @@ class NapCat:
         host = info.get('HostConfig') or {}
         network_mac = info.get('NetworkSettings', {}).get('Networks', {}).get('bridge', {}).get('MacAddress')
         mac_actual = container_config.get('MacAddress') or network_mac
+        # Docker 29 clears endpoint MAC details while a container is stopped.
+        # Revalidate its actual identity immediately after starting that container.
+        mac_matches = mac_actual == mac or (info.get('State', {}).get('Running') is False and not mac_actual)
         expected_env = self._expected_env(config, token)
         env_items = container_config.get('Env') or []
         env_map = dict(item.split('=', 1) for item in env_items if isinstance(item, str) and '=' in item)
@@ -387,7 +390,7 @@ class NapCat:
             and host.get('RestartPolicy', {}).get('Name') == 'unless-stopped'
             and host.get('SecurityOpt') == ['no-new-privileges:true']
             and host.get('Privileged') is False
-            and mac_actual == mac
+            and mac_matches
             and port_bindings == expected_ports
             and log_cfg.get('Type') == 'json-file'
             and log_cfg.get('Config') == {'max-size': '10m', 'max-file': '3'}
@@ -471,6 +474,13 @@ class NapCat:
                 raise NapCatError('Owned NapCat container configuration differs; operator review is required before replacement.')
             if not self._running(info):
                 self._run(['docker', 'start', CONTAINER])
+                started = self._container_info()
+                if started is None:
+                    raise NapCatError('NapCat container disappeared after startup.')
+                self._assert_owned(started)
+                if not self._running(started) or not self._matches(started, config, token, mac):
+                    self.stop()
+                    raise NapCatError('NapCat identity verification failed after startup; the owned container was stopped.')
         else:
             self._create(config, token, mac)
         deadline = self.clock() + max(0, timeout)
