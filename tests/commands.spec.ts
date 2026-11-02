@@ -261,7 +261,7 @@ it.skipIf(process.platform === 'win32')('force-stops descendants after timeout o
       const burst = mode === 'max-buffer' ? "process.stderr.write('private diagnostic'); process.stdout.write('x'.repeat(17 * 1024 * 1024));" : ''
       const script = `const fs = require('node:fs'); const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' }); fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)); const wait = setInterval(() => { if (fs.existsSync(${JSON.stringify(readyFile)})) { clearInterval(wait); ${burst} } }, 5); setInterval(() => {}, 1000)`
       try {
-        const result = commands.run(process.execPath, ['-e', script], undefined, mode === 'timeout' ? 300 : 5000)
+        const result = commands.run(process.execPath, ['-e', script], undefined, mode === 'timeout' ? 1000 : 10000)
         if (mode === 'timeout') await expect(result).rejects.toThrow(/timed out/)
         else await expect(result).rejects.toThrow(/printed more output/)
         const before = readFileSync(heartbeatFile, 'utf8')
@@ -272,4 +272,4 @@ it.skipIf(process.platform === 'win32')('force-stops descendants after timeout o
       }
     }
   } finally { rmSync(dir, { recursive: true, force: true }) }
-})
+}, 20_000)

@@ -163,7 +163,7 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(`Using existing DSH profile '${options.profile}'; its profile files are preserved.\n`)
   }
 
-  const patch = ensureProfilePatch({ profileDir, stateDir: options.stateDir, createdFromTemplate: !profileWasPresent })
+  const patch = ensureProfilePatch({ profileDir, stateDir: options.stateDir, port: options.port, createdFromTemplate: !profileWasPresent })
   process.stdout.write(patch.created
     ? `Created ${patch.patchPath} with stateDir ${options.stateDir}.\n`
     : `Preserved existing ${patch.patchPath}; verify its stateDir and webserver port (requested port: ${options.port}).\n`)
