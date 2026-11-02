@@ -11,6 +11,14 @@
   ssh -N -L 13082:127.0.0.1:13082 <当前工作区SSH目标>
   ```
 
+Windows 推荐从 PowerShell 7 运行仓库的连接助手：
+
+```powershell
+pwsh -File scripts/connect-cnb.ps1
+```
+
+它经 `ssh wuhan` 查询本项目当前云环境，显示本机14082端口的认证链接并保持前台SSH隧道。云环境重建后重新执行即可；`-InfoOnly`显示当前SSH目标，`-VerifyOnly`验证认证链接且隐藏token。使用默认SSH known_hosts；首次连接按SSH提示核对主机。`-KnownHostsFile`可传已有CNB主机密钥文件。
+
 - 备份接收端在固定入口反代至本机 `127.0.0.1:9012`，API 前缀为 `/superagent-runtime`。公网入口应使用 HTTPS，访问令牌通过 `Authorization: Bearer ...` 传送。
 - CNB 资源回收后，下一工作区由 runtime 先获取180秒租约，再从接收端恢复快照；成功运行后每5分钟创建并上传新快照。接收端的租约与备份元数据保存在 `/var/lib/cnb-superagent/state.json`，latest 与 previous 存放两代 ZIP。
 
@@ -31,6 +39,8 @@ python3 deploy/cnb/runtime.py shutdown    # 环境结束时保存快照，允许
 
 跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭会再保存一次快照。
 
+CNB监督器还设置 `DSH_SUPERAGENT_HTTP_CLOSE=1`：当前CNB SSH转发在远端HTTP keep-alive闲置关闭后可能保留失效socket，本适配器令DSH每个HTTP socket只处理一个请求，响应显式带 `Connection: close`；WebSocket与SSE继续工作。普通本机启动默认沿用DSH原连接策略。适配器涉及固定版本DSH的内部server字段，升级DSH时需运行真实HTTP/WebSocket回归测试。
+
 ## 接收端部署模板
 
 模板文件：
@@ -47,7 +57,7 @@ SUPERAGENT_ARCHIVE_DIR=/var/lib/cnb-superagent
 SUPERAGENT_ARCHIVE_PORT=9012
 ```
 
-启用 `archive.service` 后，确认服务只监听 `127.0.0.1:9012`。在固定域名的 HTTPS server 中加入 Nginx 示例配置，设置 `client_max_body_size 512m` 并关闭 request buffering，确保ZIP流式转发。匿名 `GET /superagent-runtime/health` 返回 HTTP 200 和 `{"status":"ok"}` 或 `{"status":"waiting"}`，供现有 watchdog 按 `.status == "ok"` 探测。
+以 `install-archive.sh` 安装 `cnb-superagent-archive.service` 后，确认服务只监听 `127.0.0.1:9012`。在固定域名的 HTTPS server 中加入 Nginx 示例配置，设置 `client_max_body_size 512m` 并关闭 request buffering，确保ZIP流式转发。匿名 `GET /superagent-runtime/health` 返回 HTTP 200 和 `{"status":"ok"}` 或 `{"status":"waiting"}`，供现有 watchdog 按 `.status == "ok"` 探测。
 
 Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工作区；它需要一枚限定目标仓库的启停PAT，以及单独的 `account-engage:r` workspace列表PAT。列表令牌只用于列举实例，启停令牌只作用于配置的仓库。PAT正文需存于VPS的0600文件，环境模板只填写文件路径。
 
@@ -72,7 +82,8 @@ Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工
 从 `superagent/` 目录运行：
 
 ```sh
-python -m unittest -v deploy.cnb.test_archive deploy.cnb.test_archive_server
+python -m unittest discover -s deploy/cnb -p 'test_*.py' -v
+python deploy/cnb/integration-test.py
 ```
 
 `test_archive.py`覆盖ZIP manifest生成、路径白名单、校验、哈希错误、归档大小限制及安全恢复；`test_archive_server.py`覆盖认证、watchdog健康schema、bootstrap宽限、心跳超时、暂停/续租/释放、服务重启后的租约持久化、过期owner拒绝、并发上限、分块/半截上传、latest/previous轮换以及下载SHA-256头。
