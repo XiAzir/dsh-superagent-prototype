@@ -11,20 +11,39 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  /** Schedules a pass to deliver the collaboration note inputs queued by the Engine. */
+  requestPass(): void
   sendReplies(receiptId?: string): Promise<void>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
   return [
-    readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
+    readTool('Read one page of this ticket’s listed resources; follow page links.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
+    tool({
+      name: 'orchestrator_thread_publish',
+      description: 'Publish peer-relevant context on a subscribed thread; skip routine updates. Reuse IDs only for retries.',
+      schema: z.object({
+        thread: z.string().min(1),
+        text: z.string().trim().min(1).max(4000),
+        request_id: z.string().trim().min(1).max(200),
+      }).strict(),
+      execute: async args => {
+        const current = host.store.tickets.get(ticketId)
+        const currentAssignmentId = current && runningAssignment(current)?.id
+        if (!currentAssignmentId) throw new Error('No running Assignment owns this publication')
+        const receipt = host.engine.collaborate(ticketId, args.thread, args.text, args.request_id, currentAssignmentId)
+        host.requestPass()
+        return { published: true, ...receipt }
+      },
+    }),
     tool({
       name: 'orchestrator_ack',
       description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',

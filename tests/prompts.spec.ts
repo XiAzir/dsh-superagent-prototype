@@ -142,6 +142,21 @@ it('adds bounded personal task guidance and omits the GitHub skill when no accou
   })
 })
 
+it('guides workers to publish only consequential peer context and routes bounded delegation through the Router', () => {
+  withStore(store => {
+    const prompts = promptsOf(store)
+    for (const personal of [false, true]) {
+      const configured = new Prompts(store, () => 100000, variables, () => true, () => true, () => personal)
+      const worker = configured.compose(defaultPrompts(), 'worker')
+      const router = configured.compose(defaultPrompts(), 'orchestrator')
+      expect(worker).toContain('orchestrator_thread_publish')
+      expect(worker).toContain('ask Router to arrange bounded')
+      expect(worker).not.toContain('orchestrator_delegate')
+      expect(router).toContain('mandate')
+    }
+  })
+})
+
 
 describe('overrides of built-in parts', () => {
   const settings = () => SettingsSchema.parse({})

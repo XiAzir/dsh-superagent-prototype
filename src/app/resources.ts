@@ -97,17 +97,46 @@ function list<T>({ offset, limit }: Read, fetch: (offset: number, count: number)
   const items = fetch(offset, size + 1)
   return { items: items.slice(0, size), next_offset: items.length > size ? offset + size : null }
 }
-/** Check whether a worker session's ticket is authorized to read a trigger (via delivery, ticket origin, or followed thread). */
-const readable = (host: ResourceHost, ticket: Ticket, trigger: Trigger): boolean => reached(ticket, trigger, key => host.store.threads.get(key))
-  || ticket.origin.triggerIds.includes(trigger.id) || trigger.threads.some(ref => ticket.follows?.some(follow => follow.thread === threadKey(ref)))
-  || [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' && !input.context ? [input.triggerId] : [])]
-    .some(id => { const source = host.store.triggers.get(id); return source?.source === trigger.source
-      && source.actor.id === trigger.actor.id && !!source.context?.includes(trigger.id) })
+/** Check explicit delivery before thread reachability so subscriptions cannot reveal Router-owned or other-ticket messages. */
+const readable = (host: ResourceHost, ticket: Ticket, trigger: Trigger): boolean => {
+  const disposition = host.store.triggers.disposition(trigger.id)
+  if (disposition?.directTicketId && disposition.directTicketId !== ticket.id) return false
+  if (trigger.collaboration && !disposition?.fanout.includes(ticket.id)) return false
+  const explicitlyDelivered = disposition?.directTicketId === ticket.id || !!disposition?.fanout.includes(ticket.id)
+    || ticket.origin.triggerIds.includes(trigger.id)
+    || ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && !input.context)
+  if (trigger.human && ((disposition?.routing === 'pending' || disposition?.routing === 'handled' || trigger.routing === 'router')
+    && !explicitlyDelivered)) return false
+  return reached(ticket, trigger, key => host.store.threads.get(key))
+    || ticket.origin.triggerIds.includes(trigger.id) || trigger.threads.some(ref => ticket.follows?.some(follow => follow.thread === threadKey(ref)))
+    || [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' && !input.context ? [input.triggerId] : [])]
+      .some(id => { const source = host.store.triggers.get(id); return source?.source === trigger.source
+        && source.actor.id === trigger.actor.id && !!source.context?.includes(trigger.id) })
+}
 const trigger = (host: ResourceHost, id: string, ticketId?: string): Trigger => {
   const found = host.store.triggers.get(id)
   if (!found) throw new UserError('unknownTrigger')
   const ticket = ticketId ? host.store.tickets.get(ticketId) : undefined
   if (ticketId && (!ticket || !readable(host, ticket, found))) throw new UserError('notReached')
+  return found
+}
+/** An Executor may fetch an attachment explicitly cited as source context by its own ticket, without gaining the source message body. */
+const attachmentTrigger = (host: ResourceHost, id: string, ticketId?: string): Trigger => {
+  const found = host.store.triggers.get(id)
+  if (!found) throw new UserError('unknownTrigger')
+  if (!ticketId) return found
+  const ticket = host.store.tickets.get(ticketId)
+  if (!ticket) throw new UserError('notReached')
+  if (readable(host, ticket, found)) return found
+  const disposition = host.store.triggers.disposition(id)
+  if (disposition?.directTicketId && disposition.directTicketId !== ticketId) throw new UserError('notReached')
+  const contextSources = [...ticket.origin.triggerIds,
+    ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])]
+  const referenced = contextSources.some(sourceId => {
+    const source = host.store.triggers.get(sourceId)
+    return source?.source === found.source && source.actor.id === found.actor.id && source.context?.includes(found.id)
+  })
+  if (!referenced) throw new UserError('notReached')
   return found
 }
 /** Fetch and cache a source resource on offset 0, serving subsequent offsets from the session cache. */
@@ -117,6 +146,25 @@ async function sourcePage(read: Read, source: string, fetch: () => Promise<unkno
   if (body === undefined) throw new Error(`Read this ${source === 'feishu' ? 'Feishu' : 'GitHub'} resource from offset 0 first`)
   if (offset === 0) host.pages.set(`${sessionId}:${resource}`, body)
   return text(read, body)
+}
+/** Keep a full Feishu thread/context page from re-exposing a stored message routed to a different ticket. */
+function feishuPageForTicket(host: ResourceHost, ticketId: string | undefined, page: unknown): unknown {
+  if (!ticketId || !page || typeof page !== 'object') return page
+  const ticket = host.store.tickets.get(ticketId)
+  if (!ticket) throw new UserError('unknownTicket')
+  const visible = (item: unknown) => {
+    if (!item || typeof item !== 'object') return true
+    const row = item as Record<string, unknown>
+    const id = typeof row.message_id === 'string' ? row.message_id : typeof row.id === 'string' ? row.id : undefined
+    if (!id) return true
+    const stored = host.store.triggers.get(feishuTriggerId(id))
+    return !stored || readable(host, ticket, stored)
+  }
+  const result = page as Record<string, unknown>
+  return { ...result,
+    ...Array.isArray(result.messages) ? { messages: result.messages.filter(visible) } : {},
+    ...result.message && !visible(result.message) ? { message: null, status: 'restricted' } : {},
+  }
 }
 const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
@@ -129,7 +177,7 @@ const ROUTES: readonly Route[] = [
   ['attachment/', async read => {
     const [triggerId, id, ...rest] = read.rest.split('/')
     if (!triggerId || !id || rest.length) throw new Error('Choose an attachment resource from the original message')
-    const found = trigger(read.host, triggerId, read.ticketId)
+    const found = attachmentTrigger(read.host, triggerId, read.ticketId)
     if (!read.host.readAttachment) throw new Error('Source attachment reading is unavailable')
     return read.host.readAttachment(found, id, read.sessionId, read.signal ?? new AbortController().signal)
   }],
@@ -156,8 +204,16 @@ const ROUTES: readonly Route[] = [
       throw new Error('Unknown or inaccessible thread')
     }
     const { store } = host
-    const { read: _read, tickets: ids, ...card } = threadCard(thread, threadTitle(store, thread))
-    const page = list(read, (offset, count) => store.read.threadPage(thread.key, offset, count).map(triggerLine))
+    const owner = ticketId ? host.store.tickets.get(ticketId) : undefined
+    const visible = ticketId ? store.read.threadTriggers(thread.key, 100000).filter(item => !!owner && readable(host, owner, item)) : undefined
+    const safeLabel = visible?.find(item => item.human) ?? visible?.[0]
+    const label = safeLabel ? preview(safeLabel.text).slice(0, 80) : ticketId ? thread.key : threadTitle(store, thread)
+    const { read: _read, tickets: ids, ...rawCard } = threadCard(thread, label)
+    const { pending: _pending, evaluating: _evaluating, ...workerCard } = rawCard
+    const card = ticketId ? workerCard : rawCard
+    const page = ticketId
+      ? list(read, (offset, count) => visible!.slice().reverse().slice(offset, offset + count).map(triggerLine))
+      : list(read, (offset, count) => store.read.threadPage(thread.key, offset, count).map(triggerLine))
     // Worker sessions cannot inspect other tickets or decisions on a shared thread.
     if (ticketId) return { ...card, ...page }
     const tickets = ids.flatMap(id => { const found = store.tickets.get(id); return found ? [ticketCard(found)] : [] })
@@ -228,7 +284,8 @@ const ROUTES: readonly Route[] = [
     const ref = feishuRef(source)
     if (!ref) throw new Error('A Feishu source trigger is required')
     const commands = read.host.commands.withSignal(read.signal)
-    return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
+    return sourcePage(read, 'feishu', async () => feishuPageForTicket(read.host, read.ticketId,
+      await feishuRead(commands, ref, read.resource, read.host.feishuPageSize())))
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['trigger/', async read => {
@@ -240,7 +297,9 @@ const ROUTES: readonly Route[] = [
     const ticket = ticketId ? host.store.tickets.get(ticketId) : undefined
     const shown = (item: Trigger | undefined) => item && (!ticket || readable(host, ticket, item)) ? item : undefined
     const disposition = host.store.triggers.disposition(found.id)
-    const visible = disposition && ticket ? { ...disposition, decisionId: undefined, fanout: disposition.fanout.filter(id => id === ticket.id) }
+    const visible = disposition && ticket ? { ...disposition, decisionId: undefined, matched: undefined,
+      fanout: disposition.fanout.filter(id => id === ticket.id), context: disposition.context?.filter(id => id === ticket.id),
+      handbacks: disposition.handbacks?.filter(item => item.ticketId === ticket.id), acked: disposition.acked?.filter(id => id === ticket.id) }
       : disposition
     // Omit card preview and self-reference because this resource returns the full text.
     const { preview: _preview, chars: _chars, read: _read, ...card } = triggerCard(found, visible)
