@@ -4,5 +4,7 @@
 *.py text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+deploy/cnb/*.conf text eol=lf
+deploy/cnb/*.service text eol=lf
 scripts/dsh-superagent text eol=lf
 Dockerfile text eol=lf

@@ -50,7 +50,13 @@ try:
 except KeyError:
     run(['useradd', '--system', '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', ACCOUNT])
 keys_dir = Path('/etc/ssh/authorized_keys')
+if keys_dir.is_symlink():
+    raise SystemExit('Authorized key directory must be a regular directory.')
 keys_dir.mkdir(mode=0o755, exist_ok=True)
+# The private umask above also applies to mkdir; sshd reads as the target user.
+# This directory contains public keys only and must allow that user's traversal.
+os.chown(keys_dir, 0, 0)
+os.chmod(keys_dir, 0o755)
 authorized = keys_dir / ACCOUNT
 expected = 'restrict,port-forwarding,permitlisten="127.0.0.1:13083" ' + public + '\n'
 if authorized.exists() and authorized.read_text() != expected:
