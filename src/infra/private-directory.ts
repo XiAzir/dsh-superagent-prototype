@@ -1,6 +1,6 @@
 /** State-directory permissions: Unix mode bits and an inheritable owner-only Windows DACL. */
 import { execFileSync } from 'node:child_process'
-import { lstatSync, mkdirSync, realpathSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 
@@ -16,7 +16,7 @@ export function protectStateDirectory(directory: string): void {
     throw new Error('Choose a dedicated state subdirectory, not a filesystem root, home directory or current workspace')
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 })
-  if (process.platform !== 'win32') return
+  if (process.platform !== 'win32') { chmodSync(directory, 0o700); return }
   if (lstatSync(directory).isSymbolicLink()) throw new Error('The state directory must be a real directory, not a link')
   // The path travels as data in the environment, never as interpolated PowerShell source.
   const script = `$ErrorActionPreference = 'Stop'

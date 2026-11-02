@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, parse } from 'node:path'
 import { expect, it } from 'vitest'
@@ -28,3 +28,15 @@ it('protects a state directory and its new files using the native permission mod
     } else expect(statSync(dir).mode & 0o777).toBe(0o700)
   } finally { rmSync(root, { recursive: true, force: true }) }
 }, 20000)
+
+it.skipIf(process.platform === 'win32')('tightens permissions on an existing state directory', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-private-'))
+  const dir = join(root, 'state')
+  try {
+    chmodSync(root, 0o777)
+    protectStateDirectory(dir)
+    chmodSync(dir, 0o755)
+    protectStateDirectory(dir)
+    expect(statSync(dir).mode & 0o777).toBe(0o700)
+  } finally { chmodSync(root, 0o700); rmSync(root, { recursive: true, force: true }) }
+})

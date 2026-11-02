@@ -250,3 +250,26 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
 })
+
+it.skipIf(process.platform === 'win32')('force-stops descendants after timeout or max-buffer termination', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'command-tree-'))
+  const commands = new Commands(() => deployment, {}, new AbortController().signal)
+  try {
+    for (const mode of ['timeout', 'max-buffer'] as const) {
+      const readyFile = join(dir, `${mode}.ready`), heartbeatFile = join(dir, `${mode}.heartbeat`), pidFile = join(dir, `${mode}.pid`)
+      const childScript = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready'); process.on('SIGTERM', () => {}); setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeatFile)}, 'x'), 20)`
+      const burst = mode === 'max-buffer' ? "process.stderr.write('private diagnostic'); process.stdout.write('x'.repeat(17 * 1024 * 1024));" : ''
+      const script = `const fs = require('node:fs'); const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' }); fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)); const wait = setInterval(() => { if (fs.existsSync(${JSON.stringify(readyFile)})) { clearInterval(wait); ${burst} } }, 5); setInterval(() => {}, 1000)`
+      try {
+        const result = commands.run(process.execPath, ['-e', script], undefined, mode === 'timeout' ? 300 : 5000)
+        if (mode === 'timeout') await expect(result).rejects.toThrow(/timed out/)
+        else await expect(result).rejects.toThrow(/printed more output/)
+        const before = readFileSync(heartbeatFile, 'utf8')
+        await new Promise(resolve => setTimeout(resolve, 150))
+        expect(readFileSync(heartbeatFile, 'utf8')).toBe(before)
+      } finally {
+        try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL') } catch { /* The process group already exited. */ }
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

@@ -1,13 +1,18 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { basename } from 'node:path'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
 import { commandEnvironment, commandInvocation } from './platform.ts'
 
 const TIMEOUT_MS = 90_000
-function stopTree(pid: number | undefined): Promise<void> {
-  if (process.platform !== 'win32' || !pid) return Promise.resolve()
+const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+function stopTree(pid: number | undefined, signal: NodeJS.Signals = 'SIGTERM'): Promise<void> {
+  if (!pid) return Promise.resolve()
+  if (process.platform !== 'win32') {
+    try { process.kill(-pid, signal) } catch { try { process.kill(pid, signal) } catch { /* The process already exited. */ } }
+    return Promise.resolve()
+  }
   return new Promise(resolve => {
     const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
     killer.once('error', resolve)
@@ -88,31 +93,61 @@ export class Commands {
     try {
       return await new Promise<string>((resolve, reject) => {
         let timeout: ReturnType<typeof setTimeout>
-        let pid: number | undefined
-        let aborting: Promise<void> | undefined
+        let escalation: ReturnType<typeof setTimeout> | undefined
+        let termination: Promise<void> | undefined
         let aborted = false; let timedOut = false
         const windows = process.platform === 'win32'
+        let stdoutBytes = 0, stderrBytes = 0
+        const stdout: Buffer[] = [], stderr: Buffer[] = []
+        let outputLimitExceeded = false
+        let spawnError: Error | undefined
+        const child = spawn(invocation.file, invocation.args, { cwd, windowsHide: true, detached: !windows, shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: commandEnvironment({ ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }) })
+        const terminate = () => {
+          termination ??= (async () => {
+            await stopTree(pid)
+            child.kill('SIGTERM')
+            if (!windows) await new Promise<void>(resolve => {
+              escalation = setTimeout(() => { void stopTree(pid, 'SIGKILL').finally(resolve) }, 1500)
+            })
+          })()
+        }
+        const collect = (stream: 'stdout' | 'stderr', chunk: Buffer | string) => {
+          if (outputLimitExceeded) return
+          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          const chunks = stream === 'stdout' ? stdout : stderr
+          const used = stream === 'stdout' ? stdoutBytes : stderrBytes
+          const remaining = Math.max(0, MAX_OUTPUT_BYTES - used)
+          if (remaining) chunks.push(data.subarray(0, remaining))
+          if (stream === 'stdout') stdoutBytes += data.length
+          else stderrBytes += data.length
+          if (data.length > remaining) { outputLimitExceeded = true; terminate() }
+        }
+        child.stdout.on('data', (chunk: Buffer | string) => collect('stdout', chunk))
+        child.stderr.on('data', (chunk: Buffer | string) => collect('stderr', chunk))
+        child.once('error', error => { spawnError = error })
         const abortTree = () => {
           aborted = true
-          if (windows) aborting ??= stopTree(pid).then(() => { child.kill('SIGTERM') })
+          terminate()
         }
-        const child = execFile(invocation.file, invocation.args, { cwd, windowsHide: true, ...(windows ? {} : { signal: this.signal }), maxBuffer: 16 * 1024 * 1024,
-          env: commandEnvironment({ ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }) },
-        async (error, stdout, stderr) => {
+        child.once('close', async (code, signal) => {
           clearTimeout(timeout)
           this.signal.removeEventListener('abort', abortTree)
-          if (windows && (aborted || timedOut)) await aborting
+          if (aborted || timedOut || outputLimitExceeded) await termination
+          if (escalation) clearTimeout(escalation)
           if (aborted) reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' }))
-          else if (timedOut) reject(Object.assign(new Error('Command timed out'), { killed: true, signal: 'SIGTERM', code: null, stderr }))
-          else if (error) reject(error)
-          else resolve(stdout)
+          else if (timedOut) reject(Object.assign(new Error('Command timed out'), { killed: true, signal: 'SIGTERM', code: null, stderr: Buffer.concat(stderr).toString('utf8') }))
+          else if (outputLimitExceeded) reject(Object.assign(new Error('Command output exceeded its limit'), { killed: true, signal: 'SIGTERM', code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', stderr: '' }))
+          else if (spawnError) reject(spawnError)
+          else if (code !== 0 || signal) reject(Object.assign(new Error('Command failed'), { code: signal ? null : code, signal, killed: !!signal, stderr: Buffer.concat(stderr).toString('utf8') }))
+          else resolve(Buffer.concat(stdout).toString('utf8'))
         })
-        pid = child.pid
+        const pid = child.pid
         this.signal.addEventListener('abort', abortTree, { once: true })
         timeout = setTimeout(() => {
           timedOut = true
-          if (windows) aborting ??= stopTree(pid).then(() => { child.kill('SIGTERM') })
-          else child.kill('SIGTERM')
+          terminate()
         }, timeoutMs)
         if (this.signal.aborted) abortTree()
       })
