@@ -147,6 +147,45 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((restored / "state" / "value.json").read_text(encoding="utf-8"), '{"legacy":true}')
         self.assertFalse((restored / "home").exists())
 
+    def test_napcat_root_preserves_complete_runtime_tree(self):
+        napcat = self.data / "napcat"
+        for relative in (
+            "qq/config",
+            "plugins/state",
+            "app",
+            "identity",
+            "cache",
+            "node_modules/example",
+        ):
+            (napcat / relative).mkdir(parents=True, exist_ok=True)
+            (napcat / relative / "value.bin").write_bytes(relative.encode("utf-8"))
+
+        self.make_snapshot()
+        paths = {entry["path"] for entry in validate_archive(self.archive)["files"]}
+        for relative in (
+            "qq/config/value.bin",
+            "plugins/state/value.bin",
+            "app/value.bin",
+            "identity/value.bin",
+            "cache/value.bin",
+            "node_modules/example/value.bin",
+        ):
+            self.assertIn(f"napcat/{relative}", paths)
+
+        restored = self.base / "restored-napcat"
+        restore_snapshot(self.archive, restored)
+        self.assertEqual((restored / "napcat" / "qq" / "config" / "value.bin").read_bytes(), b"qq/config")
+        self.assertEqual((restored / "napcat" / "node_modules" / "example" / "value.bin").read_bytes(), b"node_modules/example")
+
+    def test_legacy_archive_without_napcat_root_still_restores(self):
+        (self.data / "state" / "legacy.json").write_text('{"legacy":true}', encoding="utf-8")
+        self.make_snapshot()
+
+        restored = self.base / "restored-without-napcat"
+        restore_snapshot(self.archive, restored)
+        self.assertEqual((restored / "state" / "legacy.json").read_text(encoding="utf-8"), '{"legacy":true}')
+        self.assertFalse((restored / "napcat").exists())
+
     def test_tampered_hash_rejected(self):
         (self.data / "state" / "value.json").write_text('{"ok":true}', encoding="utf-8")
         self.make_snapshot()

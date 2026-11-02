@@ -1,7 +1,7 @@
 # Place this inside the fixed domain's HTTPS server block.
 # The location and upstream retain the /superagent-runtime API prefix.
 location ^~ /superagent-runtime/ {
-    client_max_body_size 512m;
+    client_max_body_size 4g;
     client_body_timeout 60s;
 
     proxy_pass http://127.0.0.1:9012/superagent-runtime/;

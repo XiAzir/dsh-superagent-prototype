@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local CNB workspace lease and durable snapshot receiver.
 
-The receiver stores only the dsh-superagent ``home/state/work`` archive. It is
+The receiver stores the dsh-superagent data archive, optionally including NapCat. It is
 kept on a loopback listener and expects an independently provisioned bearer
 token. The archive format and path allowlist live in the adjacent archive.py.
 """
@@ -26,7 +26,7 @@ LEASE_SECONDS = 180
 BOOTSTRAP_GRACE_SECONDS = 900
 HEARTBEAT_TIMEOUT_SECONDS = 120
 MAX_JSON_BYTES = 8 * 1024
-MAX_BACKUP_BYTES = 512 * 1024 * 1024
+MAX_BACKUP_BYTES = 4 * 1024 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 30
 MAX_REQUEST_THREADS = 32

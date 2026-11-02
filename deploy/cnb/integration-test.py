@@ -118,6 +118,15 @@ class SnapshotIntegrationTests(unittest.TestCase):
         (self.data / "home" / ".config" / "example-tool" / "settings.json").write_text('{"kept":true}', encoding="utf-8")
         (self.data / "work" / "cache").mkdir()
         (self.data / "work" / "cache" / "user-record.json").write_text('{"kept":true}', encoding="utf-8")
+        napcat = self.data / "napcat"
+        (napcat / "qq" / "config").mkdir(parents=True)
+        (napcat / "qq" / "config" / "profile.json").write_text('{"runtime":"kept"}', encoding="utf-8")
+        (napcat / "plugins" / "state").mkdir(parents=True)
+        (napcat / "plugins" / "state" / "plugin.json").write_text('{"plugin":"kept"}', encoding="utf-8")
+        (napcat / "node_modules" / "plugin-runtime").mkdir(parents=True)
+        (napcat / "node_modules" / "plugin-runtime" / "index.js").write_text("module.exports = true;", encoding="utf-8")
+        (napcat / "cache").mkdir()
+        (napcat / "cache" / "identity-cache.bin").write_bytes(b"cache-kept")
         (self.data / "work" / ".artifacts" / "dsh-superagent-superagent-20261102-123456-7.log").write_text(
             "generated runtime output\n", encoding="utf-8"
         )
@@ -176,8 +185,19 @@ class SnapshotIntegrationTests(unittest.TestCase):
         self.assertEqual((self.restored_data / "work" / "business.log").read_text(encoding="utf-8"), "business event\n")
         self.assertEqual((self.restored_data / "home" / ".config" / "example-tool" / "settings.json").read_text(), '{"kept":true}')
         self.assertEqual((self.restored_data / "work" / "cache" / "user-record.json").read_text(), '{"kept":true}')
+        self.assertEqual((self.restored_data / "napcat" / "qq" / "config" / "profile.json").read_text(), '{"runtime":"kept"}')
+        self.assertEqual((self.restored_data / "napcat" / "plugins" / "state" / "plugin.json").read_text(), '{"plugin":"kept"}')
+        self.assertEqual((self.restored_data / "napcat" / "node_modules" / "plugin-runtime" / "index.js").read_text(), "module.exports = true;")
+        self.assertEqual((self.restored_data / "napcat" / "cache" / "identity-cache.bin").read_bytes(), b"cache-kept")
         restored_paths = {item["path"] for item in archive.validate_archive(original_archive)["files"]}
         self.assertIn("dsh-home/profiles/superagent/pnpm-lock.yaml", restored_paths)
+        for expected in (
+            "napcat/qq/config/profile.json",
+            "napcat/plugins/state/plugin.json",
+            "napcat/node_modules/plugin-runtime/index.js",
+            "napcat/cache/identity-cache.bin",
+        ):
+            self.assertIn(expected, restored_paths)
         self.assertNotIn("work/.artifacts/dsh-superagent-superagent-20261102-123456-7.log", restored_paths)
 
         # A fresh paused heartbeat remains healthy to the watchdog and pauses backups.

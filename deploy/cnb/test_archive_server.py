@@ -11,12 +11,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 try:
     from .archive_server import (
         BOOTSTRAP_GRACE_SECONDS,
         HEARTBEAT_TIMEOUT_SECONDS,
-        MAX_BACKUP_BYTES,
         MAX_REQUEST_THREADS,
         BASE_PREFIX,
         create_server,
@@ -25,7 +25,6 @@ except ImportError:
     from archive_server import (
         BOOTSTRAP_GRACE_SECONDS,
         HEARTBEAT_TIMEOUT_SECONDS,
-        MAX_BACKUP_BYTES,
         MAX_REQUEST_THREADS,
         BASE_PREFIX,
         create_server,
@@ -273,12 +272,13 @@ class ArchiveServerTests(unittest.TestCase):
         connection.putrequest("PUT", BASE_PREFIX + "/backup")
         connection.putheader("Authorization", f"Bearer {TOKEN}")
         connection.putheader("X-Superagent-Owner", "build-a")
-        connection.putheader("Content-Length", str(MAX_BACKUP_BYTES + 1))
-        connection.endheaders()
-        response = connection.getresponse()
-        self.assertEqual(response.status, 413)
-        response.read()
-        connection.close()
+        with patch("deploy.cnb.archive_server.MAX_BACKUP_BYTES", 16):
+            connection.putheader("Content-Length", "17")
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual(response.status, 413)
+            response.read()
+            connection.close()
 
     def test_request_thread_limit_rejects_excess_connections(self) -> None:
         acquired = 0
