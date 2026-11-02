@@ -272,12 +272,14 @@ class ArchiveServerTests(unittest.TestCase):
         connection.putrequest("PUT", BASE_PREFIX + "/backup")
         connection.putheader("Authorization", f"Bearer {TOKEN}")
         connection.putheader("X-Superagent-Owner", "build-a")
-        with patch("deploy.cnb.archive_server.MAX_BACKUP_BYTES", 16):
-            connection.putheader("Content-Length", "17")
-            connection.endheaders()
-            response = connection.getresponse()
-            self.assertEqual(response.status, 413)
-            response.read()
+        try:
+            with patch(f"{create_server.__module__}.MAX_BACKUP_BYTES", 16):
+                connection.putheader("Content-Length", "17")
+                connection.endheaders()
+                response = connection.getresponse()
+                self.assertEqual(response.status, 413)
+                response.read()
+        finally:
             connection.close()
 
     def test_request_thread_limit_rejects_excess_connections(self) -> None:
