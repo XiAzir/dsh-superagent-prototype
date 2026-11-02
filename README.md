@@ -51,6 +51,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
 - [Personal mode](docs/personal.md): Web tasks, follow-ups, and local results
+- [Task rooms](docs/task-rooms.md): group-style supervision, peer Worker subscriptions and directed owner input
 - [QQ through NapCat](docs/qq-napcat.md): QQ Source setup and routing
 
 ## Development

@@ -354,6 +354,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/artifacts.tsx` | Authorized personal-task file downloads with busy state and retryable errors |
 | `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
 | `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
+| `src/app/task-rooms.ts` | Owner-visible task-room projections, targeted human input and paginated execution details |
+| `src/app/room-journal.ts` | Transactional indexed room history, report revisions and current/historical membership |
 | `src/app/api.ts` | `Api`, including `GET qq/status` and `PUT qq/token`, every route's parameters, query, body and response, and the list filters; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
@@ -397,6 +399,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/personal.tsx` | Personal-mode Web task creation, conversation history, follow-ups and related Ticket results |
+| `src/client/rooms.tsx` | Group-style task supervision, recipients, live message pagination and lazy execution details |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
@@ -464,6 +467,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/http-compat.spec.ts` | CNB no-reuse opt-in, guarded disposal, host compatibility checks, real HTTP connection closure and WebSocket upgrades |
 | `tests/web-tasks.spec.ts` | Personal Web task admission, idempotency, Engine intake, persistent conversation history, pagination and reply delivery |
+| `tests/core-collaboration.spec.ts` | Directed input, subscription collaboration, peer delegation and durable deduplication |
+| `tests/collaboration-tools.spec.ts` | Runtime collaboration tools and per-recipient resource visibility |
+| `tests/task-rooms.spec.ts` | Room journal persistence, message routing, report history and execution detail authorization |
+| `tests/panel-rooms.spec.tsx` | Room UI, live pagination, recipients, safe retries and lazy execution records |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
