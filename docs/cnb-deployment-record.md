@@ -46,4 +46,10 @@
 - 浏览器首批请求和WebSocket101成功，HTTP闲置后复用旧连接会停滞；额外Connection:close请求头可恢复全部请求。
 - Node单socket Agent实测：响应Keep-Alive timeout=5，闲置7秒后仍复用未收到close的旧socket，后续请求超时；Connection:close对照两次约157ms完成。
 - 兼容开关 `DSH_SUPERAGENT_HTTP_CLOSE=1` 限定为CNB监督器启动的DSH进程，使用Node的maxRequestsPerSocket=1；本机DSH配置继续保留。
-- TypeScript类型检查与构建通过，6项真实HTTP/WebSocket等兼容测试通过，25项runtime测试通过。服务端兼容补丁将在当前实例重启后实机复核。
+- TypeScript类型检查与构建通过，6项真实HTTP/WebSocket等兼容测试通过，25项runtime测试通过。当前实例重启后已实机复核：响应Connection:close，浏览器默认请求头正常交互。
+- 管理API接受SSH转发后的规范loopback端口，仍要求Origin与Host严格一致及自定义请求标记，拒绝cross-site、外部host和非法authority；新增回归通过。
+- ego默认profile实测正常打开个人任务面板；等待8秒后API请求返回200/个人模式，修复覆盖了原闲置复用故障。
+- 最终当前实例Python测试47项通过，真实HTTP/SQLite/ZIP集成1项通过，HTTP兼容/同源/文档索引专项20项通过。
+- 测试命令任务与两个验证文件已清理；工作文件历史副本仍可在近期归档中找到。
+- 当前本机保留一条127.0.0.1:14082访问隧道供控制台使用，其余诊断隧道已关闭；云端持续运行与外部恢复由监督器及武汉cron负责。
+- 云端尚未配置模型API凭据，QQ/NapCat和邮箱配置继续保留在本机。控制台“添加API Key”属于云端首次设置。
