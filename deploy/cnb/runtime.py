@@ -113,11 +113,19 @@ def config() -> dict[str, str]:
 
 
 def owner() -> str:
+    ensure_dirs()
     value = os.environ.get('CNB_BUILD_ID', '').strip()
-    if not value:
-        raise RuntimeErrorSafe('CNB_BUILD_ID is required to identify the runtime lease owner.')
-    if len(value) > 128 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', value):
-        raise RuntimeErrorSafe('CNB_BUILD_ID has an invalid lease owner format.')
+    if value:
+        if len(value) > 128 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', value):
+            raise RuntimeErrorSafe('CNB_BUILD_ID has an invalid lease owner format.')
+        write_json(CONTROL / 'owner.json', {'owner': value})
+        return value
+    saved = read_json(CONTROL / 'owner.json', {})
+    value = saved.get('owner', '') if isinstance(saved, dict) else ''
+    if not isinstance(value, str) or len(value) > 128 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', value):
+        raise RuntimeErrorSafe('CNB_BUILD_ID is required on first start to identify the runtime lease owner.')
+    if os.name != 'nt':
+        os.chmod(CONTROL / 'owner.json', 0o600)
     return value
 
 

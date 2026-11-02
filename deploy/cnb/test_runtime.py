@@ -54,6 +54,45 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(runtime.RuntimeErrorSafe):
                 runtime.config()
 
+    def test_owner_uses_control_record_when_environment_is_unset_and_env_overrides(self):
+        with patch.dict(os.environ, {"CNB_BUILD_ID": "cnb-build-old"}, clear=True):
+            self.assertEqual(runtime.owner(), "cnb-build-old")
+        owner_path = self.control / "owner.json"
+        self.assertEqual(json.loads(owner_path.read_text()), {"owner": "cnb-build-old"})
+        if os.name != "nt":
+            self.assertEqual(owner_path.stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runtime.owner(), "cnb-build-old")
+        with patch.dict(os.environ, {"CNB_BUILD_ID": "cnb-build-new"}, clear=True):
+            self.assertEqual(runtime.owner(), "cnb-build-new")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runtime.owner(), "cnb-build-new")
+
+    def test_owner_requires_build_id_when_control_record_is_absent(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                runtime.owner()
+
+    def test_start_reuses_saved_owner_with_unset_environment(self):
+        with patch.dict(os.environ, {"CNB_BUILD_ID": "cnb-build-ssh"}, clear=True):
+            runtime.owner()
+        marker = self.control / "operator-stop"
+        lock = self.control / "start.lock"
+        child = type("Child", (), {"pid": 54321, "poll": lambda self: None})()
+
+        def spawn(*_args, **_kwargs):
+            runtime.write_json(self.control / "status.json", {"pid": child.pid, "state": "running"})
+            return child
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(runtime, "start_lock_file", return_value=lock.open("a+")), \
+             patch.object(runtime, "acquire_exclusive_lock"), patch.object(runtime, "config",
+                                                                           return_value={"url": "https://archive.example", "token": "x"}), \
+             patch.object(runtime, "CONTROL", self.control), patch.object(runtime, "DATA", self.data), \
+             patch.object(runtime, "ROOT", self.root), patch.object(runtime, "OPERATOR_STOP", marker), \
+             patch.object(runtime.subprocess, "Popen", side_effect=spawn):
+            self.assertEqual(runtime.start(timeout=2), 0)
+
     def test_lease_conflict_marks_lease_lost(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         with patch.object(runtime, "json_request", return_value=(409, {})):
