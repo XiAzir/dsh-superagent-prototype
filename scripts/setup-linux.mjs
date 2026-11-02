@@ -139,6 +139,15 @@ function shellQuote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
 
+export function launchInstructions(options, createdPatch) {
+  const start = `\nPreparation complete. Start with:\n  export DSH_HOME=${shellQuote(options.home)}\n  dsh --profile ${options.profile} --no-open\n`
+  if (!createdPatch) return start + 'Use the URL printed by DSH; the existing profile keeps its configured port.\n'
+    + `For managed startup, pass that URL to scripts/dsh-superagent start --profile ${options.profile} --url.\n`
+  const url = `http://127.0.0.1:${options.port}`
+  return start + `For managed startup and health checks, run:\n  scripts/dsh-superagent start --profile ${options.profile} --url ${url}\n`
+    + `Open ${url} and configure a model provider in the DSH profile.\n`
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv)
   if (options.help) {
@@ -174,10 +183,7 @@ export async function main(argv = process.argv.slice(2)) {
     run('dsh', ['plugin', '--profile', options.profile, 'add', `link:${REPO_DIR}`], { env: dshEnv })
   }
 
-  const url = `http://127.0.0.1:${options.port}`
-  process.stdout.write(`\nPreparation complete. Start the personal-mode service with:\n  export DSH_HOME=${shellQuote(options.home)}\n  dsh --profile ${options.profile} --no-open\n`)
-  process.stdout.write(`For managed startup and health checks, run:\n  scripts/dsh-superagent start --url ${url}\n`)
-  process.stdout.write(`Open ${url} and configure a model provider in the DSH profile.\n`)
+  process.stdout.write(launchInstructions(options, patch.created))
   return 0
 }
 

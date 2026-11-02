@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-const { ensureProfilePatch, parseArgs, validateProfilePlugin } = await import(new URL('../scripts/setup-linux.mjs', import.meta.url).href)
+const { ensureProfilePatch, parseArgs, validateProfilePlugin, launchInstructions } = await import(new URL('../scripts/setup-linux.mjs', import.meta.url).href)
 
 const temporaryDirectories: string[] = []
 
@@ -19,6 +19,12 @@ afterEach(() => {
 })
 
 describe('Linux setup argument parsing', () => {
+  it('prints the selected profile and port for a new profile and defers to preserved settings on reruns', () => {
+    const options = parseArgs(['--profile', 'linux-personal', '--port', '13082'])
+    expect(launchInstructions(options, true)).toContain('start --profile linux-personal --url http://127.0.0.1:13082')
+    expect(launchInstructions(options, false)).not.toContain('http://127.0.0.1:13082')
+    expect(launchInstructions(options, false)).toContain('existing profile keeps its configured port')
+  })
   it('uses personal profile defaults and accepts an absolute persistent state directory', () => {
     const options = parseArgs(['--state-dir', '/srv/dsh/superagent/a: b# "quoted"'])
     expect(options.profile).toBe('superagent')
