@@ -14,6 +14,8 @@ linux:
           script: python3 -m unittest discover -s deploy/cnb -p 'test_*.py' -v
         - name: Validate persistence over real HTTP
           script: python3 deploy/cnb/integration-test.py
+        - name: Validate protected public web gateway
+          script: node --test deploy/cnb/test_web_gateway.mjs
 
   # CNB provides SSH / WebIDE. Runtime data is restored from external storage.
   vscode:
