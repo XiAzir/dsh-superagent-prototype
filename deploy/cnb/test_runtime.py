@@ -221,6 +221,24 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(marker.exists())
             self.assertFalse(release.call_args.args[3]["paused"])
 
+    def test_explicit_start_clears_only_runtime_and_superagent_pause_markers(self):
+        repo = self.root / "repo"
+        dsh_marker = repo / ".artifacts" / "control" / "profiles" / "superagent" / "manually-stopped"
+        other_marker = repo / ".artifacts" / "control" / "profiles" / "other" / "manually-stopped"
+        dsh_marker.parent.mkdir(parents=True)
+        other_marker.parent.mkdir(parents=True)
+        dsh_marker.touch()
+        other_marker.touch()
+        operator_marker = self.control / "operator-stop"
+        operator_marker.touch()
+        with patch.object(runtime, "ROOT", repo), patch.object(runtime, "OPERATOR_STOP", operator_marker):
+            self.assertTrue(runtime.Supervisor({}, "build-1").is_paused())
+            runtime.clear_start_markers()
+            self.assertFalse(runtime.Supervisor({}, "build-1").is_paused())
+        self.assertFalse(operator_marker.exists())
+        self.assertFalse(dsh_marker.exists())
+        self.assertTrue(other_marker.exists())
+
     def test_pause_is_healthy_for_watchdog_but_fenced_backup_is_skipped(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.lease_acquired.set()

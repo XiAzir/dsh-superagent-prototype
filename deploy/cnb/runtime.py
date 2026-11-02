@@ -618,6 +618,12 @@ def lock_file():
     return stream
 
 
+def clear_start_markers() -> None:
+    """An explicit CLI start resumes only this runtime and its managed DSH profile."""
+    OPERATOR_STOP.unlink(missing_ok=True)
+    (ROOT / '.artifacts' / 'control' / 'profiles' / PROFILE / 'manually-stopped').unlink(missing_ok=True)
+
+
 def start(timeout: int = 180) -> int:
     import fcntl
     settings, runtime_owner = config(), owner()
@@ -635,7 +641,7 @@ def start(timeout: int = 180) -> int:
                     raise RuntimeErrorSafe('Concurrent CNB runtime startup stopped before becoming ready.')
                 time.sleep(0.5)
             raise RuntimeErrorSafe('Concurrent CNB runtime did not become ready within the startup deadline.')
-        OPERATOR_STOP.unlink(missing_ok=True)
+        clear_start_markers()
         status = read_json(CONTROL / 'status.json', {})
         pid = status.get('pid') if isinstance(status, dict) else None
         if pid and process_alive(pid):
