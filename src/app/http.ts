@@ -84,8 +84,11 @@ function json(res: ServerResponse, status: number, value: unknown): void {
 }
 export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
   const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || typeof host !== 'string') return false
+  const authority = /^(127\.0\.0\.1|localhost):([1-9]\d{0,4})$/.exec(host)
+  if (!authority || Number(authority[2]) > 65535) return false
+  if (req.headers['x-orchestrator-request'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') return false
+  return req.headers.origin === undefined || req.headers.origin === `http://${host}`
 }
 const MAX_WEB_ARTIFACT_BYTES = 50 * 1024 * 1024
 const encodedFilename = (name: string): string => encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)

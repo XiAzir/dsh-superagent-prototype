@@ -125,12 +125,21 @@ it('decodes path parameters and parses each route\'s query', async () => {
 it('answers only a same-origin request from the panel on the loopback address', async () => {
   const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)
-  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { host: '127.0.0.1:9999' },
-    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' }]) {
+  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' },
+    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' },
+    { host: '127.0.0.1:013082' }, { host: '127.0.0.1:0' }, { host: '127.0.0.1:65536' },
+    { host: '127.0.0.1:14084/' }, { host: 'user@localhost:14084' }]) {
     expect(await post(headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084' })).toMatchObject({ status: 200 })
+  expect(await post({ host: 'localhost:14084', origin: 'http://localhost:14084' })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: undefined })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084', 'sec-fetch-site': 'cross-site' }))
+    .toMatchObject({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084', 'sec-fetch-site': 'same-origin' }))
+    .toMatchObject({ status: 200 })
   // Management routes require a loopback Web server.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
 })
