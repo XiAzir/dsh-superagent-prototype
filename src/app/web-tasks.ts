@@ -178,10 +178,12 @@ export function webSource(store: Store, personal: () => boolean, artifacts?: Pic
     },
     channel: {
       artifacts: true,
-      allowed: address => authorized() && !!store.get(taskKey(address.conversation ?? '')),
+      allowed: address => authorized() && (address.room ? !!store.threads.get(address.room) : !!store.get(taskKey(address.conversation ?? ''))),
       link: () => ({ url: '', label: { zh: 'Web 任务', en: 'Web task' } }),
       send: async (_host, message) => {
         if (!authorized()) return 'gone'
+        // The durable outbox/room journal is the delivery surface for owner messages on non-Web task rooms too.
+        if (message.channel.address.room) return store.threads.get(message.channel.address.room) ? 'sent' : 'gone'
         const taskId = message.channel.address.conversation ?? ''
         const task = store.get(taskKey(taskId))
         if (!task) return 'gone'

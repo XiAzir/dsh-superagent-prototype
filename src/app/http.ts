@@ -31,6 +31,8 @@ import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { WebTasks, WebTaskError } from './web-tasks.ts'
+import { TaskRooms } from './task-rooms.ts'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { QqSourceError, type QqBridge } from './qq-source.ts'
 import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
 import { ScheduleConfigSchema, ScheduleConflict, ScheduleLimit, ScheduleNotFound, type Schedules } from './schedules.ts'
@@ -46,7 +48,8 @@ export interface HttpHost {
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus'>
+  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct'>
+  inspectWorker?(ticketId: string): Promise<readonly SessionEvent[]>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -171,6 +174,9 @@ const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().no
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
+  const rooms = () => new TaskRooms({ store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
+    configured: () => runtime.configured(), requestPass: () => runtime.requestPass(),
+    ...runtime.inspectWorker ? { inspectWorker: (id: string) => runtime.inspectWorker!(id) } : {} })
   const web = () => {
     const failures = runtime.sessions?.status?.().failures ?? []
     return new WebTasks({ store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
@@ -184,6 +190,19 @@ function routes(runtime: HttpHost): Routes {
   const schedules = () => runtime.schedules ?? (() => { throw new RouteError(503, 'Schedules are not ready') })()
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET rooms': ({ query }) => {
+      const page = z.object({ offset, limit: limit(50, 100) }).parse(query)
+      return rooms().list(page.offset, page.limit)
+    },
+    'GET rooms/:key': ({ params, query }) => {
+      const page = z.object({ before: z.string().optional(), limit: limit(50, 100) }).parse(query)
+      return rooms().get(params.key, page.before, page.limit)
+    },
+    'POST rooms/:key/messages': async ({ params, body }) => rooms().post(params.key, await body()),
+    'GET rooms/:key/workers/:ticketId/activity': ({ params, query }) => {
+      const page = z.object({ offset, limit: limit(30, 50) }).parse(query)
+      return rooms().activity(params.key, params.ticketId, page.offset, page.limit)
+    },
     'GET schedules': () => schedules().list(),
     'POST schedules': async ({ body }) => {
       const request = z.object({ config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))

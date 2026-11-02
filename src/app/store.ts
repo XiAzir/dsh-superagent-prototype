@@ -9,6 +9,7 @@ import { SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave }
 import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.ts'
 import { Versions } from './versions.ts'
 import { storeReads } from './store-read.ts'
+import { RoomJournal } from './room-journal.ts'
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
@@ -52,6 +53,7 @@ export { SCHEMA_VERSION }
  */
 export class Store implements Repositories {
   readonly db: DatabaseSync
+  readonly rooms: RoomJournal
   /**
    * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
    * @param report - Receives errors thrown by `afterCommit` callbacks without failing the committed transaction.
@@ -61,6 +63,7 @@ export class Store implements Repositories {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(path)
     this.read = storeReads(this.db)
+    this.rooms = new RoomJournal(this.db)
     try {
       chmodSync(path, 0o600)
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
@@ -93,9 +96,11 @@ export class Store implements Repositories {
             CREATE INDEX IF NOT EXISTS web_task_summary_updated ON web_task_summary(updated_at DESC, id ASC);
             CREATE INDEX IF NOT EXISTS web_task_ticket_ticket ON web_task_ticket(ticket_id, web_task_id);
           `)
+          this.rooms.setup()
           this.addColumns()
           this.backfillWebTaskIndex()
           if (migrating) migrateTo11(this)
+          this.rooms.backfill()
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
         })
       } catch (error) {
@@ -263,6 +268,7 @@ export class Store implements Repositories {
     save: (trigger: Trigger): void => this.atomic(() => {
       this.db.prepare('INSERT INTO trigger VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, at=excluded.at').run(trigger.id, JSON.stringify(trigger), trigger.at)
       this.indexThreads(trigger)
+      this.rooms.trigger(trigger)
     }),
     disposition: (id: string): TriggerDisposition | undefined => { const row = this.db.prepare('SELECT value FROM disposition WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as TriggerDisposition : undefined },
     saveDisposition: (id: string, value: TriggerDisposition): void => { this.db.prepare('INSERT INTO disposition VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(id, JSON.stringify(value)) },
@@ -271,6 +277,7 @@ export class Store implements Repositories {
     get: (keyValue: string): Thread | undefined => { const row = this.db.prepare('SELECT value FROM thread WHERE key=?').get(keyValue); return row ? JSON.parse(String(row.value)) as Thread : undefined },
     save: (thread: Thread): void => this.atomic(() => {
       this.db.prepare('INSERT INTO thread VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(thread.key, JSON.stringify(thread))
+      this.rooms.thread(thread)
       if (!thread.key.startsWith('web:')) return
       const taskId = thread.key.slice('web:'.length)
       if (!this.db.prepare('SELECT 1 FROM web_task_summary WHERE id=?').get(taskId)) return
@@ -302,7 +309,9 @@ export class Store implements Repositories {
   readonly tickets = {
     get: (id: string): Ticket | undefined => { const row = this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Ticket : undefined },
     save: (ticket: Ticket): void => this.atomic(() => {
+      const previous = this.tickets.get(ticket.id)
       this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket))
+      this.rooms.ticket(ticket, previous)
       this.db.prepare(`UPDATE web_task_summary SET updated_at=MAX(updated_at, ?)
         WHERE id IN (SELECT web_task_id FROM web_task_ticket WHERE ticket_id=?)`).run(ticket.updatedAt, ticket.id)
     }),
@@ -344,7 +353,11 @@ export class Store implements Repositories {
      */
     add: (message: OutboundMessage): boolean => {
       const receipt: Receipt = { ...message, status: 'pending' }
-      return Number(this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)').run(message.id, JSON.stringify(receipt)).changes) > 0
+      return this.atomic(() => {
+        const added = Number(this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)').run(message.id, JSON.stringify(receipt)).changes) > 0
+        if (added) this.rooms.reply(message)
+        return added
+      })
     },
     /**
      * Marks a pending receipt as sent or dropped (with drop reason and timestamp), recreating the receipt if the message
