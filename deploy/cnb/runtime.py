@@ -83,7 +83,10 @@ def log(event: str, **metadata: Any) -> None:
 
 
 def set_status(state: str, **metadata: Any) -> None:
-    safe = {k: v for k, v in metadata.items() if k in {'pid', 'healthy', 'paused', 'intentional_stop', 'updated_at', 'last_backup', 'last_heartbeat', 'reason'}}
+    safe = {k: v for k, v in metadata.items() if k in {
+        'pid', 'healthy', 'paused', 'intentional_stop', 'updated_at', 'last_backup', 'last_backup_attempt',
+        'next_backup_attempt', 'last_heartbeat', 'reason',
+    }}
     safe.update(state=state, updated_at=time.time())
     write_json(CONTROL / 'status.json', safe)
 
@@ -156,6 +159,9 @@ class Supervisor:
         self.lease_acquired = threading.Event()
         self.last_heartbeat = 0.0
         self.last_backup = 0.0
+        self.last_backup_attempt = 0.0
+        self.next_backup_attempt = 0.0
+        self.backup_failures = 0
         self.dsh_started = False
         self.dsh_starting = False
         self.service_control_lock = threading.Lock()
@@ -187,7 +193,7 @@ class Supervisor:
                     self.last_heartbeat = time.time()
                     state = 'paused' if self.is_paused() else ('running' if self.dsh_started else 'bootstrapping')
                     set_status(state, pid=os.getpid(), healthy=self.is_healthy(),
-                               paused=self.is_paused(), last_heartbeat=self.last_heartbeat, last_backup=self.last_backup)
+                               paused=self.is_paused(), last_heartbeat=self.last_heartbeat, **self.backup_status())
             except RuntimeErrorSafe as exc:
                 log('heartbeat_error', reason=str(exc)[:160])
                 if self.lease_acquired.is_set() and time.time() - self.last_heartbeat > LEASE_LOST_SECONDS:
@@ -375,6 +381,9 @@ class Supervisor:
             raise RuntimeErrorSafe('Snapshot skipped because this runtime no longer owns the archive lease.')
         if self.is_paused():
             raise RuntimeErrorSafe('Snapshot skipped during intentional pause.')
+        self.last_backup_attempt = time.time()
+        set_status('running', pid=os.getpid(), healthy=self.is_healthy(), paused=False,
+                   last_heartbeat=self.last_heartbeat, **self.backup_status())
         staging = CONTROL / 'snapshot-upload.zip'
         try:
             self._archive_call('create', staging, DATA)
@@ -398,7 +407,49 @@ class Supervisor:
         finally:
             staging.unlink(missing_ok=True)
         self.last_backup = time.time()
+        self.backup_failures = 0
+        self.next_backup_attempt = self.last_backup + SNAPSHOT_SECONDS
+        paused = self.is_paused()
+        set_status('paused' if paused else 'running', pid=os.getpid(), healthy=self.is_healthy(), paused=paused,
+                   last_heartbeat=self.last_heartbeat, **self.backup_status())
         log('backup_complete')
+
+    def backup_status(self) -> dict[str, float]:
+        return {'last_backup': self.last_backup, 'last_backup_attempt': self.last_backup_attempt,
+                'next_backup_attempt': self.next_backup_attempt}
+
+    def note_backup_failure(self, error: BaseException) -> None:
+        self.backup_failures += 1
+        delay = min(300, 60 * (2 ** min(self.backup_failures - 1, 3)))
+        self.next_backup_attempt = time.time() + delay
+        log('backup_error', reason=type(error).__name__, attempt=self.backup_failures)
+        set_status('running' if self.dsh_started else 'bootstrapping', pid=os.getpid(),
+                   healthy=self.is_healthy(), paused=self.is_paused(), last_heartbeat=self.last_heartbeat,
+                   **self.backup_status())
+
+    def periodic_backup_if_due(self) -> bool:
+        if self.is_paused() or self.lease_lost.is_set():
+            return False
+        now = time.time()
+        due = self.next_backup_attempt or self.last_backup + SNAPSHOT_SECONDS
+        if now < due:
+            return False
+        try:
+            self.backup()
+            return True
+        except (RuntimeErrorSafe, subprocess.SubprocessError, OSError) as exc:
+            if not self.lease_lost.is_set():
+                self.note_backup_failure(exc)
+            return False
+
+    def initial_backup_best_effort(self) -> bool:
+        try:
+            self.backup()
+            return True
+        except (RuntimeErrorSafe, subprocess.SubprocessError, OSError) as exc:
+            if not self.lease_lost.is_set() and not self.intentional:
+                self.note_backup_failure(exc)
+            return False
 
     def _upload_backup_file(self, path: Path, digest: str) -> int:
         """Upload a snapshot with a fixed length and bounded memory, without following redirects."""
@@ -522,7 +573,7 @@ class Supervisor:
             if self.dsh_started:
                 self.stop_dsh()
             set_status('paused', pid=os.getpid(), healthy=True, paused=True, intentional_stop=True,
-                       last_heartbeat=self.last_heartbeat, last_backup=self.last_backup)
+                       last_heartbeat=self.last_heartbeat, **self.backup_status())
             self.stop_event.wait(5)
         if self.stop_event.is_set() or self.lease_lost.is_set():
             return False
@@ -547,9 +598,8 @@ class Supervisor:
             if fresh:
                 self.set_fresh_worker_limit()
             set_status('running', pid=os.getpid(), healthy=True, paused=False, last_heartbeat=self.last_heartbeat,
-                       last_backup=self.last_backup)
-            self.backup()
-            set_status('running', pid=os.getpid(), healthy=True, paused=False, last_backup=self.last_backup)
+                       **self.backup_status())
+            self.initial_backup_best_effort()
             attempt = 0
             while not self.stop_event.wait(5):
                 if self.lease_lost.is_set():
@@ -563,14 +613,10 @@ class Supervisor:
                     attempt += 1
                     if attempt > 5:
                         raise RuntimeErrorSafe('Managed DSH service stopped repeatedly; inspect the local service log.')
-                    set_status('restarting', pid=os.getpid(), reason='service_exited')
+                    set_status('restarting', pid=os.getpid(), reason='service_exited', **self.backup_status())
                     time.sleep(min(60, 2 ** attempt))
                     self.start_dsh()
-                if not self.is_paused() and time.time() - self.last_backup >= SNAPSHOT_SECONDS:
-                    try:
-                        self.backup()
-                    except RuntimeErrorSafe as exc:
-                        log('backup_error', reason=str(exc)[:160])
+                self.periodic_backup_if_due()
             return 0
         finally:
             if not self.intentional and not self.lease_lost.is_set():
@@ -591,7 +637,7 @@ class Supervisor:
                 except RuntimeErrorSafe:
                     pass
             set_status('stopped', pid=os.getpid(), healthy=False, paused=self.intentional,
-                       intentional_stop=self.intentional, last_backup=self.last_backup)
+                       intentional_stop=self.intentional, **self.backup_status())
 
     def _service_exists(self) -> bool:
         try:
@@ -610,12 +656,26 @@ class Supervisor:
             return self._local_ready()
 
 
-def lock_file():
+def lock_file(name: str):
     ensure_dirs()
-    stream = (CONTROL / 'runtime.lock').open('a+')
+    path = CONTROL / name
+    stream = path.open('a+')
     if os.name != 'nt':
-        os.chmod(CONTROL / 'runtime.lock', 0o600)
+        os.chmod(path, 0o600)
     return stream
+
+
+def start_lock_file():
+    return lock_file('start.lock')
+
+
+def serve_lock_file():
+    return lock_file('serve.lock')
+
+
+def acquire_exclusive_lock(stream) -> None:
+    import fcntl
+    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def clear_start_markers() -> None:
@@ -625,11 +685,10 @@ def clear_start_markers() -> None:
 
 
 def start(timeout: int = 180) -> int:
-    import fcntl
     settings, runtime_owner = config(), owner()
-    with lock_file() as lock:
+    with start_lock_file() as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquire_exclusive_lock(lock)
         except BlockingIOError:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -711,15 +770,20 @@ def stop(timeout: int = 360, intentional: bool = True) -> int:
 
 def serve() -> int:
     settings, runtime_owner = config(), owner()
-    supervisor = Supervisor(settings, runtime_owner)
-    supervisor.intentional = OPERATOR_STOP.exists()
-    def shutdown(*_args):
-        supervisor.intentional = supervisor.is_paused()
-        supervisor.stop_event.set()
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-    set_status('starting', pid=os.getpid(), healthy=False, paused=False)
-    return supervisor.run()
+    with serve_lock_file() as lock:
+        try:
+            acquire_exclusive_lock(lock)
+        except BlockingIOError:
+            raise RuntimeErrorSafe('Another CNB runtime supervisor already owns the serve lock.') from None
+        supervisor = Supervisor(settings, runtime_owner)
+        supervisor.intentional = OPERATOR_STOP.exists()
+        def shutdown(*_args):
+            supervisor.intentional = supervisor.is_paused()
+            supervisor.stop_event.set()
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        set_status('starting', pid=os.getpid(), healthy=False, paused=False)
+        return supervisor.run()
 
 
 def main(argv: list[str] | None = None) -> int:

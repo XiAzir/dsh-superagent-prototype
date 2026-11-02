@@ -5,6 +5,7 @@ import os
 import shutil
 import hashlib
 import io
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -238,6 +239,64 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(operator_marker.exists())
         self.assertFalse(dsh_marker.exists())
         self.assertTrue(other_marker.exists())
+
+    def test_periodic_snapshot_failures_back_off_without_raising(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        supervisor.last_backup = 699
+        failures = [
+            subprocess.CalledProcessError(1, ["archive.py"]),
+            subprocess.TimeoutExpired(["archive.py"], 180),
+            OSError("disk unavailable"),
+            runtime.RuntimeErrorSafe("archive validation failed"),
+        ]
+        with patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(runtime.time, "time", return_value=1000), \
+             patch.object(runtime, "set_status"), patch.object(runtime, "log"), \
+             patch.object(supervisor, "_archive_call", side_effect=failures) as archive:
+            for expected_delay in (60, 120, 240, 300):
+                supervisor.next_backup_attempt = 0
+                self.assertFalse(supervisor.periodic_backup_if_due())
+                self.assertEqual(supervisor.last_backup_attempt, 1000)
+                self.assertEqual(supervisor.next_backup_attempt, 1000 + expected_delay)
+                self.assertFalse(supervisor.periodic_backup_if_due())
+        self.assertEqual(archive.call_count, 4)
+
+    def test_initial_snapshot_failure_is_recorded_but_nonfatal(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.object(supervisor, "backup", side_effect=subprocess.CalledProcessError(1, ["archive.py"])), \
+             patch.object(supervisor, "note_backup_failure") as note:
+            self.assertFalse(supervisor.initial_backup_best_effort())
+        note.assert_called_once()
+
+    def test_start_and_serve_use_distinct_locks_and_serve_lock_lives_through_run(self):
+        start_path, serve_path = self.control / "start.lock", self.control / "serve.lock"
+        with patch.object(runtime, "CONTROL", self.control), patch.object(runtime, "ensure_dirs"):
+            start_lock = runtime.start_lock_file()
+            serve_lock = runtime.serve_lock_file()
+        self.assertEqual(Path(start_lock.name), start_path)
+        self.assertEqual(Path(serve_lock.name), serve_path)
+        start_lock.close(); serve_lock.close()
+
+        acquired = {"value": False}
+        def acquire(_stream):
+            if acquired["value"]:
+                raise BlockingIOError
+            acquired["value"] = True
+        testcase = self
+        class RuntimeStub:
+            def __init__(self, *_args): pass
+            def run(self):
+                with testcase.assertRaises(runtime.RuntimeErrorSafe):
+                    runtime.serve()
+                return 0
+        with patch.object(runtime, "CONTROL", self.control), patch.object(runtime, "ensure_dirs"), \
+             patch.object(runtime, "config", return_value={"url": "https://archive.example", "token": "x"}), \
+             patch.object(runtime, "owner", return_value="build-1"), \
+             patch.object(runtime, "acquire_exclusive_lock", side_effect=acquire), \
+             patch.object(runtime, "Supervisor", RuntimeStub), patch.object(runtime, "set_status"), \
+             patch.object(runtime.signal, "signal"):
+            self.assertEqual(runtime.serve(), 0)
 
     def test_pause_is_healthy_for_watchdog_but_fenced_backup_is_skipped(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
