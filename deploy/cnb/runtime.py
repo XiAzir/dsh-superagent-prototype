@@ -22,8 +22,12 @@ from typing import Any
 
 try:
     from deploy.cnb import web_tunnel
+    from deploy.cnb.napcat import NapCat
+    from deploy.cnb.archive import MAX_ARCHIVE_BYTES as MAX_ARCHIVE_SIZE
 except ModuleNotFoundError:  # Running runtime.py as a standalone script.
     import web_tunnel
+    from napcat import NapCat
+    from archive import MAX_ARCHIVE_BYTES as MAX_ARCHIVE_SIZE
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -37,6 +41,9 @@ SNAPSHOT_SECONDS = 300
 LEASE_LOST_SECONDS = 90
 READY_TIMEOUT = 180
 BOOTSTRAP_TIMEOUT = 300
+ARCHIVE_OPERATION_TIMEOUT = 600
+TRANSFER_TIMEOUT = 600
+NAPCAT_RETRY_SECONDS = 30
 MAX_RESPONSE = 2 * 1024 * 1024
 OPERATOR_STOP = CONTROL / 'operator-stop'
 
@@ -220,6 +227,11 @@ class Supervisor:
         self.backup_failures = 0
         self.dsh_started = False
         self.dsh_starting = False
+        self.napcat = NapCat(DATA, CONTROL)
+        self.napcat_enabled = False
+        self.napcat_retry_pending = False
+        self.napcat_retry_at = 0.0
+        self.shutting_down = False
         self.service_control_lock = threading.Lock()
         self.intentional = False
         self.backup_path = CONTROL / 'snapshot.zip'
@@ -241,7 +253,7 @@ class Supervisor:
                 else:
                     code, result = json_request(self.settings, '/heartbeat', 'POST', {
                         'owner': self.owner, 'healthy': self.is_healthy(), 'paused': self.is_paused(),
-                        'stage': 'running' if self.dsh_started else 'bootstrapping',
+                        'stage': 'shutting_down' if self.shutting_down else ('running' if self.dsh_started else 'bootstrapping'),
                         'detail': ''.join(ch for ch in os.environ.get('CNB_REPO_SLUG', '') if ord(ch) >= 32)[:240],
                     })
                     if code == 409:
@@ -249,7 +261,7 @@ class Supervisor:
                     if code != 200:
                         raise RuntimeErrorSafe(f'Lease heartbeat failed with HTTP {code}.')
                     self.last_heartbeat = time.time()
-                    state = 'paused' if self.is_paused() else ('running' if self.dsh_started else 'bootstrapping')
+                    state = 'paused' if self.is_paused() else ('shutting_down' if self.shutting_down else ('running' if self.dsh_started else 'bootstrapping'))
                     set_status(state, pid=os.getpid(), healthy=self.is_healthy(),
                                paused=self.is_paused(), last_heartbeat=self.last_heartbeat, **self.backup_status())
             except RuntimeErrorSafe as exc:
@@ -259,15 +271,87 @@ class Supervisor:
             self.heartbeat_stop.wait(HEARTBEAT_SECONDS)
 
     def is_healthy(self) -> bool:
-        return self.is_paused() or bool(self.dsh_started and self._local_ready())
+        if self.is_paused() or self.shutting_down:
+            return True
+        napcat_ready = not (self.napcat_enabled or self.napcat_retry_pending) or self._napcat_healthy()
+        return bool(self.dsh_started and self._local_ready() and napcat_ready)
+
+    def _napcat_healthy(self) -> bool:
+        try:
+            return self.napcat.healthy()
+        except Exception as exc:
+            log('napcat_health_error', reason=type(exc).__name__)
+            return False
+
+    def _napcat_config_enabled(self) -> bool:
+        """Read only the enable bit so fencing during startup knows whether Docker was eligible."""
+        path = DATA / 'napcat' / 'deployment.json'
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            value = json.loads(path.read_text(encoding='utf-8'))
+            return isinstance(value, dict) and value.get('enabled') is True
+        except (OSError, UnicodeError, ValueError):
+            return False
+
+    def ensure_napcat(self) -> bool:
+        """Reconcile the optional owned NapCat container without exposing its output."""
+        if self.lease_lost.is_set() or self.is_paused():
+            return False
+        self.napcat_retry_pending = self._napcat_config_enabled()
+        try:
+            result = self.napcat.ensure_started()
+        except Exception as exc:
+            self.napcat_retry_pending = True
+            self.napcat_retry_at = time.monotonic() + NAPCAT_RETRY_SECONDS
+            log('napcat_start_error', reason=type(exc).__name__)
+            return False
+        was_enabled = self.napcat_enabled
+        self.napcat_enabled = result.get('enabled') is True
+        if not self.napcat_enabled:
+            if was_enabled:
+                self.napcat_retry_pending = True
+                self.stop_napcat()
+                return False
+            self.napcat_retry_pending = False
+            self.napcat_retry_at = 0.0
+            return False
+        self.napcat_retry_pending = True
+        if self.lease_lost.is_set():
+            self.stop_napcat(fenced=True)
+            return False
+        ready = result.get('running') is True and result.get('webui_ready') is True and self._napcat_healthy()
+        self.napcat_retry_pending = not ready
+        self.napcat_retry_at = 0.0 if ready else time.monotonic() + NAPCAT_RETRY_SECONDS
+        if not ready:
+            log('napcat_not_ready', retry_seconds=NAPCAT_RETRY_SECONDS)
+        return ready
+
+    def stop_napcat(self, *, fenced: bool = False) -> None:
+        if not self.napcat_enabled and not self.napcat_retry_pending:
+            return
+        try:
+            self.napcat.stop(timeout=30)
+            self.napcat_enabled = False
+            self.napcat_retry_pending = False
+        except Exception as exc:
+            log('napcat_stop_error', reason=type(exc).__name__, fenced=fenced)
 
     def _lose_lease(self) -> None:
         self.lease_lost.set()
+        self._stop_services(fenced=True)
+
+    def _stop_services(self, *, fenced: bool = False) -> None:
+        try:
+            self.stop_web_tunnel()
+        except Exception as exc:
+            log('web_tunnel_stop_error', reason=type(exc).__name__)
         if self.dsh_started and not self.dsh_starting:
             try:
-                self.stop_dsh(fenced=True)
+                self.stop_dsh(fenced=fenced)
             except Exception as exc:
-                log('fenced_dsh_stop_error', reason=type(exc).__name__)
+                log('fenced_dsh_stop_error' if fenced else 'dsh_stop_error', reason=type(exc).__name__)
+        self.stop_napcat(fenced=fenced)
 
     def is_paused(self) -> bool:
         marker = ROOT / '.artifacts' / 'control' / 'profiles' / PROFILE / 'manually-stopped'
@@ -306,7 +390,7 @@ class Supervisor:
                                      headers={'Authorization': 'Bearer ' + self.settings['token'],
                                               'Accept': 'application/zip'})
         try:
-            response_context = OPENER.open(req, timeout=30)
+            response_context = OPENER.open(req, timeout=TRANSFER_TIMEOUT)
         except urllib.error.HTTPError as exc:
             exc.close()
             if exc.code == 404:
@@ -323,9 +407,9 @@ class Supervisor:
                     declared = int(length)
                 except (TypeError, ValueError):
                     raise RuntimeErrorSafe('Backup response omitted a valid Content-Length.')
-                if declared <= 0 or declared > 512 * 1024 * 1024:
+                if declared <= 0 or declared > MAX_ARCHIVE_SIZE:
                     raise RuntimeErrorSafe('Backup response size exceeded its limit.')
-                deadline = time.monotonic() + 120
+                deadline = time.monotonic() + TRANSFER_TIMEOUT
                 while True:
                     if time.monotonic() >= deadline:
                         raise RuntimeErrorSafe('Backup download exceeded its time limit.')
@@ -333,7 +417,7 @@ class Supervisor:
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > 512 * 1024 * 1024 or total > declared:
+                    if total > MAX_ARCHIVE_SIZE or total > declared:
                         raise RuntimeErrorSafe('Backup response size exceeded its limit.')
                     digest.update(chunk)
                     output.write(chunk)
@@ -455,30 +539,35 @@ class Supervisor:
             args = [sys.executable, str(ARCHIVE), action, str(archive), str(destination)]
         else:
             args = [sys.executable, str(ARCHIVE), action, str(archive)]
-        subprocess.run(args, cwd=ROOT, env=child_environment(), timeout=180,
+        subprocess.run(args, cwd=ROOT, env=child_environment(), timeout=ARCHIVE_OPERATION_TIMEOUT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
-    def backup(self) -> None:
+    def backup(self, *, allow_paused: bool = False) -> None:
         if self.lease_lost.is_set() or not self.lease_acquired.is_set():
             raise RuntimeErrorSafe('Snapshot skipped because this runtime no longer owns the archive lease.')
-        if self.is_paused():
+        if self.is_paused() and not allow_paused:
             raise RuntimeErrorSafe('Snapshot skipped during intentional pause.')
         self.last_backup_attempt = time.time()
-        set_status('running', pid=os.getpid(), healthy=self.is_healthy(), paused=False,
+        paused = self.is_paused()
+        set_status('paused' if paused else ('shutting_down' if self.shutting_down else 'running'),
+                   pid=os.getpid(), healthy=self.is_healthy(), paused=paused,
                    last_heartbeat=self.last_heartbeat, **self.backup_status())
         staging = CONTROL / 'snapshot-upload.zip'
         try:
             self._archive_call('create', staging, DATA)
             size = staging.stat().st_size
-            if size <= 0 or size > 512 * 1024 * 1024:
+            if size <= 0 or size > MAX_ARCHIVE_SIZE:
                 raise RuntimeErrorSafe('Snapshot archive exceeded its size limit.')
-            if self.lease_lost.is_set() or self.is_paused():
+            if self.lease_lost.is_set() or (self.is_paused() and not allow_paused):
                 raise RuntimeErrorSafe('Snapshot skipped because this runtime no longer owns the archive lease.')
             digest = hashlib.sha256()
+            digest_deadline = time.monotonic() + ARCHIVE_OPERATION_TIMEOUT
             with staging.open('rb') as source:
                 while chunk := source.read(1024 * 1024):
+                    if time.monotonic() >= digest_deadline:
+                        raise RuntimeErrorSafe('Snapshot digest exceeded its time limit.')
                     digest.update(chunk)
-            if self.lease_lost.is_set() or self.is_paused():
+            if self.lease_lost.is_set() or (self.is_paused() and not allow_paused):
                 raise RuntimeErrorSafe('Snapshot skipped because this runtime no longer owns the archive lease.')
             code = self._upload_backup_file(staging, digest.hexdigest())
             if code == 409:
@@ -537,9 +626,11 @@ class Supervisor:
         """Upload a snapshot with a fixed length and bounded memory, without following redirects."""
         parsed = urllib.parse.urlsplit(self.settings['url'])
         connection_type = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-        connection = connection_type(parsed.hostname, parsed.port, timeout=60)
+        connection = connection_type(parsed.hostname, parsed.port, timeout=TRANSFER_TIMEOUT)
         route = (parsed.path.rstrip('/') + '/backup') or '/backup'
         size = path.stat().st_size
+        if size <= 0 or size > MAX_ARCHIVE_SIZE:
+            raise RuntimeErrorSafe('Snapshot archive exceeded its size limit.')
         try:
             connection.putrequest('PUT', route)
             connection.putheader('Authorization', 'Bearer ' + self.settings['token'])
@@ -550,7 +641,7 @@ class Supervisor:
             connection.putheader('X-Superagent-Owner', self.owner)
             connection.endheaders()
             sent = 0
-            deadline = time.monotonic() + 120
+            deadline = time.monotonic() + TRANSFER_TIMEOUT
             with path.open('rb') as source:
                 while chunk := source.read(1024 * 1024):
                     if time.monotonic() >= deadline:
@@ -653,9 +744,7 @@ class Supervisor:
     def _wait_for_resume(self) -> bool:
         while self.is_paused() and not self.stop_event.is_set() and not self.lease_lost.is_set():
             self.intentional = True
-            if self.dsh_started:
-                self.stop_web_tunnel()
-                self.stop_dsh()
+            self._stop_services()
             set_status('paused', pid=os.getpid(), healthy=True, paused=True, intentional_stop=True,
                        last_heartbeat=self.last_heartbeat, **self.backup_status())
             self.stop_event.wait(5)
@@ -665,9 +754,10 @@ class Supervisor:
         return True
 
     def run(self) -> int:
-        heartbeat = threading.Thread(target=self.heartbeat_loop, name='cnb-heartbeat', daemon=True)
-        heartbeat.start()
+        heartbeat: threading.Thread | None = None
         try:
+            heartbeat = threading.Thread(target=self.heartbeat_loop, name='cnb-heartbeat', daemon=True)
+            heartbeat.start()
             try:
                 self.web_tunnel_config = web_tunnel.load_config(control=CONTROL)
             except web_tunnel.TunnelConfigError as exc:
@@ -682,6 +772,10 @@ class Supervisor:
                 return 1 if self.lease_lost.is_set() else 0
             if self.lease_lost.is_set():
                 raise RuntimeErrorSafe('Archive lease was lost during bootstrap.')
+            self.ensure_napcat()
+            if self.lease_lost.is_set():
+                self._stop_services(fenced=True)
+                raise RuntimeErrorSafe('Archive lease was lost during NapCat startup.')
             self.start_dsh()
             if fresh:
                 self.set_fresh_worker_limit()
@@ -692,11 +786,19 @@ class Supervisor:
             while not self.stop_event.wait(5):
                 if self.lease_lost.is_set():
                     self.stop_dsh(fenced=True); return 1
-                was_intentional = self.intentional
+                was_intentional = self.intentional or self.is_paused()
                 if not self._wait_for_resume():
                     return 1 if self.lease_lost.is_set() else 0
                 if was_intentional and not self.dsh_started:
+                    self.ensure_napcat()
                     self.start_dsh()
+                napcat_unhealthy = self.napcat_enabled and not self._napcat_healthy()
+                if ((napcat_unhealthy or self.napcat_retry_pending)
+                        and time.monotonic() >= self.napcat_retry_at):
+                    self.ensure_napcat()
+                if self.lease_lost.is_set():
+                    self._stop_services(fenced=True)
+                    return 1
                 if not self._service_exists():
                     attempt += 1
                     if attempt > 5:
@@ -707,30 +809,40 @@ class Supervisor:
                 self.periodic_backup_if_due()
             return 0
         finally:
-            self.stop_web_tunnel()
-            # Flush the application's final writes before the shutdown snapshot.
-            # A manual pause also keeps its latest state in the durable archive.
-            self.stop_dsh(fenced=self.lease_lost.is_set())
-            if self.lease_acquired.is_set() and not self.lease_lost.is_set():
-                try:
-                    self.backup()
-                except Exception as exc:
-                    log('final_backup_error', reason=type(exc).__name__)
-            self.heartbeat_stop.set()
-            heartbeat.join(timeout=12)
-            if heartbeat.is_alive():
-                self.lease_lost.set()
-            if self.lease_lost.is_set():
-                self.stop_dsh(fenced=True)
-            if self.lease_acquired.is_set():
-                try:
-                    if not heartbeat.is_alive():
+            self.shutting_down = True
+            try:
+                # Preserve the lease and healthy heartbeat until the final snapshot is durable.
+                self._stop_services(fenced=self.lease_lost.is_set())
+                if self.lease_acquired.is_set() and not self.lease_lost.is_set():
+                    try:
+                        self.backup(allow_paused=True)
+                    except Exception as exc:
+                        log('final_backup_error', reason=type(exc).__name__)
+            finally:
+                self.heartbeat_stop.set()
+                heartbeat_alive = False
+                if heartbeat is not None:
+                    try:
+                        heartbeat.join(timeout=12)
+                        heartbeat_alive = heartbeat.is_alive()
+                    except Exception as exc:
+                        log('heartbeat_join_error', reason=type(exc).__name__)
+                        heartbeat_alive = True
+                if heartbeat_alive:
+                    self.lease_lost.set()
+                if self.lease_lost.is_set():
+                    self._stop_services(fenced=True)
+                if self.lease_acquired.is_set():
+                    try:
                         json_request(self.settings, '/release', 'POST',
                                      {'owner': self.owner, 'paused': self.intentional}, timeout=5)
-                except RuntimeErrorSafe:
-                    pass
-            set_status('stopped', pid=os.getpid(), healthy=False, paused=self.intentional,
-                       intentional_stop=self.intentional, **self.backup_status())
+                    except Exception as exc:
+                        log('lease_release_error', reason=type(exc).__name__)
+                try:
+                    set_status('stopped', pid=os.getpid(), healthy=False, paused=self.intentional,
+                               intentional_stop=self.intentional, **self.backup_status())
+                except Exception as exc:
+                    log('stopped_status_error', reason=type(exc).__name__)
 
     def _service_exists(self) -> bool:
         try:
@@ -835,7 +947,7 @@ def process_alive(pid: Any) -> bool:
         return False
 
 
-def stop(timeout: int = 360, intentional: bool = True) -> int:
+def stop(timeout: int = 1300, intentional: bool = True) -> int:
     OPERATOR_STOP.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if intentional:
         OPERATOR_STOP.touch(mode=0o600, exist_ok=True)

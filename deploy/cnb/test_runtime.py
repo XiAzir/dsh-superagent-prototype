@@ -206,6 +206,95 @@ class RuntimeTests(unittest.TestCase):
         stop_dsh.assert_called_once()
         self.assertFalse(supervisor.dsh_started)
 
+    def test_napcat_disabled_is_noop_and_does_not_need_docker(self):
+        with patch.object(runtime.NapCat, "_run", side_effect=AssertionError("Docker must not run")) as docker:
+            supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+            with patch.object(supervisor, "is_paused", return_value=False):
+                self.assertFalse(supervisor.ensure_napcat())
+        self.assertFalse(supervisor.napcat_enabled)
+        docker.assert_not_called()
+
+        deployment = self.data / "napcat" / "deployment.json"
+        deployment.parent.mkdir(parents=True)
+        deployment.write_text('{"enabled":false}', encoding="utf-8")
+        with patch.object(runtime.NapCat, "_run", side_effect=AssertionError("disabled config must not use Docker")) as docker:
+            with patch.object(supervisor, "is_paused", return_value=False):
+                self.assertFalse(supervisor.ensure_napcat())
+        docker.assert_not_called()
+
+    def test_napcat_waiting_for_qq_login_is_healthy_when_webui_is_ready(self):
+        class Manager:
+            def __init__(self, *_args): pass
+            def ensure_started(self):
+                return {"enabled": True, "running": True, "webui_ready": True, "login": "pending"}
+            def healthy(self): return True
+            def stop(self, **_kwargs): return True
+        with patch.object(runtime, "NapCat", Manager):
+            supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.dsh_started = True
+        with patch.object(supervisor, "_local_ready", return_value=True), \
+             patch.object(supervisor, "is_paused", return_value=False):
+            self.assertTrue(supervisor.ensure_napcat())
+            self.assertTrue(supervisor.is_healthy())
+        self.assertTrue(supervisor.napcat_enabled)
+
+    def test_napcat_start_failure_retries_after_30_seconds_and_logs_only_type(self):
+        class Manager:
+            def __init__(self, *_args): pass
+            def ensure_started(self): raise ValueError("private container detail")
+        with patch.object(runtime, "NapCat", Manager), patch.object(runtime, "log") as log, \
+             patch.object(runtime.time, "monotonic", return_value=100):
+            supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+            with patch.object(supervisor, "is_paused", return_value=False):
+                self.assertFalse(supervisor.ensure_napcat())
+        self.assertEqual(supervisor.napcat_retry_at, 100 + runtime.NAPCAT_RETRY_SECONDS)
+        self.assertTrue(supervisor.napcat_retry_pending)
+        log.assert_called_once_with("napcat_start_error", reason="ValueError")
+
+    def test_lease_fencing_stops_dsh_then_owned_napcat(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.dsh_started = True
+        supervisor.napcat_enabled = True
+        order = []
+        with patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("dsh")), \
+             patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("napcat")):
+            supervisor._lose_lease()
+        self.assertTrue(supervisor.lease_lost.is_set())
+        self.assertEqual(order, ["dsh", "napcat"])
+
+    def test_firstboot_restore_and_bootstrap_precede_napcat_then_dsh(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        order = []
+        class Thread:
+            def __init__(self, **_kwargs): pass
+            def start(self): pass
+            def join(self, timeout=None): pass
+            def is_alive(self): return False
+        def start_dsh():
+            order.append("dsh")
+            supervisor.dsh_started = True
+            supervisor.stop_event.set()
+        def ensure_napcat():
+            order.append("napcat")
+            supervisor.napcat_enabled = True
+            return True
+        with patch.object(runtime.threading, "Thread", Thread), \
+             patch.object(supervisor, "_wait_for_resume", return_value=True), \
+             patch.object(supervisor, "restore_firstboot", side_effect=lambda: order.append("restore")), \
+             patch.object(supervisor, "bootstrap", side_effect=lambda: order.append("bootstrap") or False), \
+             patch.object(supervisor, "initial_backup_best_effort"), \
+             patch.object(supervisor, "ensure_napcat", side_effect=ensure_napcat), \
+             patch.object(supervisor, "start_dsh", side_effect=start_dsh), \
+             patch.object(supervisor, "stop_web_tunnel"), \
+             patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("stop-dsh")), \
+             patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("stop-napcat")), \
+             patch.object(supervisor, "backup", side_effect=lambda **_kwargs: order.append("backup")), \
+             patch.object(runtime, "set_status"), patch.object(runtime, "json_request", return_value=(200, {})), \
+             patch.object(runtime, "log"):
+            self.assertEqual(supervisor.run(), 0)
+        self.assertEqual(order, ["restore", "bootstrap", "napcat", "dsh", "stop-dsh", "stop-napcat", "backup"])
+
     def test_cnb_dsh_launch_opts_into_http_no_reuse(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         child = type("Process", (), {"returncode": 0, "poll": lambda self: self.returncode})()
@@ -280,18 +369,26 @@ class RuntimeTests(unittest.TestCase):
                 supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
                 supervisor.lease_acquired.set()
                 supervisor.intentional = manual
+                supervisor.dsh_started = True
                 supervisor.stop_event.set()
                 order = []
+                def backup(**kwargs):
+                    order.append(("backup", kwargs))
+                def stop_dsh(**_kwargs):
+                    order.append("stop")
+                    raise OSError("stop failure detail")
                 with patch.object(supervisor, "heartbeat_loop"), \
                      patch.object(supervisor, "_wait_for_resume", return_value=False), \
                      patch.object(supervisor, "stop_web_tunnel"), \
-                     patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("stop")), \
-                     patch.object(supervisor, "backup", side_effect=lambda: order.append("backup")), \
+                     patch.object(supervisor, "stop_dsh", side_effect=stop_dsh), \
+                     patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("stop-napcat")), \
+                     patch.object(supervisor, "backup", side_effect=backup), \
                      patch.object(runtime.web_tunnel, "load_config", return_value=None), \
-                     patch.object(runtime, "json_request", return_value=(200, {})), \
-                     patch.object(runtime, "set_status"):
+                     patch.object(runtime, "json_request", return_value=(200, {})) as release, \
+                     patch.object(runtime, "set_status"), patch.object(runtime, "log"):
                     self.assertEqual(supervisor.run(), 0)
-                self.assertEqual(order, ["stop", "backup"])
+                self.assertEqual(order, ["stop", "stop-napcat", ("backup", {"allow_paused": True})])
+                self.assertEqual(release.call_args.args[1], "/release")
 
     def test_web_tunnel_hook_posts_cookie_contract_and_stops_with_dsh(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example/superagent-runtime", "token": "secret"},
@@ -479,6 +576,24 @@ class RuntimeTests(unittest.TestCase):
              patch.object(supervisor, "_archive_call", side_effect=AssertionError("fenced snapshot must not start")):
             with self.assertRaises(runtime.RuntimeErrorSafe):
                 supervisor.backup()
+
+    def test_final_manual_backup_can_run_while_paused(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        supervisor.intentional = True
+        staging = self.control / "snapshot-upload.zip"
+        def create_archive(action, path, _data):
+            self.assertEqual(action, "create")
+            path.write_bytes(b"paused-final-snapshot")
+        with patch.object(supervisor, "is_paused", return_value=True), \
+             patch.object(supervisor, "_archive_call", side_effect=create_archive), \
+             patch.object(supervisor, "_upload_backup_file", return_value=200) as upload, \
+             patch.object(runtime, "set_status"), patch.object(runtime, "log"):
+            supervisor.backup(allow_paused=True)
+        upload.assert_called_once()
+        self.assertGreater(supervisor.last_backup, 0)
+        self.assertGreater(supervisor.last_backup_attempt, 0)
+        self.assertFalse(staging.exists())
 
     def test_pause_heartbeat_reports_healthy_and_paused_while_retaining_lease(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
