@@ -209,20 +209,94 @@ class RuntimeTests(unittest.TestCase):
     def test_cnb_dsh_launch_opts_into_http_no_reuse(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         child = type("Process", (), {"returncode": 0, "poll": lambda self: self.returncode})()
-        with patch.object(runtime.subprocess, "Popen", return_value=child) as spawn, \
-             patch.object(supervisor, "is_paused", return_value=False):
+        with patch.dict(os.environ, {
+                 "SUPERAGENT_WEB_TUNNEL_KEY_B64": "private-key",
+                 "SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS": "pinned-host",
+                 "SUPERAGENT_WEB_TUNNEL_HOST": "8.148.72.235",
+                 "SUPERAGENT_ARCHIVE_TOKEN": "archive-secret",
+                 "SUPERAGENT_KEEP_SETTING": "retained",
+             }), \
+             patch.object(runtime.subprocess, "Popen", return_value=child) as spawn, \
+             patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(supervisor, "start_web_tunnel"):
             supervisor.start_dsh()
-        self.assertEqual(spawn.call_args.kwargs["env"]["DSH_SUPERAGENT_HTTP_CLOSE"], "1")
+        child_env = spawn.call_args.kwargs["env"]
+        self.assertEqual(child_env["DSH_SUPERAGENT_HTTP_CLOSE"], "1")
+        self.assertEqual(child_env["SUPERAGENT_KEEP_SETTING"], "retained")
+        self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KEY_B64", child_env)
+        self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS", child_env)
+        self.assertNotIn("SUPERAGENT_WEB_TUNNEL_HOST", child_env)
+        self.assertNotIn("SUPERAGENT_ARCHIVE_TOKEN", child_env)
+
+    def test_bootstrap_and_dependency_install_strip_supervisor_secrets(self):
+        profile = self.data / "dsh-home" / "profiles" / "superagent"
+        profile.mkdir(parents=True)
+        (profile / "package.json").write_text("{}", encoding="utf-8")
+        (profile / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.dict(os.environ, {
+                 "SUPERAGENT_WEB_TUNNEL_KEY_B64": "private-key",
+                 "SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS": "pinned-host",
+                 "SUPERAGENT_ARCHIVE_TOKEN": "archive-secret",
+             }), patch.object(runtime.subprocess, "run", return_value=None) as run:
+            supervisor.bootstrap()
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            child_env = call.kwargs["env"]
+            self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KEY_B64", child_env)
+            self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS", child_env)
+            self.assertNotIn("SUPERAGENT_ARCHIVE_TOKEN", child_env)
+
+    def test_web_tunnel_hook_posts_cookie_contract_and_stops_with_dsh(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example/superagent-runtime", "token": "secret"},
+                                        "build-1")
+        supervisor.web_tunnel_config = runtime.web_tunnel.TunnelConfig(
+            "8.148.72.235", self.control / "key", self.control / "known_hosts")
+        supervisor.dsh_started = True
+        captured = {}
+
+        instances = []
+
+        class Tunnel:
+            def __init__(self, config, owner, root, archive_post, **kwargs):
+                captured.update(config=config, owner=owner, root=root, archive_post=archive_post, kwargs=kwargs)
+                self.started = self.stopped = False
+                instances.append(self)
+            def start(self): self.started = True
+            def stop(self): self.stopped = True
+
+        with patch.object(runtime.web_tunnel, "WebTunnel", Tunnel), \
+             patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(runtime, "json_request", return_value=(201, {})) as post:
+            supervisor.start_web_tunnel()
+            self.assertTrue(supervisor.web_tunnel.started)
+            self.assertEqual(captured["archive_post"]("build-1", "dsh=safe"), 201)
+            post.assert_called_once_with(supervisor.settings, "/web-session", "POST",
+                                         {"owner": "build-1", "cookie": "dsh=safe"}, timeout=10)
+            supervisor.stop_web_tunnel()
+            stopped = instances[0]
+            self.assertTrue(stopped.stopped)
+            self.assertIsNone(supervisor.web_tunnel)
+            supervisor.start_web_tunnel()
+        self.assertEqual(len(instances), 2)
+        self.assertIsNot(instances[0], instances[1])
 
     def test_fenced_stop_uses_short_deadline_then_only_kills_verified_profile_pids(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.dsh_started = True
+        class Tunnel:
+            stopped = False
+            def stop(self): self.stopped = True
+        tunnel = Tunnel()
+        supervisor.web_tunnel = tunnel
         with patch.object(runtime.subprocess, "run", return_value=type("Result", (), {"returncode": 1})()) as stop, \
              patch.object(supervisor, "_force_kill_dsh_profile") as force_kill:
             supervisor.stop_dsh(fenced=True)
         self.assertIn("20", stop.call_args.args[0])
         self.assertEqual(stop.call_args.kwargs["timeout"], 25)
         force_kill.assert_called_once()
+        self.assertTrue(tunnel.stopped)
+        self.assertIsNone(supervisor.web_tunnel)
         self.assertFalse(supervisor.dsh_started)
 
     def test_dsh_force_kill_verifier_matches_only_superagent_profile_command(self):

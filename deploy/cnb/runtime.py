@@ -20,6 +20,11 @@ import urllib.request
 import uuid
 from typing import Any
 
+try:
+    from deploy.cnb import web_tunnel
+except ModuleNotFoundError:  # Running runtime.py as a standalone script.
+    import web_tunnel
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 DATA = Path('/workspace/.superagent-runtime/data')
@@ -34,6 +39,15 @@ READY_TIMEOUT = 180
 BOOTSTRAP_TIMEOUT = 300
 MAX_RESPONSE = 2 * 1024 * 1024
 OPERATOR_STOP = CONTROL / 'operator-stop'
+
+
+def child_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Forward application settings while keeping supervisor tunnel/archive secrets private."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('SUPERAGENT_WEB_TUNNEL_') and key != 'SUPERAGENT_ARCHIVE_TOKEN'}
+    if overrides:
+        env.update(overrides)
+    return env
 
 
 class RuntimeErrorSafe(RuntimeError):
@@ -175,6 +189,8 @@ class Supervisor:
         self.service_control_lock = threading.Lock()
         self.intentional = False
         self.backup_path = CONTROL / 'snapshot.zip'
+        self.web_tunnel_config: web_tunnel.TunnelConfig | None = None
+        self.web_tunnel: web_tunnel.WebTunnel | None = None
 
     def heartbeat_loop(self) -> None:
         while not self.heartbeat_stop.is_set():
@@ -307,20 +323,21 @@ class Supervisor:
         fresh = not profile.exists()
         subprocess.run(['node', str(ROOT / 'scripts' / 'setup-linux.mjs'), '--home', str(DATA / 'dsh-home'),
                         '--state-dir', str(DATA / 'state'), '--port', '13082'], cwd=ROOT,
-                       env={**os.environ, 'DSH_HOME': str(DATA / 'dsh-home')}, timeout=BOOTSTRAP_TIMEOUT,
+                       env=child_environment({'DSH_HOME': str(DATA / 'dsh-home')}), timeout=BOOTSTRAP_TIMEOUT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
         lock = profile / 'package.json'
         if lock.exists() and (profile / 'pnpm-lock.yaml').exists():
             subprocess.run(['pnpm', '-C', str(profile), 'install', '--frozen-lockfile'], cwd=ROOT,
-                           timeout=BOOTSTRAP_TIMEOUT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                           env=child_environment(), timeout=BOOTSTRAP_TIMEOUT,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
         return fresh
 
     def start_dsh(self) -> None:
         if self.is_paused():
             self.intentional = True
             return
-        env = {**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL,
-               'DSH_SUPERAGENT_HTTP_CLOSE': '1'}
+        env = child_environment({'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL,
+                                 'DSH_SUPERAGENT_HTTP_CLOSE': '1'})
         command = [sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'start', '--profile', PROFILE,
                    '--url', URL, '--timeout', str(READY_TIMEOUT)]
         self.dsh_started = True
@@ -359,6 +376,27 @@ class Supervisor:
         if self.lease_lost.is_set():
             self.stop_dsh(fenced=True)
             raise RuntimeErrorSafe('Managed DSH startup stopped after archive lease fencing.')
+        self.start_web_tunnel()
+
+    def start_web_tunnel(self) -> None:
+        if (self.web_tunnel_config is None or self.lease_lost.is_set() or not self.dsh_started
+                or self.is_paused()):
+            return
+        if self.web_tunnel is None:
+            def post_session(runtime_owner: str, cookie: str) -> int:
+                code, _result = json_request(self.settings, '/web-session', 'POST',
+                                             {'owner': runtime_owner, 'cookie': cookie}, timeout=10)
+                return code
+            self.web_tunnel = web_tunnel.WebTunnel(
+                self.web_tunnel_config, self.owner, ROOT, post_session, event_log=log,
+                should_stop=lambda: self.lease_lost.is_set() or self.is_paused() or self.stop_event.is_set())
+        self.web_tunnel.start()
+
+    def stop_web_tunnel(self) -> None:
+        tunnel = self.web_tunnel
+        self.web_tunnel = None
+        if tunnel is not None:
+            tunnel.stop()
 
     def set_fresh_worker_limit(self) -> None:
         status, _, data = request(URL, '', '/orchestrator/api/settings', headers={'x-orchestrator-request': '1'}, timeout=5)
@@ -383,7 +421,8 @@ class Supervisor:
             args = [sys.executable, str(ARCHIVE), action, str(archive), str(destination)]
         else:
             args = [sys.executable, str(ARCHIVE), action, str(archive)]
-        subprocess.run(args, cwd=ROOT, timeout=180, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        subprocess.run(args, cwd=ROOT, env=child_environment(), timeout=180,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
     def backup(self) -> None:
         if self.lease_lost.is_set() or not self.lease_acquired.is_set():
@@ -497,6 +536,7 @@ class Supervisor:
             connection.close()
 
     def stop_dsh(self, *, fenced: bool = False) -> None:
+        self.stop_web_tunnel()
         if not self.dsh_started:
             return
         with self.service_control_lock:
@@ -507,7 +547,7 @@ class Supervisor:
             return
         manual_marker = ROOT / '.artifacts' / 'control' / 'profiles' / PROFILE / 'manually-stopped'
         was_manual_stop = manual_marker.exists()
-        env = {**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL}
+        env = child_environment({'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL})
         stop_timeout = 20 if fenced else 60
         try:
             result = subprocess.run([sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'stop', '--profile', PROFILE,
@@ -527,7 +567,7 @@ class Supervisor:
 
     def _force_kill_dsh_profile(self) -> None:
         """After a fenced graceful-stop timeout, kill only PIDs the service manager identifies as this profile."""
-        env = {**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL}
+        env = child_environment({'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL})
         try:
             result = subprocess.run([sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'status',
                                      '--profile', PROFILE, '--url', URL], cwd=ROOT, env=env,
@@ -580,6 +620,7 @@ class Supervisor:
         while self.is_paused() and not self.stop_event.is_set() and not self.lease_lost.is_set():
             self.intentional = True
             if self.dsh_started:
+                self.stop_web_tunnel()
                 self.stop_dsh()
             set_status('paused', pid=os.getpid(), healthy=True, paused=True, intentional_stop=True,
                        last_heartbeat=self.last_heartbeat, **self.backup_status())
@@ -593,6 +634,10 @@ class Supervisor:
         heartbeat = threading.Thread(target=self.heartbeat_loop, name='cnb-heartbeat', daemon=True)
         heartbeat.start()
         try:
+            try:
+                self.web_tunnel_config = web_tunnel.load_config(control=CONTROL)
+            except web_tunnel.TunnelConfigError as exc:
+                raise RuntimeErrorSafe(str(exc)) from None
             if not self.lease_acquired.wait(15):
                 raise RuntimeErrorSafe('Could not acquire the archive lease.')
             if not self._wait_for_resume():
@@ -628,6 +673,7 @@ class Supervisor:
                 self.periodic_backup_if_due()
             return 0
         finally:
+            self.stop_web_tunnel()
             if not self.intentional and not self.lease_lost.is_set():
                 try:
                     self.backup()
@@ -653,7 +699,8 @@ class Supervisor:
             result = subprocess.run([sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'status',
                                      '--profile', PROFILE, '--url', URL], cwd=ROOT, capture_output=True,
                                     text=True, timeout=5,
-                                    env={**os.environ, 'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL})
+                                    env=child_environment({'DSH_HOME': str(DATA / 'dsh-home'),
+                                                           'DSH_SUPERAGENT_URL': URL}))
             if result.returncode in (0, 2, 3):
                 return True
             try:
