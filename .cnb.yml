@@ -1,0 +1,24 @@
+# Branches carrying the Linux deployment run the same validation and dev image.
+(**):
+  push:
+    - docker:
+        build: .ide/Dockerfile
+      stages:
+        - name: Install locked dependencies
+          script: pnpm install --frozen-lockfile
+        - name: Typecheck, test and build on Linux
+          script: pnpm check
+
+  # CNB provides SSH / WebIDE; Superagent starts after explicit profile setup.
+  vscode:
+    - docker:
+        build: .ide/Dockerfile
+      services:
+        - name: vscode
+          options:
+            keepAliveTimeout: 18h
+      stages:
+        - name: Install locked dependencies
+          script: pnpm install --frozen-lockfile
+        - name: Build Superagent
+          script: pnpm build

@@ -13,6 +13,8 @@ CNB 仓库：[XiAzir/dsh-superagent](https://cnb.cool/XiAzir/dsh-superagent)。�
 
 在 `linux` 分支点击“云原生开发”，平台会按照 `.ide/Dockerfile` 安装工具，并按 `.cnb.yml` 安装依赖、构建。SSH 命令可从工作区启动页面的“SSH 登录命令”复制。每次推送 `linux` 分支会触发 `pnpm check`。
 
+云开发服务配置了 `services: [{ name: vscode, options: { keepAliveTimeout: 18h } }]`，离线保活时间为 18 小时，见 [CNB service:vscode 配置](https://docs.cnb.cool/zh/build/grammar.html)。配置随新建环境生效；首次启动后进入 WebIDE，后续再通过 SSH 操作。平台的最大运行时长和凌晨回收规则继续适用。
+
 ## 准备 profile
 
 在仓库根目录执行：
