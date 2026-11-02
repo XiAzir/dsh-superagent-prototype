@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import hashlib
+import io
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.request import Request
+
+from deploy.cnb import runtime
+
+
+class RuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = runtime.ROOT / "tmp"
+        self.tmp.mkdir(exist_ok=True)
+        self.root = self.tmp / f"cnb-runtime-test-{os.getpid()}-{id(self)}"
+        self.root.mkdir()
+        self.control = self.root / "control"
+        self.data = self.root / "data"
+        self.control.mkdir()
+        self.data.mkdir()
+        self.paths = patch.multiple(runtime, CONTROL=self.control, DATA=self.data)
+        self.paths.start()
+
+    def tearDown(self):
+        self.paths.stop()
+        shutil.rmtree(self.root)
+
+    def test_config_saves_private_restart_credentials_without_printing(self):
+        env = patch.dict(os.environ, {
+            "SUPERAGENT_ARCHIVE_URL": "https://archive.example/superagent-runtime",
+            "SUPERAGENT_ARCHIVE_TOKEN": "secret-token",
+        })
+        with env:
+            value = runtime.config()
+        saved = json.loads((self.control / "credentials.json").read_text())
+        self.assertEqual(value, {"url": "https://archive.example/superagent-runtime", "token": "secret-token"})
+        self.assertEqual(saved, value)
+        if os.name != "nt":
+            self.assertEqual((self.control / "credentials.json").stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runtime.config(), value)
+
+    def test_config_rejects_plaintext_non_loopback_archive_url(self):
+        with patch.dict(os.environ, {
+            "SUPERAGENT_ARCHIVE_URL": "http://archive.example/runtime",
+            "SUPERAGENT_ARCHIVE_TOKEN": "secret-token",
+        }, clear=True):
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                runtime.config()
+
+    def test_lease_conflict_marks_lease_lost(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.object(runtime, "json_request", return_value=(409, {})):
+            supervisor.heartbeat_loop()
+        self.assertTrue(supervisor.lease_lost.is_set())
+        self.assertFalse(supervisor.lease_acquired.is_set())
+
+    def test_successful_lease_initializes_heartbeat_clock_before_first_renewal(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        calls = []
+
+        def renew(_settings, path, _method, _value, **_kwargs):
+            calls.append(path)
+            if path == "/lease":
+                return 200, {}
+            supervisor.heartbeat_stop.set()
+            return 503, {}
+
+        with patch.object(runtime, "json_request", side_effect=renew), \
+             patch.object(runtime, "log"), patch.object(runtime, "set_status"), \
+             patch.object(runtime, "HEARTBEAT_SECONDS", 0):
+            supervisor.heartbeat_loop()
+        self.assertEqual(calls, ["/lease", "/heartbeat"])
+        self.assertGreater(supervisor.last_heartbeat, 0)
+        self.assertFalse(supervisor.lease_lost.is_set())
+
+    def test_local_ready_sends_required_orchestrator_header_and_checks_actual_state_shape(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        class Response:
+            def __init__(self, state="ready"): self.state = state
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self, _limit):
+                return json.dumps({"setup": {}, "masterReady": self.state == "ready", "paused": self.state == "paused",
+                                   "health": {"runtime": {"state": self.state}}}).encode()
+        seen = []
+        def open_url(request, timeout):
+            seen.append((request, timeout))
+            return Response()
+        with patch.object(runtime.urllib.request, "urlopen", side_effect=open_url):
+            self.assertTrue(supervisor._local_ready())
+        self.assertIsInstance(seen[0][0], Request)
+        self.assertEqual(seen[0][0].get_header("X-orchestrator-request"), "1")
+
+        with patch.object(runtime.urllib.request, "urlopen", return_value=Response("paused")):
+            self.assertTrue(supervisor._local_ready())
+
+    def test_backup_download_streams_to_disk_and_verifies_sha256(self):
+        payload = b"snapshot-bytes" * 100
+        class Response(io.BytesIO):
+            status = 200
+            headers = {"Content-Length": str(len(payload)), "X-Archive-SHA256": hashlib.sha256(payload).hexdigest()}
+            reads = []
+            def read(self, size=-1):
+                self.reads.append(size)
+                return super().read(size)
+            def __enter__(self): return self
+            def __exit__(self, *_args): self.close()
+        response = Response(payload)
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "secret"}, "build-1")
+        with patch.object(runtime, "OPENER") as opener:
+            opener.open.return_value = response
+            code, _ = supervisor._download_backup()
+        self.assertEqual(code, 200)
+        self.assertEqual(supervisor.backup_path.read_bytes(), payload)
+        self.assertTrue(all(size == 1024 * 1024 for size in response.reads))
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+
+    def test_backup_upload_streams_fixed_length_chunks_without_read_bytes(self):
+        payload = b"archive" * (1024 * 300)
+        archive = self.control / "upload.zip"
+        archive.write_bytes(payload)
+        class Response:
+            status = 200
+            def read(self, _limit): return b"{}"
+        class Connection:
+            def __init__(self, *_args, **_kwargs): self.headers = {}; self.sent = 0
+            def putrequest(self, method, route): self.method, self.route = method, route
+            def putheader(self, key, value): self.headers[key.lower()] = value
+            def endheaders(self): pass
+            def send(self, chunk): self.sent += len(chunk)
+            def getresponse(self): return Response()
+            def close(self): pass
+        connection = Connection()
+        with patch.object(runtime.http.client, "HTTPSConnection", return_value=connection):
+            status = runtime.Supervisor({"url": "https://archive.example/superagent-runtime", "token": "secret"},
+                                        "build-1")._upload_backup_file(archive, hashlib.sha256(payload).hexdigest())
+        self.assertEqual(status, 200)
+        self.assertEqual(connection.route, "/superagent-runtime/backup")
+        self.assertEqual(connection.headers["content-length"], str(len(payload)))
+        self.assertEqual(connection.headers["authorization"], "Bearer secret")
+        self.assertEqual(connection.sent, len(payload))
+
+    def test_dsh_startup_is_terminated_and_service_stopped_after_fencing(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        class Process:
+            returncode = None
+            terminated = False
+            def poll(self): return self.returncode
+            def terminate(self): self.terminated = True; self.returncode = -15
+            def wait(self, timeout=None): return self.returncode
+        child = Process()
+        supervisor.lease_lost.set()
+        with patch.object(runtime.subprocess, "Popen", return_value=child), \
+             patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: setattr(supervisor, "dsh_started", False)) as stop_dsh:
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                supervisor.start_dsh()
+        self.assertTrue(child.terminated)
+        stop_dsh.assert_called_once()
+        self.assertFalse(supervisor.dsh_started)
+
+    def test_fenced_stop_uses_short_deadline_then_only_kills_verified_profile_pids(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.dsh_started = True
+        with patch.object(runtime.subprocess, "run", return_value=type("Result", (), {"returncode": 1})()) as stop, \
+             patch.object(supervisor, "_force_kill_dsh_profile") as force_kill:
+            supervisor.stop_dsh(fenced=True)
+        self.assertIn("20", stop.call_args.args[0])
+        self.assertEqual(stop.call_args.kwargs["timeout"], 25)
+        force_kill.assert_called_once()
+        self.assertFalse(supervisor.dsh_started)
+
+    def test_dsh_force_kill_verifier_matches_only_superagent_profile_command(self):
+        good = b"/usr/bin/node\0/home/cnb/.local/bin/dsh\0--profile\0superagent\0--no-open\0"
+        bad = b"/usr/bin/node\0/home/cnb/.local/bin/dsh\0--profile\0other\0--no-open\0"
+        with patch.object(Path, "read_bytes", return_value=good):
+            self.assertTrue(runtime.Supervisor._verified_dsh_profile_pid(123))
+        with patch.object(Path, "read_bytes", return_value=bad):
+            self.assertFalse(runtime.Supervisor._verified_dsh_profile_pid(123))
+
+    def test_release_paused_body_contract_is_explicit(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        supervisor.intentional = True
+        class Thread:
+            def __init__(self, **_kwargs): pass
+            def start(self): pass
+            def join(self, timeout=None): pass
+            def is_alive(self): return False
+        with patch.object(runtime.threading, "Thread", Thread), \
+             patch.object(supervisor, "_wait_for_resume", return_value=False), \
+             patch.object(supervisor, "restore_firstboot"), patch.object(supervisor, "bootstrap", return_value=False), \
+             patch.object(supervisor, "start_dsh", side_effect=lambda: setattr(supervisor, "dsh_started", True)), \
+             patch.object(supervisor, "backup") as backup, patch.object(supervisor, "stop_dsh"), \
+             patch.object(runtime, "json_request", return_value=(200, {})) as release, \
+             patch.object(runtime, "set_status"), patch.object(runtime, "log"):
+            supervisor.stop_event.set()
+            self.assertEqual(supervisor.run(), 0)
+        self.assertEqual(release.call_args.args[3], {"owner": "build-1", "paused": True})
+        backup.assert_not_called()
+
+    def test_stop_and_shutdown_record_distinct_pause_intent(self):
+        marker = self.control / "operator-stop"
+        with patch.object(runtime, "OPERATOR_STOP", marker), patch.object(runtime, "process_alive", return_value=False), \
+             patch.object(runtime, "read_json", return_value={}), patch.object(runtime, "set_status"), \
+             patch.object(runtime, "config", return_value={"url": "https://archive.example", "token": "x"}), \
+             patch.object(runtime, "owner", return_value="build-1"), \
+             patch.object(runtime, "json_request", return_value=(200, {})) as release:
+            self.assertEqual(runtime.stop(intentional=True), 0)
+            self.assertTrue(marker.exists())
+            self.assertTrue(release.call_args.args[3]["paused"])
+            release.reset_mock()
+            self.assertEqual(runtime.stop(intentional=False), 0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(release.call_args.args[3]["paused"])
+
+    def test_pause_is_healthy_for_watchdog_but_fenced_backup_is_skipped(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        with patch.object(supervisor, "is_paused", return_value=True), \
+             patch.object(supervisor, "_local_ready", side_effect=AssertionError), \
+             patch.object(supervisor, "_archive_call", side_effect=AssertionError("snapshot must not start")):
+            self.assertTrue(supervisor.is_healthy())
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                supervisor.backup()
+        supervisor.lease_lost.set()
+        with patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(supervisor, "_archive_call", side_effect=AssertionError("fenced snapshot must not start")):
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                supervisor.backup()
+
+    def test_pause_heartbeat_reports_healthy_and_paused_while_retaining_lease(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.lease_acquired.set()
+        with patch.object(supervisor, "is_paused", return_value=True), \
+             patch.object(supervisor, "is_healthy", return_value=True), \
+             patch.object(runtime, "set_status"), patch.object(runtime, "log"), \
+             patch.object(runtime, "json_request", return_value=(200, {})) as heartbeat:
+            def stop_after_post(*_args, **_kwargs):
+                supervisor.heartbeat_stop.set()
+                return 200, {}
+            heartbeat.side_effect = stop_after_post
+            supervisor.heartbeat_loop()
+        self.assertEqual(heartbeat.call_args.args[1], "/heartbeat")
+        self.assertEqual(heartbeat.call_args.args[3]["healthy"], True)
+        self.assertEqual(heartbeat.call_args.args[3]["paused"], True)
+
+    def test_firstboot_404_leaves_data_empty(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.object(supervisor, "_download_backup", return_value=(404, None)):
+            supervisor.restore_firstboot()
+        self.assertEqual(list(self.data.iterdir()), [])
+
+    def test_existing_data_skips_remote_restore(self):
+        (self.data / "state").mkdir()
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.object(runtime, "request", side_effect=AssertionError("unexpected download")):
+            supervisor.restore_firstboot()
+
+    def test_non_404_restore_failure_aborts_firstboot(self):
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        with patch.object(supervisor, "_download_backup", return_value=(503, None)):
+            with self.assertRaises(runtime.RuntimeErrorSafe):
+                supervisor.restore_firstboot()
+
+
+if __name__ == "__main__":
+    unittest.main()
