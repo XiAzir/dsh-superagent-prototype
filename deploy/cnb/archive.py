@@ -1,7 +1,7 @@
 """Create, validate, and restore bounded private Superagent data snapshots.
 
 The archive contains ``snapshot/dsh-home``, ``snapshot/state`` and optionally
-``snapshot/work``. It is a ZIP file with a JSON manifest at
+``snapshot/work`` and ``snapshot/home``. It is a ZIP file with a JSON manifest at
 ``snapshot/manifest.json``. Source data is copied into a temporary staging
 directory before the archive is atomically installed. SQLite databases are
 copied through SQLite's online backup API so WAL contents are included.
@@ -35,11 +35,12 @@ MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_MEMBERS = 200_000
 CHUNK_SIZE = 1024 * 1024
 SQLITE_BACKUP_TIMEOUT = 15.0
-ROOTS = ("dsh-home", "state", "work")
+ROOTS = ("dsh-home", "state", "work", "home")
 REQUIRED_ROOTS = ("dsh-home", "state")
+OPTIONAL_ROOTS = ("work", "home")
 MANIFEST_NAME = "snapshot/manifest.json"
 
-_SKIP_DIRS = {"node_modules", ".pnpm-store", ".cache", "cache", "caches"}
+_SKIP_DIRS = {"node_modules", ".pnpm-store"}
 _RUNTIME_LOG = re.compile(r"dsh-superagent-[A-Za-z0-9_-]+-\d{8}-\d{6}-\d+\.log\Z", re.IGNORECASE)
 _COPY_ATTEMPTS = 3
 _DIR_FD_SUPPORTED = os.open in os.supports_dir_fd and os.scandir in os.supports_fd
@@ -76,6 +77,17 @@ def _mkdir_private(path: Path, *, parents: bool = False, exist_ok: bool = False)
 
 def _is_runtime_log(relative: Path, name: str) -> bool:
     return relative.parts[:1] == (".artifacts",) and bool(_RUNTIME_LOG.fullmatch(name))
+
+
+def _is_generated_directory(root_name: str, relative: Path, name: str) -> bool:
+    if name.lower() in _SKIP_DIRS:
+        return True
+    # Keep ordinary cache folders because applications may store business data there.
+    # Only omit known rebuildable caches from the isolated application home.
+    if root_name == "home":
+        parts = (*relative.parts, name)
+        return parts == (".cache",) or parts == (".local", "share", "pnpm")
+    return False
 
 
 def _safe_mode(mode: int) -> int:
@@ -378,7 +390,7 @@ def _walk_source(
                     skip_counts["symlink"] += 1
                     continue
                 if stat.S_ISDIR(file_stat.st_mode):
-                    if name.lower() in _SKIP_DIRS:
+                    if _is_generated_directory(root_name, rel_path.parent, name):
                         skip_counts["generated_directory"] += 1
                         continue
                     _record_member(budget, member_limit)
@@ -469,7 +481,7 @@ def create_snapshot(
 ) -> dict[str, Any]:
     """Create an atomic ZIP snapshot from data_dir and return its manifest.
 
-    ``data_dir`` contains dsh-home and state directories, plus optional work.
+    ``data_dir`` contains dsh-home and state directories, plus optional work and home.
     Existing archives remain intact when creation fails.
     """
     source_input = Path(data_dir).absolute()
@@ -490,15 +502,18 @@ def create_snapshot(
         if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
             raise SnapshotError(f"Required snapshot root must be a real directory: {root}")
         root_stats[root_name] = root_stat
-    work_root = source / "work"
-    try:
-        work_stat = work_root.lstat()
-    except FileNotFoundError:
-        work_stat = None
-    except OSError as exc:
-        raise SnapshotError(f"Cannot inspect optional work directory: {work_root}") from exc
-    if work_stat is not None and (stat.S_ISLNK(work_stat.st_mode) or not stat.S_ISDIR(work_stat.st_mode)):
-        raise SnapshotError(f"Optional work root must be a real directory: {work_root}")
+    optional_stats: dict[str, os.stat_result] = {}
+    for root_name in OPTIONAL_ROOTS:
+        optional_root = source / root_name
+        try:
+            optional_stat = optional_root.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SnapshotError(f"Cannot inspect optional {root_name} directory: {optional_root}") from exc
+        if stat.S_ISLNK(optional_stat.st_mode) or not stat.S_ISDIR(optional_stat.st_mode):
+            raise SnapshotError(f"Optional {root_name} root must be a real directory: {optional_root}")
+        optional_stats[root_name] = optional_stat
     output = Path(archive_path).absolute()
     output.parent.mkdir(parents=True, exist_ok=True)
     if _is_within(output.resolve(), source):
@@ -513,7 +528,7 @@ def create_snapshot(
         budget = {"expanded": 0, "members": 0}
         for _root in REQUIRED_ROOTS:
             _record_member(budget, max_members)
-        if work_stat is not None:
+        for _root in optional_stats:
             _record_member(budget, max_members)
         files: list[dict[str, Any]] = []
         for root_name in REQUIRED_ROOTS:
@@ -521,10 +536,11 @@ def create_snapshot(
             if not _same_directory(root_stats[root_name], source_root.lstat()):
                 raise SnapshotError(f"Required snapshot source directory changed: {source_root}")
             files.extend(_walk_source(source_root, root_name, stage, skip_counts, budget, max_expanded_bytes, max_members))
-        if work_stat is not None:
-            if not _same_directory(work_stat, work_root.lstat()):
-                raise SnapshotError(f"Optional work source directory changed: {work_root}")
-            files.extend(_walk_source(work_root, "work", stage, skip_counts, budget, max_expanded_bytes, max_members))
+        for root_name, expected_stat in optional_stats.items():
+            optional_root = source / root_name
+            if not _same_directory(expected_stat, optional_root.lstat()):
+                raise SnapshotError(f"Optional {root_name} source directory changed: {optional_root}")
+            files.extend(_walk_source(optional_root, root_name, stage, skip_counts, budget, max_expanded_bytes, max_members))
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "files": sorted(files, key=lambda item: item["path"]),
@@ -540,7 +556,7 @@ def create_snapshot(
         modes_by_path = {item["path"]: item["mode"] for item in files}
         temp_archive = temp_root / "snapshot.zip"
         with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
-            for root_name in (*REQUIRED_ROOTS, *(('work',) if work_stat is not None else ())):
+            for root_name in (*REQUIRED_ROOTS, *optional_stats):
                 root = stage / root_name
                 _write_directory(archive, f"snapshot/{root_name}/")
                 for current, dirs, names in os.walk(root):
@@ -725,9 +741,11 @@ def restore_snapshot(
         for root in REQUIRED_ROOTS:
             _mkdir_private(stage / root)
         with zipfile.ZipFile(archive_path, "r") as archive:
-            has_work = any(name.rstrip("/") == "snapshot/work" or name.startswith("snapshot/work/") for name in archive.namelist())
-        if has_work:
-            _mkdir_private(stage / "work")
+            roots_seen = {name.split("/")[1] for name in archive.namelist()
+                          if name.startswith("snapshot/") and name != MANIFEST_NAME}
+        for root in OPTIONAL_ROOTS:
+            if root in roots_seen:
+                _mkdir_private(stage / root)
         with zipfile.ZipFile(archive_path, "r") as archive:
             by_name = {info.filename.rstrip("/"): info for info in archive.infolist()}
             for item in manifest["files"]:

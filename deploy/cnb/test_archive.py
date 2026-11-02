@@ -99,6 +99,54 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((restored / "dsh-home" / "operator.yaml").stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE((restored / "dsh-home" / "run.sh").stat().st_mode), 0o700)
 
+    def test_home_config_and_browser_profile_are_saved_but_rebuildable_caches_are_skipped(self):
+        home = self.data / "home"
+        (home / ".config" / "agent-tool").mkdir(parents=True)
+        (home / ".config" / "agent-tool" / "settings.json").write_text('{"theme":"dark"}', encoding="utf-8")
+        (home / ".config" / "chromium" / "Default").mkdir(parents=True)
+        (home / ".config" / "chromium" / "Default" / "Preferences").write_text('{"profile":"kept"}', encoding="utf-8")
+        (home / ".cache" / "browser").mkdir(parents=True)
+        (home / ".cache" / "browser" / "rebuildable.bin").write_bytes(b"cache")
+        (home / ".local" / "share" / "pnpm").mkdir(parents=True)
+        (home / ".local" / "share" / "pnpm" / "store.bin").write_bytes(b"store")
+        (home / "node_modules" / ".pnpm-store").mkdir(parents=True)
+        (home / "node_modules" / ".pnpm-store" / "generated").write_text("generated", encoding="utf-8")
+        (self.data / "work" / "cache").mkdir(parents=True)
+        (self.data / "work" / "cache" / "business-state.json").write_text('{"cursor":4}', encoding="utf-8")
+        (self.data / "work" / "caches").mkdir()
+        (self.data / "work" / "caches" / "index.json").write_text("index", encoding="utf-8")
+        (self.data / "work" / ".cache").mkdir()
+        (self.data / "work" / ".cache" / "project-state").write_text("keep", encoding="utf-8")
+
+        self.make_snapshot()
+        paths = {entry["path"] for entry in validate_archive(self.archive)["files"]}
+        for kept in (
+            "home/.config/agent-tool/settings.json",
+            "home/.config/chromium/Default/Preferences",
+            "work/cache/business-state.json",
+            "work/caches/index.json",
+            "work/.cache/project-state",
+        ):
+            self.assertIn(kept, paths)
+        self.assertFalse(any(path.startswith("home/.cache/") for path in paths))
+        self.assertFalse(any(path.startswith("home/.local/share/pnpm/") for path in paths))
+        self.assertFalse(any("node_modules" in path or ".pnpm-store" in path for path in paths))
+
+        restored = self.base / "restored-home"
+        restore_snapshot(self.archive, restored)
+        self.assertEqual((restored / "home" / ".config" / "agent-tool" / "settings.json").read_text(encoding="utf-8"), '{"theme":"dark"}')
+        self.assertEqual((restored / "work" / "cache" / "business-state.json").read_text(encoding="utf-8"), '{"cursor":4}')
+        self.assertFalse((restored / "home" / ".cache").exists())
+
+    def test_legacy_archive_without_home_root_still_restores(self):
+        (self.data / "state" / "value.json").write_text('{"legacy":true}', encoding="utf-8")
+        self.make_snapshot()
+
+        restored = self.base / "restored-legacy"
+        restore_snapshot(self.archive, restored)
+        self.assertEqual((restored / "state" / "value.json").read_text(encoding="utf-8"), '{"legacy":true}')
+        self.assertFalse((restored / "home").exists())
+
     def test_tampered_hash_rejected(self):
         (self.data / "state" / "value.json").write_text('{"ok":true}', encoding="utf-8")
         self.make_snapshot()

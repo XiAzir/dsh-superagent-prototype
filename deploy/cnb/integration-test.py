@@ -114,6 +114,10 @@ class SnapshotIntegrationTests(unittest.TestCase):
             json.dumps({"session": "kept", "cursor": 17}), encoding="utf-8"
         )
         (self.data / "work" / "business.log").write_text("business event\n", encoding="utf-8")
+        (self.data / "home" / ".config" / "example-tool").mkdir(parents=True)
+        (self.data / "home" / ".config" / "example-tool" / "settings.json").write_text('{"kept":true}', encoding="utf-8")
+        (self.data / "work" / "cache").mkdir()
+        (self.data / "work" / "cache" / "user-record.json").write_text('{"kept":true}', encoding="utf-8")
         (self.data / "work" / ".artifacts" / "dsh-superagent-superagent-20261102-123456-7.log").write_text(
             "generated runtime output\n", encoding="utf-8"
         )
@@ -170,6 +174,8 @@ class SnapshotIntegrationTests(unittest.TestCase):
             json.dumps({"session": "kept", "cursor": 17}),
         )
         self.assertEqual((self.restored_data / "work" / "business.log").read_text(encoding="utf-8"), "business event\n")
+        self.assertEqual((self.restored_data / "home" / ".config" / "example-tool" / "settings.json").read_text(), '{"kept":true}')
+        self.assertEqual((self.restored_data / "work" / "cache" / "user-record.json").read_text(), '{"kept":true}')
         restored_paths = {item["path"] for item in archive.validate_archive(original_archive)["files"]}
         self.assertIn("dsh-home/profiles/superagent/pnpm-lock.yaml", restored_paths)
         self.assertNotIn("work/.artifacts/dsh-superagent-superagent-20261102-123456-7.log", restored_paths)
