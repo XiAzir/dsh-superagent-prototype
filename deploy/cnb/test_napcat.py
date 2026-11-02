@@ -215,7 +215,8 @@ class NapCatTests(unittest.TestCase):
     def test_start_creates_private_persistent_paths_and_uses_only_owned_environment(self):
         config = self.write_config({'enabled': True, 'account': '12345678'})
         with patch.object(self.client, '_webui_reachable', return_value=True):
-            with patch.object(self.client, '_ensure_alias') as aliases:
+            with patch.object(self.client, '_ensure_alias',
+                              wraps=self.client._ensure_alias if os.name != 'nt' else None) as aliases:
                 result = self.client.ensure_started(timeout=0)
         self.assertEqual(aliases.call_count, 2)
         self.assertEqual(result, {'enabled': True, 'running': True, 'webui_ready': True, 'login': 'pending'})
@@ -305,7 +306,6 @@ class NapCatTests(unittest.TestCase):
         self.write_config({'enabled': True})
         outside = self.tmp / 'outside'
         outside.mkdir()
-        (self.data / 'napcat' / 'config').rmdir()
         (self.data / 'napcat' / 'config').symlink_to(outside, target_is_directory=True)
         with self.assertRaisesRegex(napcat.NapCatError, 'symlink'):
             self.client.ensure_started(timeout=0)
