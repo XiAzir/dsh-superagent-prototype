@@ -1,4 +1,7 @@
 import { expect, it, onTestFinished, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Config, type Machine } from '../src/deployment.ts'
 import { apply } from '../src/index.ts'
 import { protectStateDirectory } from '../src/infra/private-directory.ts'
@@ -106,4 +109,21 @@ it('refuses keys of the previous configuration before registering anything', asy
   await expect(apply(ctx as never, Config({ stateDir: '/srv/state', github: { cli: 'gh' } } as never))).rejects.toThrow('github (now on the GitHub Source)')
   expect(ctx.on).not.toHaveBeenCalled()
   expect(ctx.inject).not.toHaveBeenCalled()
+})
+
+it('guards the plugin state directory against non-snapshotted CNB paths', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'superagent-plugin-state-'))
+  const data = join(base, 'data')
+  mkdirSync(join(data, 'state'), { recursive: true })
+  vi.stubEnv('DSH_SUPERAGENT_DATA_ROOT', data)
+  try {
+    const { ctx } = context()
+    await expect(apply(ctx as never, Config({ stateDir: join(data, 'elsewhere') }))).rejects.toThrow('snapshotted data area')
+    expect(protectStateDirectory).not.toHaveBeenCalledWith(join(data, 'elsewhere'))
+    await apply(ctx as never, Config({ stateDir: join(data, 'state') }))
+    expect(protectStateDirectory).toHaveBeenCalledWith(join(data, 'state'))
+  } finally {
+    vi.unstubAllEnvs()
+    rmSync(base, { recursive: true, force: true })
+  }
 })

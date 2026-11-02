@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Commands } from '../src/infra/commands.ts'
@@ -25,7 +25,7 @@ beforeEach(() => {
     runner(signal, program, args, cwd, timeoutMs) }) } as unknown as Pick<Commands, 'withSignal'>
   scheduler = new Schedules(store, commands, { paused: () => paused, closing: () => closing })
 })
-afterEach(async () => { await scheduler.stop(); store.close(); rmSync(directory, { recursive: true, force: true }); vi.useRealTimers() })
+afterEach(async () => { await scheduler.stop(); store.close(); rmSync(directory, { recursive: true, force: true }); vi.unstubAllEnvs(); vi.useRealTimers() })
 
 it('validates a bounded strict absolute-path argv configuration and persists item revisions', () => {
   expect(() => ScheduleConfigSchema.parse({ ...config(), unknown: 'x' })).toThrow()
@@ -39,6 +39,33 @@ it('validates a bounded strict absolute-path argv configuration and persists ite
   const updated = scheduler.update(created.id, created.revision, config({ enabled: false, name: 'Edited' }))
   expect(updated).toMatchObject({ revision: 2, config: { enabled: false, name: 'Edited' }, nextRunAt: null })
   expect(() => scheduler.update(created.id, created.revision, config())).toThrow(ScheduleConflict)
+})
+
+it('confines new and updated schedule working directories to snapshot roots when CNB sets a data root', () => {
+  const data = join(directory, 'data')
+  const work = join(data, 'work')
+  const neighboring = `${data}-backup`
+  mkdirSync(work, { recursive: true })
+  mkdirSync(join(neighboring, 'work'), { recursive: true })
+  vi.stubEnv('DSH_SUPERAGENT_DATA_ROOT', data)
+  const item = scheduler.create(config({ enabled: false, cwd: work }))
+  expect(() => scheduler.create(config({ cwd: join(neighboring, 'work') }))).toThrow('snapshotted data area')
+  expect(() => scheduler.update(item.id, item.revision, config({ enabled: false, cwd: join(data, 'other') })))
+    .toThrow('snapshotted data area')
+  expect(() => ScheduleConfigSchema.parse(config({ cwd: data }))).toThrow('snapshotted data area')
+})
+
+it('does not execute a persisted legacy schedule whose cwd is outside snapshot roots', async () => {
+  vi.stubEnv('DSH_SUPERAGENT_DATA_ROOT', '')
+  const item = scheduler.create(config({ enabled: false, cwd: directory }))
+  const state = store.get(KV.schedules.state)!
+  state.items[0] = { ...state.items[0]!, config: { ...state.items[0]!.config, enabled: true }, nextRunAt: '2000-01-01T00:00:00.000Z' }
+  store.set(KV.schedules.state, state)
+  vi.stubEnv('DSH_SUPERAGENT_DATA_ROOT', join(directory, 'data'))
+  scheduler.start()
+  await Promise.resolve()
+  expect(runner).not.toHaveBeenCalled()
+  expect(scheduler.list().items.find(candidate => candidate.id === item.id)?.lastRun?.status).toBe('failed')
 })
 
 it('runs one overdue occurrence after restart and advances past missed intervals without catch-up', async () => {

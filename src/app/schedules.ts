@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { KV } from '../kv.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Store } from './store.ts'
+import { assertPersistentDataPath } from '../infra/persistent-path.ts'
 
 export const ScheduleConfigSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -18,6 +19,8 @@ export const ScheduleConfigSchema = z.object({
   if (config.args.reduce((size, argument) => size + argument.length, 0) > 16_384) {
     context.addIssue({ code: 'custom', path: ['args'], message: 'Combined arguments exceed 16384 characters' })
   }
+  try { assertPersistentDataPath(config.cwd) }
+  catch (error) { context.addIssue({ code: 'custom', path: ['cwd'], message: error instanceof Error ? error.message : 'Directory is outside snapshotted data areas' }) }
 })
 
 export type ScheduleConfig = z.infer<typeof ScheduleConfigSchema>
@@ -210,6 +213,7 @@ export class Schedules {
     run.promise = (async () => {
       let result: ScheduleRun | undefined
       try {
+        assertPersistentDataPath(current!.config.cwd)
         this.writeLastRun(current!.id, current!.revision, { status: 'running', startedAt })
         try {
           await this.commands.withSignal(controller.signal).run(current!.config.program, [...current!.config.args], current!.config.cwd,

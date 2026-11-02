@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { SettingsSchema, assessmentOutcome, policyEffects, settingsPolicy, policyVersion, allowedSender, anyoneAllowed, type Settings } from '../src/policy.ts'
 import type { MandateBasis } from '../src/core/index.ts'
 import { migrateSettings } from '../src/app/migration.ts'
@@ -27,6 +30,22 @@ const feishu = (overrides: Partial<Trigger> & { meta?: Record<string, unknown> }
 const unaddressed = (overrides: Partial<Trigger> = {}): Trigger => { const { addressed: _addressed, ...rest } = feishu(overrides); return rest }
 const github = (login: string, addressed?: 'mention'): Trigger => ({ id: 'g', source: 'github', threads: [{ source: 'github', id: '1' }], actor: { source: 'github', id: login }, human: true, at: '', text: 'x', ...addressed ? { addressed } : {}, meta: { number: 1, isPr: true } })
 const ticket = { id: 'ticket', ended: { at: '', by: 'executor', reason: 'closed', outcome: 'closed' } } as Ticket
+
+it('requires CNB executor directories to stay under one of the archived roots', () => {
+  const base = mkdtempSync(join(tmpdir(), 'superagent-policy-path-'))
+  const data = join(base, 'data')
+  mkdirSync(join(data, 'state'), { recursive: true })
+  mkdirSync(join(data, 'work'), { recursive: true })
+  vi.stubEnv('DSH_SUPERAGENT_DATA_ROOT', data)
+  try {
+    expect(SettingsSchema.parse({ executor: { directory: join(data, 'state', 'work') } }).executor.directory)
+      .toBe(join(data, 'state', 'work'))
+    expect(() => SettingsSchema.parse({ executor: { directory: join(data, 'other') } })).toThrow('snapshotted data area')
+  } finally {
+    vi.unstubAllEnvs()
+    rmSync(base, { recursive: true, force: true })
+  }
+})
 
 describe('source scope', () => {
   it('listens to configured chats, reads every message only where configured, and follows the direct-message switch', () => {

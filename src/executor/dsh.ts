@@ -13,6 +13,7 @@ import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
+import { assertPersistentDataPath } from '../infra/persistent-path.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
@@ -248,7 +249,7 @@ export class DshExecutor implements Executor {
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
-    const directory = ticket.execution?.directory ?? ''
+    const directory = assertPersistentDataPath(ticket.execution?.directory ?? '')
     await mkdir(dirname(directory), { recursive: true })
     const command = this.host.store.settings().executor.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
@@ -320,7 +321,7 @@ export class DshExecutor implements Executor {
         try {
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            await this.host.sessions.ensure(sessionId, assertPersistentDataPath(ticket.execution?.directory ?? ''), ticket.title, 'worker')
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -437,7 +438,7 @@ export class DshExecutor implements Executor {
       return !!stored && liveTicket(stored) && latestAssignment(stored)?.id === assignment.id
     }
     const source = sourceTrigger(this.host, ticket)
-    const workspace = ticket.execution?.directory ?? ''
+    const workspace = assertPersistentDataPath(ticket.execution?.directory ?? '')
     if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
     if (!await stat(workspace).then(() => true, () => false)) {

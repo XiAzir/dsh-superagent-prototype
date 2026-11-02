@@ -10,6 +10,7 @@ import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffe
 import { sameName } from './infra/text.ts'
 import { WORKER_COMMANDS, isWorkerCommand } from './infra/environment.ts'
 import { isAbsolutePath } from './infra/platform.ts'
+import { assertPersistentDataPath } from './infra/persistent-path.ts'
 
 export const RuleIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)
 export const RuleMatchSchema = z.object({ rule_id: RuleIdSchema, reason: z.string().trim().min(1).max(500) }).strict()
@@ -96,7 +97,11 @@ export const ExecutorConfigSchema = z.object({
   directory: z.string().trim().refine(path => path === '' || isAbsolutePath(path), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
-}).strict()
+}).strict().superRefine((config, context) => {
+  if (!config.directory) return
+  try { assertPersistentDataPath(config.directory) }
+  catch (error) { context.addIssue({ code: 'custom', path: ['directory'], message: error instanceof Error ? error.message : 'Directory is outside snapshotted data areas' }) }
+})
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
   paused: z.boolean().default(false),
