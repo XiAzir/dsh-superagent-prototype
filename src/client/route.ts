@@ -4,7 +4,7 @@ import type { SetupPlace } from '../setup.ts'
 import { DECISION_FILTERS, type DecisionFilter } from './api.ts'
 import type { T } from './text.ts'
 
-export const TABS = ['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'tasks'] as const
+export const TABS = ['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'rooms', 'tasks'] as const
 export type Tab = typeof TABS[number]
 export const SETTINGS_GROUPS = ['source', 'eval', 'execution', 'schedules', 'prompts', 'deployment'] as const
 export type SettingsGroup = typeof SETTINGS_GROUPS[number]
@@ -15,6 +15,7 @@ export type Route = { page: 'overview' | 'source'; id?: undefined; query?: undef
   | { page: 'execution'; id?: undefined; query?: { filter?: TicketFilter } }
   | { page: 'execution'; id: string; query?: undefined }
   | { page: 'tasks'; id?: string; query?: undefined }
+  | { page: 'rooms'; id?: string; query?: undefined }
   | { page: 'settings'; id?: undefined; query: { group: SettingsGroup; source?: string; version?: string } }
 export const HOME: Route = { page: 'overview' }
 export const settingsRoute = (group: SettingsGroup, query: { source?: string; version?: string } = {}): Route =>
@@ -22,7 +23,7 @@ export const settingsRoute = (group: SettingsGroup, query: { source?: string; ve
 export const setupPage = (place: SetupPlace): Route =>
   place === 'deployment' ? settingsRoute('deployment') : settingsRoute('source', { source: place })
 export const routeLabel = (t: T, route: Route): string =>
-  route.id ? t(route.page === 'trigger' ? 'term.thread' : route.page === 'tasks' ? 'webTask.title' : 'term.ticket') : t(`tab.${route.page}`)
+  route.id ? t(route.page === 'trigger' ? 'term.thread' : route.page === 'tasks' ? 'webTask.title' : route.page === 'rooms' ? 'room.title' : 'term.ticket') : t(`tab.${route.page}`)
 
 const pick = <V extends string>(values: readonly V[], value: unknown): V | undefined => values.find(item => item === value)
 function compact<Q extends object>(query: Q): Q | undefined {
@@ -37,6 +38,7 @@ export function parseRoute(value: unknown): Route | undefined {
   switch (page) {
     case 'overview': case 'source': return { page }
     case 'tasks': return record ? { page, id: record } : { page }
+    case 'rooms': return record ? { page, id: record } : { page }
     case 'trigger': return record ? { page, id: record, query: compact({ trigger: text('trigger') }) }
       : { page, query: compact({ filter: pick(THREAD_FILTERS, query?.filter) }) }
     case 'eval': return { page, query: compact({ filter: pick(DECISION_FILTERS, query?.filter),

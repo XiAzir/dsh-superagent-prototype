@@ -88,6 +88,7 @@ function TaskThread({ task, onUpdated }: { task: WebTaskView; onUpdated: (task: 
   const { t, navigate } = usePanel()
   return <>
     <PageHead title={task.title || t('webTask.untitled')}>
+      <Button variant="outline" size="sm" onClick={() => navigate({ page: 'rooms', id: `web:${task.id}` })}>{t('room.view')}</Button>
       <Tag tone={statusTone(task.status)}>{t(statusKey(task.status))}</Tag>
     </PageHead>
     <div className="dt-row-meta dt-status-line">
@@ -148,7 +149,7 @@ export function PersonalPage({ id }: { id?: string }) {
     } catch (error) { setMoreError(errorText(error)) }
     finally { setMoreBusy(false) }
   }
-  const created = (task: WebTaskView) => navigate({ page: 'tasks', id: task.id })
+  const created = (task: WebTaskView) => navigate({ page: 'rooms', id: `web:${task.id}` })
   return <div className="dt-web-task-page">
     {id ? <>
       {selected.data ? <><LoadState error={selected.error} loading={false} /><TaskThread key={selected.data.id} task={selected.data}

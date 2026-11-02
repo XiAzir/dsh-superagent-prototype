@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { RoomActivity, RoomMessage, TaskRoomSummary, TaskRoomView } from '../../src/app/task-rooms.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -134,6 +135,8 @@ export interface PanelServer {
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
   webTasks: { items: ApiResponse<'GET web/tasks'>['items']; records: Record<string, ApiResponse<'GET web/tasks/:id'>> }
+  rooms: { items: TaskRoomSummary[]; views: Record<string, TaskRoomView>; activities: Record<string, RoomActivity> }
+  roomMessageError?: string
   qqStatus: ApiResponse<'GET qq/status'>
   qqToken?: string
   qqTokenError?: string
@@ -284,6 +287,26 @@ function initial(): PanelServer {
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
     settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
+    rooms: (() => {
+      const key = 'web:demo'
+      const workers = [
+        { id: 'worker-alpha-1234', title: '前端 Worker', stage: 'working', summary: '正在更新页面', sessionId: 'session-a', active: true, subscribed: true },
+        { id: 'worker-beta-5678', title: '测试 Worker', stage: 'waiting', summary: '等待反馈', sessionId: 'session-b', active: true, subscribed: true },
+        { id: 'worker-stopped', title: '已停止 Worker', stage: 'ended', summary: '', sessionId: 'session-c', active: false, subscribed: true },
+        { id: 'worker-unsubscribed', title: '未订阅 Worker', stage: 'working', summary: '', sessionId: 'session-d', active: true, subscribed: false },
+      ]
+      const messages: RoomMessage[] = [
+        { id: 'room-m1', at: '2026-11-01T10:00:00Z', kind: 'user', actor: { role: 'user', name: 'Alice' }, text: '请处理任务', audience: 'router' },
+        { id: 'room-m2', at: '2026-11-01T10:01:00Z', kind: 'collaboration', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '页面结构已更新', audience: 'thread' },
+        { id: 'room-m3', at: '2026-11-01T10:02:00Z', kind: 'system', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '运行命令：pnpm test', audience: 'record', ticketId: workers[0]!.id, details: 'PASS 3 tests' },
+        { id: 'room-m4', at: '2026-11-01T10:03:00Z', kind: 'assignment', actor: { role: 'router', name: 'Router' }, text: 'Worker 职责：修复前端显示问题', audience: 'worker', recipient: workers[0]!.id, ticketId: workers[0]!.id, details: '仅处理面板样式与交互。' },
+      ]
+      const view: TaskRoomView = { key, title: '改进任务面板', source: 'web', updatedAt: messages.at(-1)!.at, workers, pending: false,
+        messages, earlier: null, writable: true, paused: false }
+      return { items: [view], views: { [key]: view }, activities: { [workers[0]!.id]: { items: [
+        { id: 'activity-1', type: 'tool', text: 'pnpm test\nPASS 3 tests' },
+      ], next_offset: null } } }
+    })(),
     qqStatus: { enabled: false, mode: 'forward', state: 'disabled', detail: 'QQ 来源已关闭。', forwardUrl: 'ws://127.0.0.1:3001',
       reverseUrl: 'ws://127.0.0.1:6199/onebot/v11/ws', tokenConfigured: false, allowedUsers: 0, groups: 0, received: 0 },
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
@@ -330,6 +353,39 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET rooms': { query: ['offset', 'limit'], answer: ({ query }) => {
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50), items = server.rooms.items.slice(offset, offset + limit)
+    return { items, next_offset: offset + limit < server.rooms.items.length ? offset + limit : null }
+  } },
+  'GET rooms/:key': { query: ['before', 'limit'], answer: ({ params, query }) => {
+    const room = server.rooms.views[params.key]
+    if (!room) return refuse(404, '任务群不存在。')
+    const limit = Number(query.limit ?? 50)
+    if (!query.before) return { ...room, messages: room.messages.slice(-limit), earlier: room.messages.length > limit ? room.messages.at(-limit)?.id ?? null : null }
+    const index = room.messages.findIndex(item => item.id === query.before)
+    if (index < 0) return { ...room, messages: [], earlier: null }
+    const start = Math.max(0, index - limit)
+    return { ...room, messages: room.messages.slice(start, index), earlier: start > 0 ? room.messages[start - 1]?.id ?? null : null }
+  } },
+  'POST rooms/:key/messages': { body: true, answer: ({ params, body }) => {
+    const room = server.rooms.views[params.key]
+    if (!room) return refuse(404, '任务群不存在。')
+    if (server.roomMessageError) return refuse(500, server.roomMessageError)
+    const previous = room.messages.find(item => item.id === body.requestId)
+    if (previous) return { ...room, messages: room.messages }
+    const worker = room.workers.find(item => item.id === body.recipient)
+    const message: RoomMessage = { id: body.requestId, at: new Date().toISOString(), kind: 'user', actor: { role: 'user', name: 'Alice' },
+      text: body.text, audience: body.recipient ? 'worker' : 'router', recipient: worker?.title ?? body.recipient,
+      ...(body.recipient ? { ticketId: body.recipient } : {}) }
+    room.messages.push(message); room.updatedAt = message.at
+    return { ...room }
+  } },
+  'GET rooms/:key/workers/:ticketId/activity': { query: ['offset', 'limit'], answer: ({ params, query }) => {
+    const data = server.rooms.activities[params.ticketId] ?? { items: [], next_offset: null }
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    const items = data.items.slice(offset, offset + limit)
+    return { items, next_offset: offset + limit < data.items.length ? offset + limit : null }
+  } },
   'GET qq/status': { answer: () => ({ ...server.qqStatus, tokenConfigured: !!server.qqToken || server.qqStatus.tokenConfigured }) },
   'PUT qq/token': { body: true, answer: ({ body }) => {
     if (server.qqTokenError) return refuse(500, server.qqTokenError)

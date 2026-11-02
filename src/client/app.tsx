@@ -9,6 +9,7 @@ import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
 import { PersonalPage } from './personal.tsx'
+import { RoomsPage } from './rooms.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
@@ -160,6 +161,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
       case 'execution': return route.id !== undefined ? <TicketPage key={route.id} id={route.id} />
         : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
       case 'tasks': return state?.mode === 'personal' ? <PersonalPage key={route.id ?? 'tasks'} id={route.id} /> : waiting
+      case 'rooms': return state?.mode === 'personal' ? <RoomsPage key={route.id ?? 'rooms'} id={route.id} /> : waiting
       case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
         deploymentForm={deploymentForm} /> : waiting
     }
@@ -169,7 +171,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
       <Header masterId={state?.masterId} mode={state?.mode} masterReady={state?.masterReady ?? false} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
       <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
-        items={TABS.filter(value => value !== 'tasks' || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
+        items={TABS.filter(value => !['tasks', 'rooms'].includes(value) || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
           id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
       <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page}`} className="dt-main">{page}</main>
     </div>
@@ -190,7 +192,7 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
   const normalizeModeRoute = useCallback((mode: 'repository' | 'personal' | undefined) => move(current => {
-    if (mode === 'personal' && current.route.page === 'overview') return { route: { page: 'tasks' }, stack: current.stack }
+    if (mode === 'personal' && current.route.page === 'overview') return { route: { page: 'rooms' }, stack: current.stack }
     if (mode === 'repository' && current.route.page === 'tasks') return { route: HOME, stack: current.stack }
     return { route: current.route, stack: current.stack }
   }), [move])
