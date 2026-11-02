@@ -1,0 +1,28 @@
+[Unit]
+Description=CNB Superagent archive and runtime lease receiver
+After=network.target
+
+[Service]
+Type=simple
+User=cnb-superagent
+Group=cnb-superagent
+StateDirectory=cnb-superagent
+StateDirectoryMode=0700
+EnvironmentFile=/etc/cnb-superagent-archive.env
+WorkingDirectory=/usr/local/lib/cnb-superagent
+ExecStart=/usr/bin/python3 /usr/local/lib/cnb-superagent/archive_server.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/cnb-superagent
+MemoryMax=256M
+TasksMax=40
+
+[Install]
+WantedBy=multi-user.target
