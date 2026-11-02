@@ -1,0 +1,4 @@
+# External recovery for this project only. Disable this file for maintenance.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /usr/local/bin/cnb-superagent-watchdog.sh

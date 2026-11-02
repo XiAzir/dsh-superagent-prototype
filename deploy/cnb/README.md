@@ -1,10 +1,10 @@
 # CNB 云开发持久运行接入
 
-本目录提供 dsh-superagent 的 CNB runtime 快照接收端与部署模板。快照只覆盖 `archive.py` 定义的 `dsh-home`、`state`、`work` 数据；不接收共享的 maimai 数据。
+本目录提供 dsh-superagent 的 CNB 运行监督器、快照接收端与部署模板。每个应用使用独立目录、凭据和租约。
 
 ## 目标规格与访问
 
-- CNB 云开发工作区目标规格：2 核、4 GB 内存。规格由 CNB 工作区配置设定，本文模板不修改仓库 `.cnb.yml`。
+- `.cnb.yml` 的 `linux.vscode` 使用 2 核、4 GB，离线保留18小时。首次配置将 Worker 并发设为1；已有配置继续保留。资源吃紧时可调整到4核，CNB默认按每核2GB分配内存；更高内存规格需核对对应runner资源。
 - Superagent web 服务监听 `127.0.0.1:13082`。客户端通过当前 CNB 工作区 SSH 目标建立隧道：
 
   ```sh
@@ -18,7 +18,18 @@
 
 `archive.py` 生成 ZIP，并写入 `snapshot/manifest.json`（当前 `schema_version: 1`）。manifest记录文件路径、大小、SHA-256与权限位；校验和恢复都会检查manifest和文件内容。归档最大512 MiB，展开内容最大2 GiB，最多200,000个成员。上传由服务以1 MiB块流式写入临时文件；完整校验及租约复核通过后才轮换 `latest.zip` / `previous.zip`。每个已保存备份提供 `X-Archive-SHA256` 下载响应头，客户端按该值核对下载内容。
 
-归档仅包含 dsh-superagent 的 home、state 和 work，不会迁移既有模型供应商凭据，也不会迁移或启动 QQ、NapCat 等客户端。模型配置及后续服务集成需在目标 DSH profile 中单独设置。
+首次部署使用新的云端 profile，保留本机现有服务。后续在云端配置的模型凭据、QQ配置、会话、定时任务数据库与工作文件均随快照保存，归档应按敏感数据管理。NapCat等独立应用的运行目录需另行规划。`node_modules`、缓存及已知运行日志会被排除，依赖锁文件保留；恢复后自动重新安装 profile 依赖。
+
+## 启停与恢复
+
+```sh
+python3 deploy/cnb/runtime.py start       # 首启恢复快照，启动或恢复运行
+python3 deploy/cnb/runtime.py status
+python3 deploy/cnb/runtime.py stop        # 人工停机，外部恢复保持暂停
+python3 deploy/cnb/runtime.py shutdown    # 环境结束时保存快照，允许外部重新拉起
+```
+
+跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭会再保存一次快照。
 
 ## 接收端部署模板
 
