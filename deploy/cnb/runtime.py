@@ -50,6 +50,40 @@ def child_environment(overrides: dict[str, str] | None = None) -> dict[str, str]
     return env
 
 
+def application_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Keep application defaults and tool-created user state on workspace storage."""
+    home = DATA / 'home'
+    paths = {
+        'HOME': str(home), 'DSH_HOME': str(DATA / 'dsh-home'),
+        'XDG_CONFIG_HOME': str(home / '.config'), 'XDG_DATA_HOME': str(home / '.local' / 'share'),
+        'XDG_STATE_HOME': str(home / '.local' / 'state'), 'XDG_CACHE_HOME': str(home / '.cache'),
+        'XDG_RUNTIME_DIR': str(CONTROL / 'run'),
+        'TMPDIR': str(CONTROL / 'tmp'), 'TMP': str(CONTROL / 'tmp'), 'TEMP': str(CONTROL / 'tmp'),
+        'npm_config_cache': str(home / '.cache' / 'npm'),
+        'npm_config_store_dir': str(home / '.cache' / 'pnpm' / 'store'),
+        'PNPM_HOME': str(home / '.local' / 'share' / 'pnpm'),
+        'DSH_SUPERAGENT_WORK_DIR': str(DATA / 'work'),
+        'DSH_SUPERAGENT_DATA_ROOT': str(DATA),
+    }
+    if overrides:
+        paths.update(overrides)
+    return child_environment(paths)
+
+
+def prepare_application_paths() -> None:
+    """Run after first-boot restore: creating DATA children earlier hides a backup."""
+    env = application_environment()
+    for name in ('HOME', 'DSH_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+                 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'DSH_SUPERAGENT_WORK_DIR'):
+        path = Path(env[name])
+        expected = CONTROL if name in ('XDG_RUNTIME_DIR', 'TMPDIR') else DATA
+        if not path.resolve().is_relative_to(expected.resolve()) or path.is_symlink():
+            raise RuntimeErrorSafe('Application storage path escapes the managed workspace directory.')
+        path.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == 'nt' else 0o700)
+        if os.name != 'nt':
+            os.chmod(path, 0o700)
+
+
 class RuntimeErrorSafe(RuntimeError):
     pass
 
@@ -319,16 +353,17 @@ class Supervisor:
             raise
 
     def bootstrap(self) -> bool:
+        prepare_application_paths()
         profile = DATA / 'dsh-home' / 'profiles' / PROFILE
         fresh = not profile.exists()
         subprocess.run(['node', str(ROOT / 'scripts' / 'setup-linux.mjs'), '--home', str(DATA / 'dsh-home'),
                         '--state-dir', str(DATA / 'state'), '--port', '13082'], cwd=ROOT,
-                       env=child_environment({'DSH_HOME': str(DATA / 'dsh-home')}), timeout=BOOTSTRAP_TIMEOUT,
+                       env=application_environment(), timeout=BOOTSTRAP_TIMEOUT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
         lock = profile / 'package.json'
         if lock.exists() and (profile / 'pnpm-lock.yaml').exists():
             subprocess.run(['pnpm', '-C', str(profile), 'install', '--frozen-lockfile'], cwd=ROOT,
-                           env=child_environment(), timeout=BOOTSTRAP_TIMEOUT,
+                           env=application_environment(), timeout=BOOTSTRAP_TIMEOUT,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
         return fresh
 
@@ -336,8 +371,7 @@ class Supervisor:
         if self.is_paused():
             self.intentional = True
             return
-        env = child_environment({'DSH_HOME': str(DATA / 'dsh-home'), 'DSH_SUPERAGENT_URL': URL,
-                                 'DSH_SUPERAGENT_HTTP_CLOSE': '1'})
+        env = application_environment({'DSH_SUPERAGENT_URL': URL, 'DSH_SUPERAGENT_HTTP_CLOSE': '1'})
         command = [sys.executable, str(ROOT / 'scripts' / 'dsh-superagent'), 'start', '--profile', PROFILE,
                    '--url', URL, '--timeout', str(READY_TIMEOUT)]
         self.dsh_started = True
@@ -674,7 +708,10 @@ class Supervisor:
             return 0
         finally:
             self.stop_web_tunnel()
-            if not self.intentional and not self.lease_lost.is_set():
+            # Flush the application's final writes before the shutdown snapshot.
+            # A manual pause also keeps its latest state in the durable archive.
+            self.stop_dsh(fenced=self.lease_lost.is_set())
+            if self.lease_acquired.is_set() and not self.lease_lost.is_set():
                 try:
                     self.backup()
                 except Exception as exc:
@@ -683,7 +720,8 @@ class Supervisor:
             heartbeat.join(timeout=12)
             if heartbeat.is_alive():
                 self.lease_lost.set()
-            self.stop_dsh(fenced=self.lease_lost.is_set())
+            if self.lease_lost.is_set():
+                self.stop_dsh(fenced=True)
             if self.lease_acquired.is_set():
                 try:
                     if not heartbeat.is_alive():

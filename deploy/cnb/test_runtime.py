@@ -223,6 +223,10 @@ class RuntimeTests(unittest.TestCase):
         child_env = spawn.call_args.kwargs["env"]
         self.assertEqual(child_env["DSH_SUPERAGENT_HTTP_CLOSE"], "1")
         self.assertEqual(child_env["SUPERAGENT_KEEP_SETTING"], "retained")
+        self.assertEqual(child_env["HOME"], str(self.data / "home"))
+        self.assertEqual(child_env["DSH_SUPERAGENT_WORK_DIR"], str(self.data / "work"))
+        self.assertEqual(child_env["XDG_CONFIG_HOME"], str(self.data / "home" / ".config"))
+        self.assertEqual(child_env["TMPDIR"], str(self.control / "tmp"))
         self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KEY_B64", child_env)
         self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS", child_env)
         self.assertNotIn("SUPERAGENT_WEB_TUNNEL_HOST", child_env)
@@ -246,6 +250,48 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KEY_B64", child_env)
             self.assertNotIn("SUPERAGENT_WEB_TUNNEL_KNOWN_HOSTS", child_env)
             self.assertNotIn("SUPERAGENT_ARCHIVE_TOKEN", child_env)
+            self.assertEqual(child_env["HOME"], str(self.data / "home"))
+            self.assertEqual(child_env["XDG_DATA_HOME"], str(self.data / "home" / ".local" / "share"))
+
+    def test_application_path_defaults_override_ambient_paths_and_preserve_fresh_restore(self):
+        with patch.dict(os.environ, {"HOME": "/root", "TMPDIR": "/tmp", "XDG_CONFIG_HOME": "/root/.config"}):
+            env = runtime.application_environment()
+            self.assertEqual(env["HOME"], str(self.data / "home"))
+            self.assertEqual(env["XDG_CONFIG_HOME"], str(self.data / "home" / ".config"))
+            self.assertEqual(env["TMPDIR"], str(self.control / "tmp"))
+        runtime.ensure_dirs()
+        self.assertEqual(list(self.data.iterdir()), [])
+        runtime.prepare_application_paths()
+        for name in ("HOME", "DSH_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                     "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "TMPDIR", "DSH_SUPERAGENT_WORK_DIR"):
+            self.assertTrue(Path(env[name]).is_dir())
+            if os.name != "nt":
+                self.assertEqual(Path(env[name]).stat().st_mode & 0o777, 0o700)
+
+    @unittest.skipIf(os.name == "nt", "Unix symlink storage validation")
+    def test_application_path_rejects_home_symlink_outside_data(self):
+        (self.data / "home").symlink_to(self.control, target_is_directory=True)
+        with self.assertRaises(runtime.RuntimeErrorSafe):
+            runtime.prepare_application_paths()
+
+    def test_shutdown_snapshots_after_application_stop_including_manual_pause(self):
+        for manual in (False, True):
+            with self.subTest(manual=manual):
+                supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+                supervisor.lease_acquired.set()
+                supervisor.intentional = manual
+                supervisor.stop_event.set()
+                order = []
+                with patch.object(supervisor, "heartbeat_loop"), \
+                     patch.object(supervisor, "_wait_for_resume", return_value=False), \
+                     patch.object(supervisor, "stop_web_tunnel"), \
+                     patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("stop")), \
+                     patch.object(supervisor, "backup", side_effect=lambda: order.append("backup")), \
+                     patch.object(runtime.web_tunnel, "load_config", return_value=None), \
+                     patch.object(runtime, "json_request", return_value=(200, {})), \
+                     patch.object(runtime, "set_status"):
+                    self.assertEqual(supervisor.run(), 0)
+                self.assertEqual(order, ["stop", "backup"])
 
     def test_web_tunnel_hook_posts_cookie_contract_and_stops_with_dsh(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example/superagent-runtime", "token": "secret"},
@@ -326,7 +372,7 @@ class RuntimeTests(unittest.TestCase):
             supervisor.stop_event.set()
             self.assertEqual(supervisor.run(), 0)
         self.assertEqual(release.call_args.args[3], {"owner": "build-1", "paused": True})
-        backup.assert_not_called()
+        backup.assert_called_once()
 
     def test_stop_and_shutdown_record_distinct_pause_intent(self):
         marker = self.control / "operator-stop"

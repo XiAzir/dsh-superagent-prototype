@@ -48,8 +48,12 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true })
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return runWithEnv({}, ...args)
+}
+function runWithEnv(env: NodeJS.ProcessEnv, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
-    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
+    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '',
+      DSH_SUPERAGENT_WORK_DIR: '', ...env },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
@@ -66,6 +70,31 @@ async function answering(state: unknown = READY, always = false): Promise<string
 const status = async (profile: string, url = 'http://127.0.0.1:9') =>
   JSON.parse((await run('status', '--profile', profile, '--url', url)).stdout) as { pids: number[]; manually_stopped: boolean }
 const posixIt = it.skipIf(process.platform === 'win32')
+
+posixIt('pins application cwd and path environment even when reusing a tmux session', async () => {
+  const url = await answering()
+  const pid = sleeper()
+  writeFileSync(join(root, 'pane'), `${pid}\n`)
+  started(service(pid))
+  const work = join(root, 'persistent work'), home = join(root, 'persistent home')
+  mkdirSync(work); mkdirSync(home)
+  program('tmux', `for a in "$@"; do printf '%s\\n' "$a"; done >> '${root}/tmux.log'; echo --- >> '${root}/tmux.log'\n`
+    + `case "$1" in has-session) exit 0;; new-*) touch '${root}/launched'; cat '${root}/pane';; esac`)
+  const result = await runWithEnv({ HOME: home, DSH_HOME: join(home, 'dsh'),
+    XDG_CONFIG_HOME: join(home, '.config'), DSH_SUPERAGENT_WORK_DIR: work, DSH_SUPERAGENT_HTTP_CLOSE: '1' },
+  'start', '--url', url, '--timeout', '10')
+  expect(result.code).toBe(0)
+  const tmux = readFileSync(join(root, 'tmux.log'), 'utf8').split('---\n').find(call => call.startsWith('new-window'))!.split('\n')
+  expect(tmux).toEqual(expect.arrayContaining(['-c', realpathSync(work), '-e', `HOME=${home}`,
+    `DSH_HOME=${join(home, 'dsh')}`, `XDG_CONFIG_HOME=${join(home, '.config')}`, 'DSH_SUPERAGENT_HTTP_CLOSE=1']))
+})
+
+posixIt('rejects a relative application work directory before launching tmux', async () => {
+  const result = await runWithEnv({ DSH_SUPERAGENT_WORK_DIR: 'relative' }, 'start')
+  expect(result.code).toBe(1)
+  expect(result.stderr).toContain('existing absolute directory')
+  expect(existsSync(join(root, 'tmux.log'))).toBe(false)
+})
 
 posixIt('refuses to stop when two processes serve the profile, before it writes the stop marker', async () => {
   processes(service(sleeper()), `${sleeper()} node node /opt/dsh --profile=superagent`)

@@ -33,6 +33,24 @@ ARTIFACTS = ROOT / '.artifacts'
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
 
+# tmux keeps its server/session environment across service restarts. Refresh these
+# explicit application paths for each new pane, including an existing session.
+APPLICATION_ENV = ('HOME', 'DSH_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+                   'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'TMP', 'TEMP', 'PNPM_HOME',
+                   'npm_config_cache', 'npm_config_store_dir', 'DSH_SUPERAGENT_WORK_DIR',
+                   'DSH_SUPERAGENT_DATA_ROOT', 'DSH_SUPERAGENT_HTTP_CLOSE')
+
+
+def service_directory():
+    """An optional deployment-specific work directory; local startup stays unchanged."""
+    configured = os.environ.get('DSH_SUPERAGENT_WORK_DIR', '')
+    if not configured:
+        return ROOT
+    directory = Path(configured)
+    if not directory.is_absolute() or not directory.is_dir():
+        raise RuntimeError('DSH_SUPERAGENT_WORK_DIR must name an existing absolute directory.')
+    return directory.resolve()
+
 
 def control(profile):
     """Return the control directory for `profile`, creating it if needed."""
@@ -159,7 +177,7 @@ def outcome(pids, current):
 def status(args):
     pids = processes(args.profile)
     current = state(args.url) if pids else None
-    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
+    print(json.dumps({'pids': pids, 'cwd': str(service_directory()), 'url': args.url,
                       'manually_stopped': stopped(args.profile), 'health': current and current['health'],
                       'errors': current and current['errors'], 'setup': current and current['setup'],
                       'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
@@ -194,6 +212,7 @@ def prune_logs(profile):
 
 
 def start(args):
+    directory = service_directory()
     session = 'dsh-' + args.profile
     pids = processes(args.profile)
     if len(pids) > 1:
@@ -215,7 +234,10 @@ def start(args):
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
         # Reuse an existing tmux session without disturbing other windows.
         target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
-        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
+        environment = [value for name in APPLICATION_ENV if name in os.environ
+                       for value in ('-e', name + '=' + os.environ[name])]
+        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server',
+                               *environment, '-c', str(directory), command],
                               check=True, capture_output=True, text=True).stdout.strip()
         if pane.isdigit():
             (control(args.profile) / 'service.pid').write_text(pane + '\n')
