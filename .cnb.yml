@@ -1,24 +1,35 @@
-# Branches carrying the Linux deployment run the same validation and dev image.
-(**):
+# Persistent service deployment is restricted to the Linux branch.
+linux:
   push:
-    - docker:
+    - runner:
+        cpus: 2
+      docker:
         build: .ide/Dockerfile
       stages:
         - name: Install locked dependencies
           script: pnpm install --frozen-lockfile
         - name: Typecheck, test and build on Linux
           script: pnpm check
+        - name: Validate persistent runtime
+          script: python3 -m unittest discover -s deploy/cnb -p 'test_*.py' -v
+        - name: Validate persistence over real HTTP
+          script: python3 deploy/cnb/integration-test.py
 
-  # CNB provides SSH / WebIDE; Superagent starts after explicit profile setup.
+  # CNB provides SSH / WebIDE. Runtime data is restored from external storage.
   vscode:
-    - docker:
+    - runner:
+        cpus: 2
+      docker:
         build: .ide/Dockerfile
+      imports:
+        - https://cnb.cool/XiAzir/dsh-superagent-secrets/-/blob/main/runtime.json
       services:
         - name: vscode
           options:
             keepAliveTimeout: 18h
       stages:
-        - name: Install locked dependencies
-          script: pnpm install --frozen-lockfile
-        - name: Build Superagent
-          script: pnpm build
+        - name: Restore and start persistent Superagent
+          script: python3 deploy/cnb/runtime.py start --timeout 900
+      endStages:
+        - name: Save runtime state before workspace shutdown
+          script: python3 deploy/cnb/runtime.py shutdown

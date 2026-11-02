@@ -4,3 +4,10 @@ lib/
 .artifacts/
 .env
 coverage/
+.superagent-runtime/
+__pycache__/
+*.pyc
+tmp/
+# Old local sandbox test artifacts are deliberately outside source control.
+deploy/cnb/tmp*/
+deploy/cnb/_test-*/
