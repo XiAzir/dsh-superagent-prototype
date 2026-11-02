@@ -2,6 +2,8 @@
 
 NapCat 负责 QQ 登录和 OneBot v11，Superagent 负责消息路由、任务执行及回复。
 
+本维护部署已于2026-11-02迁入CNB：NapCat与Superagent同环境运行，数据位于`/workspace/.superagent-runtime/data/napcat`，每5分钟随私有快照上传武汉。当前QQ授权用户为`1791081637`，群列表为空。本机便携包保留作回退副本；切换前先停旧端，保持同账号单端运行。详见[迁移实录](cnb-napcat-migration-record.md)。
+
 ```mermaid
 flowchart LR
   qq[QQ 私聊或群聊] <--> napcat[NapCat]

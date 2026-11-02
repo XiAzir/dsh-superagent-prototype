@@ -4,7 +4,7 @@
 
 ## 目标规格与访问
 
-- `.cnb.yml` 的 `linux.vscode` 使用 2 核、4 GB，离线保留18小时。首次配置将 Worker 并发设为1；已有配置继续保留。资源吃紧时可调整到4核，CNB默认按每核2GB分配内存；更高内存规格需核对对应runner资源。
+- `.cnb.yml` 的 `linux.vscode` 使用4核、8GB，Docker service承载NapCat，离线保留18小时。首次配置将Worker并发设为1；已有配置继续保留。更高内存规格需核对对应runner资源。
 - 本部署的公网 Web 入口为 `https://superagent.1994622.xyz/`，使用独立 HTTPS BasicAuth 登录；用户名 `azir`，密码保存在运维仓库已忽略的 `local/secrets.md` 对应条目。云端环境恢复后会自动重建反向隧道，日常访问直接使用域名。
 - Superagent web 服务监听 `127.0.0.1:13082`。客户端通过当前 CNB 工作区 SSH 目标建立隧道：
 
@@ -25,9 +25,9 @@ pwsh -File scripts/connect-cnb.ps1
 
 ## 快照格式和限制
 
-`archive.py` 生成 ZIP，并写入 `snapshot/manifest.json`（当前 `schema_version: 1`）。manifest记录文件路径、大小、SHA-256与权限位；校验和恢复都会检查manifest和文件内容。归档最大512 MiB，展开内容最大2 GiB，最多200,000个成员。上传由服务以1 MiB块流式写入临时文件；完整校验及租约复核通过后才轮换 `latest.zip` / `previous.zip`。每个已保存备份提供 `X-Archive-SHA256` 下载响应头，客户端按该值核对下载内容。
+`archive.py` 生成 ZIP，并写入 `snapshot/manifest.json`（当前 `schema_version: 1`）。manifest记录文件路径、大小、SHA-256与权限位；校验和恢复都会检查manifest和文件内容。归档最大4 GiB，展开内容最大8 GiB，最多200,000个成员。上传由服务以1 MiB块流式写入临时文件；完整校验及租约复核通过后才轮换 `latest.zip` / `previous.zip`。每个已保存备份提供 `X-Archive-SHA256` 下载响应头，客户端按该值核对下载内容。
 
-首次部署使用新的云端 profile，保留本机现有服务。后续在云端配置的模型凭据、QQ配置、会话、定时任务数据库与工作文件均随快照保存，归档应按敏感数据管理。NapCat等独立应用的运行目录需另行规划。`node_modules`、缓存及已知运行日志会被排除，依赖锁文件保留；恢复后自动重新安装 profile 依赖。
+首次部署使用新的云端profile，保留本机现有服务。后续在云端配置的模型凭据、QQ配置、会话、定时任务数据库与工作文件均随快照保存，归档应按敏感数据管理。NapCat由监督器管理并完整保存其独立数据根；其余应用需分别规划目录。普通应用的可重建依赖与缓存按下述规则排除，依赖锁文件保留；恢复后自动重新安装profile依赖。
 
 ### 应用数据目录
 
@@ -39,6 +39,7 @@ CNB 应用的持久数据统一位于 `/workspace/.superagent-runtime/data`：
 | `state` | Superagent SQLite、任务、定时任务、QQ附件、默认Worker工作目录 |
 | `work` | DSH默认工作目录与手工保存的工作文件 |
 | `home` | 应用HOME；工具配置、XDG数据、浏览器profile等 |
+| `napcat` | QQ登录数据、NapCat配置、插件、app、缓存、设备身份；完整保存依赖与缓存 |
 
 监督器显式设置HOME/XDG相关变量，并在复用tmux会话时更新每个新pane的环境。临时文件与运行socket位于同一workspace下的`control/tmp`和`control/run`。归档服务兼容较早仅包含dsh-home/state/work的快照。
 
@@ -54,6 +55,14 @@ python3 deploy/cnb/runtime.py status
 python3 deploy/cnb/runtime.py stop        # 人工停机，外部恢复保持暂停
 python3 deploy/cnb/runtime.py shutdown    # 环境结束时保存快照，允许外部重新拉起
 ```
+
+### NapCat 生命周期
+
+`data/napcat/deployment.json`使用私有0600配置（`enabled`与可选QQ `account`）。启用后监督器在DSH之前启动独立容器`superagent-napcat`；暂停、停机或失去租约时一并停止。QQ待扫码属于就绪状态，持续监控以容器与WebUI健康为准。无配置或disabled时保持纯Superagent运行。
+
+NapCat的WebUI token从已持久的`napcat/config/webui.json`读取，OneBot token通过Superagent管理API保存到DSH凭据服务。容器固定镜像digest、hostname、machine-id与MAC，并校验ownership、只读产物挂载和loopback端口；Docker29停止时隐藏的endpoint MAC会在启动后再次严格验证。WebUI6099与OneBot3001仅监听宿主loopback。
+
+迁移与验收记录：[本地NapCat迁移CNB](../../docs/cnb-napcat-migration-record.md)。切换回本机时先停止云端运行，再启动本地NapCat，以保持同账号单端运行。
 
 跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭及人工暂停会在应用停止后再保存一次快照。
 
@@ -75,7 +84,7 @@ SUPERAGENT_ARCHIVE_DIR=/var/lib/cnb-superagent
 SUPERAGENT_ARCHIVE_PORT=9012
 ```
 
-以 `install-archive.sh` 安装 `cnb-superagent-archive.service` 后，确认服务只监听 `127.0.0.1:9012`。在固定域名的 HTTPS server 中加入 Nginx 示例配置，设置 `client_max_body_size 512m` 并关闭 request buffering，确保ZIP流式转发。匿名 `GET /superagent-runtime/health` 返回 HTTP 200 和 `{"status":"ok"}` 或 `{"status":"waiting"}`，供现有 watchdog 按 `.status == "ok"` 探测。
+以 `install-archive.sh` 安装 `cnb-superagent-archive.service` 后，确认服务只监听 `127.0.0.1:9012`。在固定域名的HTTPS server中加入Nginx示例配置，设置`client_max_body_size 4g`并关闭request buffering，确保ZIP流式转发；大归档建议代理读写等待600秒。匿名 `GET /superagent-runtime/health` 返回HTTP 200和`{"status":"ok"}`或`{"status":"waiting"}`，供既有watchdog探测。
 
 Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工作区；它需要一枚限定目标仓库的启停PAT，以及单独的 `account-engage:r` workspace列表PAT。列表令牌只用于列举实例，启停令牌只作用于配置的仓库。PAT正文需存于VPS的0600文件，环境模板只填写文件路径。
 
@@ -103,7 +112,7 @@ Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工
 | `POST /heartbeat` | JSON含`owner`、布尔`healthy`、可选布尔`paused`及受限阶段元数据；匹配owner后续租180秒。 |
 | `POST /release` | JSON含`owner`；人工暂停时附`"paused":true`，接收端会持久化暂停标记，后续新租约的健康心跳到达后清除。 |
 | `POST /web-session` | Bearer认证，JSON含当前`owner`和DSH cookie；仅持有活跃租约的owner可更新，公共状态响应隐藏此字段。 |
-| `PUT /backup` | Bearer认证，并带 `X-Superagent-Owner: <CNB_BUILD_ID>`。最多512 MiB，流式上传ZIP；owner必须仍持有有效租约。 |
+| `PUT /backup` | Bearer认证，并带 `X-Superagent-Owner: <CNB_BUILD_ID>`。最多4 GiB，流式上传ZIP；owner必须仍持有有效租约。 |
 | `GET /backup` | Bearer认证，流式下载 `latest.zip`；无快照时返回404，成功时提供 `X-Archive-SHA256`。 |
 
 控制JSON最大8 KiB。服务对每个连接设置30秒socket超时，最多32个并发请求线程，并限制同时上传为1个。上传时会在校验后再次检查租约；过期owner以及旧owner无法覆盖当前latest。文件替换和下载打开共用锁，下载期间打开的文件描述符继续指向该代完整ZIP。
