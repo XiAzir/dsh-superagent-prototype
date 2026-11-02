@@ -369,6 +369,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/platform.ts` | Native path, argument and environment adapters for Windows and Unix |
 | `src/infra/private-directory.ts` | Protect the state directory with Unix modes or a Windows owner-only inheritable DACL |
+| `src/infra/http-compat.ts` | Opt-in CNB SSH transport adapter: one HTTP request per socket while preserving WebSocket upgrades |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
@@ -460,6 +461,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
+| `tests/http-compat.spec.ts` | CNB no-reuse opt-in, guarded disposal, host compatibility checks, real HTTP connection closure and WebSocket upgrades |
 | `tests/web-tasks.spec.ts` | Personal Web task admission, idempotency, Engine intake, persistent conversation history, pagination and reply delivery |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
