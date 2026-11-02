@@ -8,6 +8,8 @@ import { transcriptEntry } from './context.ts'
 import { WebTaskError } from './web-tasks.ts'
 import type { RoomEntry } from './room-journal.ts'
 import type { Store } from './store.ts'
+import type { ArtifactRegistry, TaskArtifact } from './artifacts.ts'
+import { record } from '../kv.ts'
 export interface RoomWorker {
   id: string; title: string; stage: string; summary: string; sessionId: string
   active: boolean; subscribed: boolean
@@ -20,6 +22,7 @@ export interface RoomMessage {
   actor: { role: 'user' | 'router' | 'worker' | 'system'; name: string; ticketId?: string }
   text: string; audience: 'router' | 'worker' | 'thread' | 'record'; recipient?: string
   ticketId?: string; details?: string
+  artifacts?: { id: string; name: string; size: number }[]
   delivery?: 'queued' | 'delivered' | 'read' | 'held' | 'failed'
 }
 export interface TaskRoomView extends TaskRoomSummary {
@@ -34,6 +37,7 @@ export const RoomMessageRequest = z.object({ text: z.string().trim().min(1).max(
 interface RoomHost {
   store: Store; engine: Pick<Engine, 'receive' | 'direct'>
   personal(): boolean; configured(): boolean; requestPass(): void
+  artifacts?: Pick<ArtifactRegistry, 'verify'> | undefined
   inspectWorker?(ticketId: string): Promise<readonly SessionEvent[]>
 }
 const Cursor = z.object({ at: z.string().datetime(), id: z.string().min(1).max(512) }).strict()
@@ -128,6 +132,11 @@ export class TaskRooms {
       const receipt = entry.receiptId && store.receipts.get(entry.receiptId)
       if (!receipt) return undefined
       return { ...base, kind: 'router', actor: { role: 'router', name: 'Router' }, text: bounded(receipt.text, 20000), audience: 'record',
+        ...receipt.status === 'sent' && receipt.artifacts?.length ? { artifacts: receipt.artifacts.flatMap(id => {
+          const artifact = store.get(record<TaskArtifact>(`task-artifact:${id}`))
+          return artifact && artifact.ticketId === receipt.ticketId
+            ? [{ id: artifact.id, name: artifact.name, size: artifact.size }] : []
+        }) } : {},
         delivery: receipt.status === 'pending' ? 'queued' : receipt.status === 'dropped' ? 'failed' : 'delivered' }
     }
     const worker = { role: 'worker' as const, name: ticket?.title ?? entry.ticketId ?? 'Worker', ticketId: entry.ticketId }
@@ -180,5 +189,21 @@ export class TaskRooms {
     }
     const start = Math.max(0, offset), size = Math.max(1, Math.min(50, limit))
     return { items: items.slice(start, start + size), next_offset: start + size < items.length ? start + size : null }
+  }
+  /** Downloads require a sent receipt in this room, its owning ticket, and a fresh immutable-spool verification. */
+  async artifact(room: string, id: string): Promise<TaskArtifact> {
+    if (!this.writable()) throw new WebTaskError(409, '请恢复个人模式的 Web 来源与 owner 授权后下载。')
+    const thread = this.thread(room)
+    const row = this.host.store.db.prepare(`SELECT o.value ->> '$.ticketId' AS ticket_id FROM outbox o
+      WHERE o.value ->> '$.status'='sent' AND o.value ->> '$.channel.thread'=?
+        AND EXISTS (SELECT 1 FROM json_each(o.value,'$.artifacts') a WHERE a.value=?) LIMIT 1`).get(room, id)
+    const ticketId = row && String(row.ticket_id)
+    const descriptor = this.host.store.get(record<TaskArtifact>(`task-artifact:${id}`))
+    if (!ticketId || descriptor?.ticketId !== ticketId || !this.tickets(thread).some(ticket => ticket.id === ticketId) || !this.host.artifacts) {
+      throw new WebTaskError(404, '该任务群尚未交付这个文件。')
+    }
+    const artifact = await this.host.artifacts.verify(id, ticketId)
+    if (!this.writable()) throw new WebTaskError(409, '下载权限已更新，请刷新后重试。')
+    return artifact
   }
 }

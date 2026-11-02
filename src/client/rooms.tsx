@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { RoomActivity, RoomMessage, TaskRoomSummary, TaskRoomView } from '../app/task-rooms.ts'
 import { Button, Dot, Icon, Tag } from './controls.tsx'
+import { ArtifactDownload } from './artifacts.tsx'
 import { usePoll } from './api.ts'
 import { usePanel, usePanelData } from './provider.tsx'
 import { errorText, when } from './text.ts'
@@ -131,11 +132,12 @@ function audienceLabel(t: ReturnType<typeof usePanel>['t'], message: RoomMessage
 function deliveryLabel(t: ReturnType<typeof usePanel>['t'], delivery: NonNullable<RoomMessage['delivery']>) {
   return t(`room.delivery.${delivery}`)
 }
-function Message({ message }: { message: RoomMessage }) {
+function Message({ roomKey, message }: { roomKey: string; message: RoomMessage }) {
   const { t } = usePanel()
   const [open, setOpen] = useState(false)
   const isUser = message.kind === 'user'
   const hasDetails = !!message.details
+  const artifacts = message.artifacts
   return <li className={`dt-room-message${isUser ? ' dt-room-user' : ''}`} data-message-id={message.id}>
     <div className="dt-room-message-head"><strong>{message.actor.name}</strong><time dateTime={message.at}>{when(message.at, t('lang'))}</time></div>
     <p className="dt-room-message-text">{message.text}</p>
@@ -145,6 +147,9 @@ function Message({ message }: { message: RoomMessage }) {
     {hasDetails && <><Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       {t(open ? 'room.hideDetails' : 'room.showDetails')}
     </Button>{open && <pre className="dt-room-details">{message.details}</pre>}</>}
+    {!!artifacts?.length && <ul className="dt-web-task-artifacts">{artifacts.map(artifact => <li key={artifact.id}>
+      <ArtifactDownload room={roomKey} artifact={artifact} />
+    </li>)}</ul>}
   </li>
 }
 
@@ -234,6 +239,9 @@ function Room({ id }: { id: string }) {
   }
   return <div className="dt-room-page">
     <PageHead title={data.title || t('room.untitled')}>
+      {data.key.startsWith('web:') && <Button variant="outline" size="sm" onClick={() => navigate({ page: 'tasks', id: data.key.slice(4) })}>
+        {t('room.openTaskConversation')}
+      </Button>}
       {state?.mode === 'personal' && <Button variant="outline" size="sm" icon={<Icon name="plus" size={14} />}
         onClick={() => navigate({ page: 'tasks' })}>{t('webTask.newTask')}</Button>}
     </PageHead>
@@ -243,7 +251,7 @@ function Room({ id }: { id: string }) {
     <WorkerList room={data} />
     <Section title={t('room.timeline')} count={data.messages.length}>
       {data.messages.length === 0 ? <Hint>{t('room.empty')}</Hint> : <ol className="dt-room-timeline" aria-label={t('room.timeline')}>
-        {visibleMessages.map(message => <Message key={message.id} message={message} />)}
+        {visibleMessages.map(message => <Message key={message.id} roomKey={data.key} message={message} />)}
       </ol>}
       {(start > 0 || data.earlier) && <Button variant="outline" size="sm" disabled={earlierBusy} icon={<Icon name="chevron-up" size={14} />}
         onClick={() => { void pageOlder() }}>{t(earlierBusy ? 'loading' : 'loadEarlier')}</Button>}

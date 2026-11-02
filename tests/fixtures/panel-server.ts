@@ -300,6 +300,9 @@ function initial(): PanelServer {
         { id: 'room-m2', at: '2026-11-01T10:01:00Z', kind: 'collaboration', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '页面结构已更新', audience: 'thread' },
         { id: 'room-m3', at: '2026-11-01T10:02:00Z', kind: 'system', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '运行命令：pnpm test', audience: 'record', ticketId: workers[0]!.id, details: 'PASS 3 tests' },
         { id: 'room-m4', at: '2026-11-01T10:03:00Z', kind: 'assignment', actor: { role: 'router', name: 'Router' }, text: 'Worker 职责：修复前端显示问题', audience: 'worker', recipient: workers[0]!.id, ticketId: workers[0]!.id, details: '仅处理面板样式与交互。' },
+        { id: 'room-m5', at: '2026-11-01T10:04:00Z', kind: 'report', actor: { role: 'worker', name: '质量验证 Worker', ticketId: workers[1]!.id },
+          text: '验证报告已交付。', audience: 'router', ticketId: workers[1]!.id,
+          artifacts: [{ id: 'room-report-a', name: '任务群验收结果.zip', size: 2048 }] },
       ]
       const view: TaskRoomView = { key, title: '改进任务面板', source: 'web', updatedAt: messages.at(-1)!.at, workers, pending: false,
         messages, earlier: null, writable: true, paused: false }

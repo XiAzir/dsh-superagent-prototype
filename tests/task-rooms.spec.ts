@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Engine, key, type OutboundMessage, type Ticket, type Trigger } from '../src/core/index.ts'
 import { TaskRooms } from '../src/app/task-rooms.ts'
+import { ArtifactRegistry } from '../src/app/artifacts.ts'
 import { Store } from '../src/app/store.ts'
 import { webSource } from '../src/app/web-tasks.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
@@ -19,25 +20,27 @@ let rooms: TaskRooms
 let clockTick: number
 let requestPass: ReturnType<typeof vi.fn<() => void>>
 let inspectWorker: ReturnType<typeof vi.fn<(id: string) => Promise<readonly SessionEvent[]>>>
+let artifacts: ArtifactRegistry
 const actor = { source: 'web', id: 'owner' }
 const base = Date.parse('2026-11-01T12:00:00.000Z')
 const now = () => new Date(base + clockTick).toISOString()
 
 function configure() {
   sources = new SourceRegistry(() => store.settings())
-  sources.register(webSource(store, () => true))
+  sources.register(webSource(store, () => true, artifacts))
   requestPass = vi.fn()
   inspectWorker = vi.fn(async () => [])
   engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources),
     assessor: { request: vi.fn() }, executor: { start: vi.fn(), deliver: vi.fn(), stop: vi.fn() },
     outbox: { send: vi.fn(), status: () => undefined, withdraw: vi.fn() }, now })
-  rooms = new TaskRooms({ store, engine, personal: () => true, configured: () => true, requestPass, inspectWorker })
+  rooms = new TaskRooms({ store, engine, personal: () => true, configured: () => true, requestPass, inspectWorker, artifacts })
 }
 
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'task-rooms-'))
   path = join(directory, 'orchestrator.sqlite')
   store = new Store(path)
+  artifacts = new ArtifactRegistry(store, directory)
   store.saveSettings(SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
     policy: { sources: { web: { allowed: [{ id: 'owner', name: 'Owner' }] } } } }))
   clockTick = 0
@@ -158,5 +161,59 @@ describe('task rooms', () => {
     expect(sources.channelAllowed({ source: 'web', address: { room: threadKey } })).toBe(true)
     expect(store.rooms.page(threadKey, 100).some(row => row.kind === 'reply' && row.receiptId === channelMessage.id)).toBe(true)
     expect(rooms.get(threadKey).messages).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'router', text: channelMessage.text })]))
+  })
+
+  it('exposes only sent room receipts, verifies ticket-scoped snapshots, and refuses missing or cross-room artifacts', async () => {
+    const worker = accept('artifact-origin', 'artifact-room')
+    const roomKey = 'web:artifact-room'
+    const work = join(directory, 'work', worker.id)
+    mkdirSync(work, { recursive: true })
+    const source = join(work, 'summary.txt')
+    writeFileSync(source, 'durable room artifact bytes')
+    const artifact = await artifacts.stage(worker.id, work, source, 'room-summary.txt')
+    const otherWork = join(directory, 'work', 'other-ticket')
+    mkdirSync(otherWork, { recursive: true })
+    const otherSource = join(otherWork, 'other.txt')
+    writeFileSync(otherSource, 'belongs to another ticket')
+    const wrongTicketArtifact = await artifacts.stage('other-ticket', otherWork, otherSource, 'other.txt')
+    const channel = sources.kind('web')!.channel!
+    const message = (id: string, thread: string, artifactId: string, ticketId = worker.id): OutboundMessage => ({ id,
+      channel: { source: 'web', thread, address: { room: thread } }, text: `Attachment ${id}`, kind: 'reply', ticketId, artifacts: [artifactId] })
+
+    const pending = message('artifact-pending', roomKey, artifact.id)
+    store.receipts.add(pending)
+    expect(await channel.send({} as never, pending)).toBe('sent')
+    expect(rooms.get(roomKey).messages.find(item => item.id === 'reply:artifact-pending')?.artifacts).toBeUndefined()
+    await expect(rooms.artifact(roomKey, artifact.id)).rejects.toMatchObject({ status: 404 })
+    store.receipts.settle(pending, 'sent')
+
+    const sent = message('artifact-sent', roomKey, artifact.id)
+    store.receipts.add(sent)
+    expect(await channel.send({} as never, sent)).toBe('sent')
+    store.receipts.settle(sent, 'sent')
+    expect(rooms.get(roomKey).messages.find(item => item.id === 'reply:artifact-sent')?.artifacts).toEqual([
+      { id: artifact.id, name: artifact.name, size: artifact.size },
+    ])
+    expect(store.rooms.members(roomKey)).toContain(worker.id)
+    expect(store.receipts.get('artifact-sent')).toMatchObject({ status: 'sent', ticketId: worker.id, channel: { thread: roomKey }, artifacts: [artifact.id] })
+    await expect(rooms.artifact(roomKey, artifact.id)).resolves.toMatchObject({ id: artifact.id, ticketId: worker.id, name: artifact.name })
+
+    const wrongTicket = message('artifact-wrong-ticket', roomKey, wrongTicketArtifact.id)
+    store.receipts.add(wrongTicket)
+    await expect(channel.send({} as never, wrongTicket)).rejects.toThrow('Unknown artifact')
+    store.receipts.settle(wrongTicket, 'sent')
+    await expect(rooms.artifact(roomKey, wrongTicketArtifact.id)).rejects.toMatchObject({ status: 404 })
+
+    const otherRoomKey = 'web:artifact-other-room'
+    engine.receive(seedTrigger('artifact-other-room-origin', 'artifact-other-room'))
+    const crossRoom = message('artifact-cross-room', otherRoomKey, artifact.id)
+    store.receipts.add(crossRoom); store.receipts.settle(crossRoom, 'sent')
+    await expect(rooms.artifact(otherRoomKey, artifact.id)).rejects.toMatchObject({ status: 404 })
+    expect(artifacts.get(artifact.id, worker.id)).toBeDefined()
+
+    const original = store.settings.bind(store)
+    store.settings = () => SettingsSchema.parse({ ...original(), policy: { ...original().policy, sources: { web: { allowed: [] } } } })
+    try { await expect(rooms.artifact(roomKey, artifact.id)).rejects.toMatchObject({ status: 409 }) }
+    finally { store.settings = original }
   })
 })

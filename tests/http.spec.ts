@@ -213,6 +213,70 @@ it('serves only immutable delivered Web artifact bytes to the authorized owner o
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
 })
 
+it('serves only sent, same-room task-room artifact bytes linked to their owning Worker', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'http-room-artifact-'))
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  try {
+    store.saveSettings(SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
+      policy: { sources: { web: { allowed: [{ id: 'owner', name: 'Owner' }] } } } }))
+    const artifacts = new ArtifactRegistry(store, directory)
+    const room = 'qq:room-artifact'
+    const otherRoom = 'qq:room-other'
+    const origin = { source: 'qq', id: 'room-artifact' }
+    const mandate = { strength: 'explicit' as const, policyVersion: 'v1', basis: { via: 'listed' as const },
+      actor: { source: 'qq', id: 'owner' }, scope: 'room' }
+    store.threads.save({ key: room, ref: origin, createdAt: '2026-01-01T00:00:00.000Z', subscriptions: ['room-worker'], correlated: [], pending: [], meta: {} })
+    store.threads.save({ key: otherRoom, ref: { source: 'qq', id: 'room-other' }, createdAt: '2026-01-01T00:00:00.000Z',
+      subscriptions: [], correlated: [], pending: [], meta: {} })
+    store.triggers.save({ id: 'room-origin', source: 'qq', threads: [origin], actor: mandate.actor, human: true,
+      at: '2026-01-01T00:00:00.000Z', text: 'origin', meta: {} })
+    store.tickets.save({ id: 'room-worker', title: 'Room worker', decisionId: 'room-decision', mandate,
+      channels: [{ source: 'web', thread: room, address: { room } }], assignments: [], inputs: [], undelivered: [],
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', origin: { triggerId: 'room-origin', triggerIds: ['room-origin'] } } as never)
+
+    const work = join(directory, 'work', 'room-worker')
+    mkdirSync(work, { recursive: true })
+    const validSource = join(work, 'summary.txt'), pendingSource = join(work, 'pending.txt')
+    writeFileSync(validSource, 'room artifact immutable bytes')
+    writeFileSync(pendingSource, 'not sent')
+    const valid = await artifacts.stage('room-worker', work, validSource, 'room-summary.txt')
+    const pending = await artifacts.stage('room-worker', work, pendingSource, 'pending.txt')
+    const wrongWork = join(directory, 'work', 'other-worker')
+    mkdirSync(wrongWork, { recursive: true })
+    const wrongSource = join(wrongWork, 'wrong.txt')
+    writeFileSync(wrongSource, 'different worker artifact')
+    const wrongTicket = await artifacts.stage('other-worker', wrongWork, wrongSource, 'wrong.txt')
+    const message = (id: string, artifactId: string) => ({ id, channel: { source: 'web', thread: room, address: { room } },
+      text: id, kind: 'reply' as const, ticketId: 'room-worker', artifacts: [artifactId] })
+    const delivered = message('room-valid-receipt', valid.id)
+    store.receipts.add(delivered); store.receipts.settle(delivered, 'sent')
+    const queued = message('room-pending-receipt', pending.id)
+    store.receipts.add(queued)
+    // Model a corrupt or legacy sent receipt that links one Worker to another Worker's artifact.
+    const mismatched = message('room-wrong-ticket-receipt', wrongTicket.id)
+    store.receipts.add(mismatched); store.receipts.settle(mismatched, 'sent')
+
+    const call = serve({ store, artifacts, machine: { mode: 'personal', promptMaxChars: { get: () => 100_000 },
+      admissionContextMaxPages: { get: () => 10 }, admissionContextTimeoutMs: { get: () => 15_000 } }, configured: () => true, health: {},
+      engine: { receive: () => 'stored', direct: () => ({}) }, requestPass: () => {} })
+    const artifactPath = (thread: string, id: string) => `rooms/${encodeURIComponent(thread)}/artifacts/${id}`
+    const response = await call('GET', artifactPath(room, valid.id))
+    expect(response).toMatchObject({ status: 200, bytes: Buffer.from('room artifact immutable bytes'), headers: {
+      'content-type': 'application/octet-stream', 'content-length': String(valid.size), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'content-disposition': `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(valid.name)}`,
+    } })
+    expect(await call('GET', artifactPath(room, pending.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(otherRoom, valid.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(room, wrongTicket.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(room, valid.id), undefined, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
+
+    const original = store.settings.bind(store)
+    store.settings = () => SettingsSchema.parse({ ...original(), policy: { ...original().policy, sources: { web: { allowed: [] } } } })
+    try { expect(await call('GET', artifactPath(room, valid.id))).toMatchObject({ status: 409 }) }
+    finally { store.settings = original }
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
+})
+
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {
   const saves: unknown[] = []
   const call = serve({

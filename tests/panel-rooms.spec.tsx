@@ -17,6 +17,7 @@ it('opens Rooms by default in personal mode and shows Router, multiple Workers, 
   expect(text()).toContain('测试 Worker')
   expect(text()).toContain('发给 Router')
   expect(text()).toContain('线程协作消息')
+  expect(text()).toContain('下载 任务群验收结果.zip')
   expect(text()).not.toContain('PASS 3 tests')
   expect(server.requests.some(request => request.path.includes('workers/worker-alpha-1234/activity'))).toBe(false)
 
@@ -29,7 +30,7 @@ it('opens Rooms by default in personal mode and shows Router, multiple Workers, 
   await click(zh['room.showDetails'])
   await click(zh['room.showDetails'])
   expect(text()).toContain('仅处理面板样式与交互。')
-  expect(all('[data-message-id]')).toHaveLength(4)
+  expect(all('[data-message-id]')).toHaveLength(5)
 })
 
 it('labels a new message for Router by default and sends a selected Worker message only to that Worker', async () => {
@@ -88,6 +89,8 @@ it('supports a deep-linked room route', async () => {
   server.setup.machine.mode = 'personal'
   await mount()
   expect(document.querySelector('[data-message-id="room-m1"]')).not.toBeNull()
+  await click(zh['room.openTaskConversation'])
+  expect(server.requests.some(request => request.path === 'web/tasks/demo')).toBe(true)
 })
 
 it('refreshes the room list without discarding the existing paged rooms', async () => {

@@ -1,10 +1,14 @@
-/** Authenticated downloads for files delivered into a personal task conversation. */
+/** Authenticated downloads for files delivered into a personal task conversation or task room. */
 import { useEffect, useRef, useState } from 'react'
 import { Button } from './controls.tsx'
 import { usePanel } from './provider.tsx'
 import { errorText } from './text.ts'
 
-export function ArtifactDownload({ conversation, artifact }: { conversation: string; artifact: { id: string; name: string; size: number } }) {
+type Artifact = { id: string; name: string; size: number }
+type ArtifactDownloadProps = { artifact: Artifact } & (
+  { conversation: string; room?: never } | { room: string; conversation?: never }
+)
+export function ArtifactDownload({ conversation, room, artifact }: ArtifactDownloadProps) {
   const { t } = usePanel()
   const [busy, setBusy] = useState(false), [failure, setFailure] = useState('')
   const pending = useRef<AbortController>()
@@ -14,7 +18,10 @@ export function ArtifactDownload({ conversation, artifact }: { conversation: str
     const controller = pending.current = new AbortController()
     setBusy(true); setFailure('')
     try {
-      const response = await fetch(`/orchestrator/api/web/tasks/${encodeURIComponent(conversation)}/artifacts/${encodeURIComponent(artifact.id)}`, {
+      const endpoint = room
+        ? `/orchestrator/api/rooms/${encodeURIComponent(room)}/artifacts/${encodeURIComponent(artifact.id)}`
+        : `/orchestrator/api/web/tasks/${encodeURIComponent(conversation!)}/artifacts/${encodeURIComponent(artifact.id)}`
+      const response = await fetch(endpoint, {
         headers: { 'x-orchestrator-request': '1' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]) })
       if (!response.ok) {
         const detail = await response.json().catch(() => ({})) as { error?: string }

@@ -183,7 +183,14 @@ export function webSource(store: Store, personal: () => boolean, artifacts?: Pic
       send: async (_host, message) => {
         if (!authorized()) return 'gone'
         // The durable outbox/room journal is the delivery surface for owner messages on non-Web task rooms too.
-        if (message.channel.address.room) return store.threads.get(message.channel.address.room) ? 'sent' : 'gone'
+        if (message.channel.address.room) {
+          if (!store.threads.get(message.channel.address.room)) return 'gone'
+          for (const id of [...new Set(message.artifacts ?? [])]) {
+            if (!message.ticketId || !artifacts) throw new Error('Room artifact delivery requires its originating ticket and registry')
+            await artifacts.verify(id, message.ticketId)
+          }
+          return authorized() && store.threads.get(message.channel.address.room) ? 'sent' : 'gone'
+        }
         const taskId = message.channel.address.conversation ?? ''
         const task = store.get(taskKey(taskId))
         if (!task) return 'gone'

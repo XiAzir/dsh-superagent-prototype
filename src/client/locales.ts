@@ -125,6 +125,7 @@ const TEXT = {
   'webTask.title': ['个人任务', 'Personal tasks'],
   'room.title': ['任务群', 'Task rooms'],
   'room.view': ['查看任务群', 'View task room'],
+  'room.openTaskConversation': ['原任务对话', 'Original task conversation'],
   'room.untitled': ['未命名任务群', 'Untitled task room'],
   'room.list': ['任务群列表', 'Task rooms'],
   'room.listEmpty': ['还没有任务群。创建一个新任务后，这里会显示 Router 与 Worker 的协作记录。', 'No task rooms yet. Create a task to see Router and Worker activity here.'],

@@ -49,3 +49,21 @@ it('shows a download refusal next to the button and lets the person retry', asyn
   expect(container!.querySelector('[role="alert"]')?.textContent).toBe('Web 账号授权已关闭')
   expect(button.disabled).toBe(false)
 })
+
+it('downloads a task-room artifact from the room-scoped endpoint', async () => {
+  const fetcher = vi.fn(async (url: string) => url.includes('/artifacts/') ? new Response('room file bytes')
+    : new Response('{"load":{"running":0}}'))
+  vi.stubGlobal('fetch', fetcher)
+  const create = vi.fn(() => 'blob:room-artifact'), revoke = vi.fn()
+  vi.stubGlobal('URL', class extends URL { static createObjectURL = create; static revokeObjectURL = revoke })
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {})
+  container = document.createElement('div'); document.body.append(container)
+  root = createRoot(container)
+  await act(async () => root!.render(<PanelProvider t={translator(zh)}><ArtifactDownload room="web:project/1"
+    artifact={{ id: 'artifact/a', name: '验收结果.zip', size: 2048 }} /></PanelProvider>))
+  await act(async () => container!.querySelector('button')!.click())
+  expect(fetcher).toHaveBeenCalledWith('/orchestrator/api/rooms/web%3Aproject%2F1/artifacts/artifact%2Fa',
+    expect.objectContaining({ headers: { 'x-orchestrator-request': '1' } }))
+  expect(create).toHaveBeenCalledTimes(1)
+  expect(container!.querySelector('[role="alert"]')).toBeNull()
+})

@@ -176,6 +176,7 @@ function routes(runtime: HttpHost): Routes {
   const { store } = runtime
   const rooms = () => new TaskRooms({ store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
     configured: () => runtime.configured(), requestPass: () => runtime.requestPass(),
+    artifacts: runtime.artifacts,
     ...runtime.inspectWorker ? { inspectWorker: (id: string) => runtime.inspectWorker!(id) } : {} })
   const web = () => {
     const failures = runtime.sessions?.status?.().failures ?? []
@@ -330,19 +331,24 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       try {
         await runtime.ready
         const artifactRoute = /^\/orchestrator\/api\/web\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
-        if (artifactRoute) {
+        const roomArtifactRoute = /^\/orchestrator\/api\/rooms\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
+        if (artifactRoute || roomArtifactRoute) {
           if (req.method !== 'GET') throw new RouteError(404, 'Unknown operation')
-          const conversation = decoded(artifactRoute[1]!)
-          const id = decoded(artifactRoute[2]!)
+          const matched = (artifactRoute ?? roomArtifactRoute)!
+          const conversation = decoded(matched[1]!)
+          const id = decoded(matched[2]!)
           const tasks = new WebTasks({ store: runtime.store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
             health: () => runtime.health, artifacts: runtime.artifacts,
             receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() } })
-          const artifact = await tasks.artifact(conversation, id)
+          const rooms = new TaskRooms({ store: runtime.store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
+            configured: () => runtime.configured(), requestPass: () => runtime.requestPass(), artifacts: runtime.artifacts })
+          const readArtifact = () => roomArtifactRoute ? rooms.artifact(conversation, id) : tasks.artifact(conversation, id)
+          const artifact = await readArtifact()
           if (artifact.size > MAX_WEB_ARTIFACT_BYTES) throw new RouteError(404, 'Delivered artifact exceeds the download limit')
           const bytes = await readFile(artifact.path)
           if (bytes.byteLength !== artifact.size || bytes.byteLength > MAX_WEB_ARTIFACT_BYTES
             || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw new Error('Artifact spool content changed during Web delivery')
-          const current = await tasks.artifact(conversation, id)
+          const current = await readArtifact()
           if (current.ticketId !== artifact.ticketId || current.size !== artifact.size || current.sha256 !== artifact.sha256) {
             throw new WebTaskError(404, '交付文件不存在。')
           }
