@@ -31,6 +31,8 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 30
 MAX_REQUEST_THREADS = 32
 OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+COOKIE_PAIR_RE = re.compile(r"^dsh-auth-[A-Za-z0-9_-]{43}=[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$")
+MAX_WEB_COOKIE_BYTES = 4096
 
 
 def _default_validator(path: Path) -> dict[str, Any]:
@@ -228,7 +230,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
         if not path.startswith(BASE_PREFIX + "/"):
             return None
         suffix = path[len(BASE_PREFIX) :]
-        return suffix if suffix in ("/health", "/status", "/lease", "/heartbeat", "/release", "/backup") else None
+        return suffix if suffix in ("/health", "/status", "/lease", "/heartbeat", "/release", "/backup", "/web-session") else None
 
     def _read_json(self) -> dict[str, Any] | None:
         if self.headers.get("Transfer-Encoding"):
@@ -378,10 +380,13 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             return
+        if route == "/web-session":
+            self._reply(405, {"error": "method not allowed"})
+            return
 
     def do_POST(self) -> None:  # noqa: N802
         route = self._route()
-        if route not in ("/lease", "/heartbeat", "/release"):
+        if route not in ("/lease", "/heartbeat", "/release", "/web-session"):
             self._reply(404, {"error": "not found"})
             return
         if not self._authorized():
@@ -393,6 +398,26 @@ class ArchiveHandler(BaseHTTPRequestHandler):
         if owner is None:
             self._reply(400, {"error": "invalid owner"})
             return
+        if route == "/web-session":
+            cookie = payload.get("cookie")
+            try:
+                cookie_bytes = cookie.encode("utf-8") if isinstance(cookie, str) else b""
+            except UnicodeEncodeError:
+                cookie_bytes = b""
+            if not isinstance(cookie, str) or len(cookie_bytes) > MAX_WEB_COOKIE_BYTES or not COOKIE_PAIR_RE.fullmatch(cookie):
+                self._reply(400, {"error": "invalid web session"})
+                return
+            now = time.time()
+            with self.server.lock:
+                state = self.server.state()
+                lease = self.server.active_lease(state, now)
+                if not lease or lease.get("owner") != owner:
+                    self._reply(409, {"error": "active lease required"})
+                    return
+                state["web_session"] = {"owner": owner, "cookie": cookie, "updated_at": now}
+                self.server.save_state(state)
+            self._reply(200, {"ok": True})
+            return
         now = time.time()
         with self.server.lock:
             state = self.server.state()
@@ -403,6 +428,8 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                     return
                 acquired_at = lease.get("acquired_at", now) if lease and lease.get("owner") == owner else now
                 state["lease"] = {"owner": owner, "acquired_at": acquired_at, "expires_at": now + LEASE_SECONDS}
+                if not lease or lease.get("owner") != owner:
+                    state.pop("web_session", None)
                 if not lease or (state.get("heartbeat") or {}).get("owner") != owner:
                     if state.get("intentional_paused") is not True:
                         state["heartbeat"] = None
@@ -418,6 +445,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
                     self._reply(400, {"error": "paused must be boolean"})
                     return
                 state["lease"] = None
+                state.pop("web_session", None)
                 state["intentional_paused"] = paused
                 state["heartbeat"] = (
                     {"owner": owner, "at": now, "healthy": False, "paused": True, "released": True}

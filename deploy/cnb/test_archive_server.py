@@ -122,6 +122,48 @@ class ArchiveServerTests(unittest.TestCase):
         self.assertEqual(self.post("/release", {"owner": "build-a"})[0], 409)
         self.assertEqual(self.post("/release", {"owner": "build-b"})[0], 200)
 
+    def test_web_session_is_private_owner_fenced_and_cleared_on_owner_change(self) -> None:
+        cookie = "dsh-auth-" + "A" * 43 + "=private-value"
+        self.assertEqual(self.post("/web-session", {"owner": "build-a", "cookie": cookie})[0], 409)
+        self.assertEqual(self.post("/lease", {"owner": "build-a"})[0], 200)
+        self.assertEqual(self.post("/web-session", {"owner": "build-a", "cookie": cookie})[0], 200)
+        saved = self.server.state()["web_session"]
+        self.assertEqual(saved["owner"], "build-a")
+        self.assertEqual(saved["cookie"], cookie)
+        self.assertIsInstance(saved["updated_at"], (int, float))
+
+        # Same-owner lease renewal retains the session, while status and health never return it.
+        self.assertEqual(self.post("/lease", {"owner": "build-a"})[0], 200)
+        self.assertEqual(self.server.state()["web_session"]["cookie"], cookie)
+        for route in ("/status", "/health"):
+            code, body, _ = self.request("GET", route)
+            self.assertEqual(code, 200)
+            self.assertNotIn(cookie.encode(), body)
+            self.assertNotIn(b"web_session", body)
+
+        self.assertEqual(self.post("/web-session", {"owner": "build-b", "cookie": cookie})[0], 409)
+        state = self.server.state()
+        state["lease"]["expires_at"] = time.time() - 1
+        self.server.save_state(state)
+        self.assertEqual(self.post("/web-session", {"owner": "build-a", "cookie": cookie})[0], 409)
+        self.assertEqual(self.post("/lease", {"owner": "build-b"})[0], 200)
+        self.assertNotIn("web_session", self.server.state())
+        self.assertEqual(self.post("/web-session", {"owner": "build-b", "cookie": cookie})[0], 200)
+        self.assertEqual(self.post("/release", {"owner": "build-b"})[0], 200)
+        self.assertNotIn("web_session", self.server.state())
+
+    def test_web_session_rejects_invalid_cookie_without_echoing_it(self) -> None:
+        self.post("/lease", {"owner": "build-a"})
+        for cookie in ("a=b; other=c", "a=b\r\nInjected: x", "a=two words", "", "dsh-auth-" + "A" * 43 + "=" + "x" * 4096):
+            code, body, _ = self.request("POST", "/web-session", {"owner": "build-a", "cookie": cookie})
+            self.assertIn(code, (400, 413))
+            if cookie:
+                self.assertNotIn(cookie.encode(), body)
+        self.assertNotIn("web_session", self.server.state())
+        boundary_cookie = "dsh-auth-" + "A" * 43 + "=" + "x" * (4096 - len("dsh-auth-" + "A" * 43 + "="))
+        self.assertEqual(self.post("/web-session", {"owner": "build-a", "cookie": boundary_cookie})[0], 200)
+        self.assertEqual(len(self.server.state()["web_session"]["cookie"].encode()), 4096)
+
     def test_watchdog_health_bootstrap_heartbeat_timeout_and_pause(self) -> None:
         self.assertEqual(self.post("/lease", {"owner": "build-a"})[0], 200)
         code, body, _ = self.request("GET", "/health", auth=False)
