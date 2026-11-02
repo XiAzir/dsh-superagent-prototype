@@ -474,6 +474,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/service-windows.spec.ts` | Native Windows service management with fixture processes |
 | `tests/private-directory.spec.ts` | Native state-directory permissions and inherited Windows file access |
 | `tests/windows-config.spec.ts` | Windows execution paths and reserved command-name protection |
+| `tests/linux-setup.spec.ts` | Linux profile creation, YAML path encoding and preservation of existing configuration |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx`, `panel-qq.spec.tsx` | The settings groups, drafts and history, the prompts, Deployment, search, glossary, route memory, and QQ status and token controls |

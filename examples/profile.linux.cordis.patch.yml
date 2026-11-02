@@ -1,0 +1,10 @@
+# Example Linux personal-mode profile configuration.
+# Replace the stateDir with an absolute path on persistent storage if needed.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 3082
+- id: dsh-superagent
+  config:
+    mode: personal
+    stateDir: "/home/your-user/.local/share/dsh-superagent/state"

@@ -4,7 +4,8 @@ This fork adds **personal mode, a Web task inbox, Windows support, and a NapCat-
 upstream research prototype. Repository mode remains available. Personal mode runs
 with a model and a local execution environment, and accepts tasks directly from
 the DSH Web panel. See [Personal mode](docs/personal.md) and
-[Windows setup](docs/windows.md).
+[Windows setup](docs/windows.md). The `linux` branch carries the same features with
+[Linux and CNB setup](docs/linux.md), a reproducible development image and Linux CI.
 
 This fork also includes QQ file and visual-media input, immutable task artifacts,
 Router status replies, semantic QQ task routing and an external Watchdog. See
@@ -24,7 +25,7 @@ It is also a way of working with an agent: **take as little human attention as p
 
 This local checkout includes Windows compatibility maintenance. See
 [Windows setup](docs/windows.md) for PowerShell 7, native service management and
-the dedicated-profile workflow. The original Unix deployment remains available.
+the dedicated-profile workflow. See [Linux and CNB setup](docs/linux.md) for the maintained Linux deployment.
 
 QQ can be connected through NapCat's OneBot v11 WebSocket interface. See
 [QQ through NapCat](docs/qq-napcat.md) for installation, connection modes,
