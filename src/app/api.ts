@@ -8,6 +8,10 @@ import type { SettingsView } from './views/settings.ts'
 import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
+import type { WebTaskSummary, WebTaskView } from './web-tasks.ts'
+import type { QqStatus } from './qq-source.ts'
+import type { ScheduleConfig, ScheduleItem, ScheduleList } from './schedules.ts'
+import type { TaskRoomSummary, TaskRoomView, RoomActivity } from './task-rooms.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -18,7 +22,27 @@ interface Paged { offset?: number; limit?: number }
 type Delivery = 'injected' | 'pending'
 
 export interface Api {
+  'GET rooms': { query?: Paged; response: { items: TaskRoomSummary[]; next_offset: number | null } }
+  'GET rooms/:key': { query?: { before?: string; limit?: number }; response: TaskRoomView }
+  'POST rooms/:key/messages': { body: { text: string; requestId: string; recipient?: string }; response: TaskRoomView }
+  'GET rooms/:key/workers/:ticketId/activity': { query?: Paged; response: RoomActivity }
+  'GET schedules': { response: ScheduleList }
+  'POST schedules': { body: { config: ScheduleConfig }; response: { item: ScheduleItem } }
+  'PUT schedules/:id': { body: { revision: number; config: ScheduleConfig }; response: { item: ScheduleItem } }
+  'POST schedules/:id/run': { response: { status: 'queued' | 'running'; item: ScheduleItem } }
+  'DELETE schedules/:id': { body: { revision: number }; response: { removed: true } }
+  'GET qq/status': { response: QqStatus }
+  'PUT qq/token': { body: { value: string }; response: { configured: boolean } }
+  'GET web/tasks': { query?: Paged; response: { items: WebTaskSummary[]; next_offset: number | null } }
+  'GET web/tasks/:id': { response: WebTaskView }
+  'POST web/tasks': { body: { text: string; requestId: string }; response: WebTaskView }
+  'POST web/tasks/:id/messages': { body: { text: string; requestId: string }; response: WebTaskView }
   'GET state': { response: StateView }
+  /** Bounded diagnostic projection for the external Watchdog process; contains no source message bodies or environment values. */
+  'GET watchdog/snapshot': { query?: { offset?: number; limit?: number; candidateAfterMs?: number };
+    response: import('./watchdog.ts').WatchdogSnapshot & { baseline: ReturnType<typeof import('./watchdog.ts').baselineAssessment> } }
+  /** Ask an explicitly waiting worker for a status report; other ticket states are unchanged. */
+  'POST watchdog/tickets/:id/request-status': { response: { requested: boolean } }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }
   'GET sources': { response: SourceStatusView[] }

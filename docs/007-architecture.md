@@ -38,7 +38,7 @@ Shutdown cancels turns, waits for passes, effects and agents, restores the proce
 | --- | --- | --- |
 | Setup | `src/app/setup.ts` | Resolves the repository and the accounts by probing their CLIs the way worker shells run them, writes and applies the workers' environment and command shims, and keeps the setup problems; Settings checks a changed account through it, and restarts through it, which runs setup again |
 | Passes | `src/app/passes.ts` | One pass at a time, every two seconds and whenever a command asks: the due effects, then `Engine.evaluateDue`; a Source's Trigger reaches the Engine through it |
-| Outbox | `src/app/outbox.ts` | The Engine's `Outbox` port, and the only writer of the receipts: `send` keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
+| Outbox | `src/app/outbox.ts` | The Engine's `Outbox` port, and the only writer of the receipts: `send` keeps a message's receipt and queues its `reply` effect in one transaction; delivery runs across up to four lanes, preserves FIFO for each ticket/conversation/lane, and reserves one slot for interactive status replies; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
 | Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
 
 ### Engine
@@ -156,7 +156,7 @@ Its interfaces are grouped by purpose:
 - **Read queries:** `read` serves views, tools and Source polls through methods such as `threadTriggers`, `triggerStats`, `search` and `droppedReplies`. These methods never write.
 - **Source metadata:** `threads.describe` and `threads.patchMeta` update Source-owned Thread metadata.
 - **Settings:** `settings`, `saveSettings`, `blockRevision` and `settingsHistory`. Settings and prompts use numbered `Versions` (`src/app/versions.ts`).
-- **Outbox receipts:** `replyStatus` and `receipts`, written only by Outbox. Receipt operations are `get`, `waiting`, `behind`, `add`, `settle` and `withdraw`. `behind` checks whether an earlier message for the same Ticket and conversation is waiting with fewer than three failures. A withdrawn message settles with `channelGone` or `channelIgnored`. Read queries expose failed and dropped replies through `failingReplies`, `droppedReplies` and `droppedSince`.
+- **Outbox receipts:** `replyStatus` and `receipts`, written only by Outbox. Receipt operations are `get`, `waiting`, `behind`, `add`, `settle` and `withdraw`. `orchestrator_reply` returns the persistent `receipt_id` and current status as soon as the receipt is queued; `orchestrator_read receipt/<id>` reads its final outcome. `behind` checks an earlier message for the same Ticket, conversation and delivery lane below three failures. Normal results preserve each ticket's conversation order; interactive status replies have a separate lane and reserved slot so slow attachments leave room for status responses. A withdrawn message settles with `channelGone` or `channelIgnored`. Read queries expose failed and dropped replies through `failingReplies`, `droppedReplies` and `droppedSince`.
 - **Typed key-value records:** `get`, `set`, `delete` and `keys`, using entries from `KV`.
 
 `afterCommit` runs an action only after the transaction commits, never after rollback. Runtime reads records in their stored shape; the schema 11 migration converts older supported records at startup.
@@ -185,6 +185,8 @@ Each kind has a health entry under its name. It reports an error once one of its
 Sources extend the host through `SourceKind`, defined in `src/sources/kind.ts`. A kind declares its identity, title, description, configuration `schema` and `fields`, derived `facts`, and `health` entries. Optional behavior includes `scope`, a `channel` (`allowed`, `send`, `link`), `threadContext`, `find`, `policy`, `environment` and `refreshLabels`.
 
 `SourceRegistry` (`registry.ts`) owns registered kinds and stored instances, and implements the Engine's `SourceScope`. Registration claims health entries on `HealthBoard`; duplicate claims and reserved `sync:` names are refused. A SourceContext writes only through its registration's claimed entries, so reports after unregistration do nothing.
+
+The QQ Source uses NapCat's OneBot v11 WebSocket connection. `src/app/qq-source.ts` owns its lifecycle and credential-backed connection status, while `src/sources/onebot-client.ts` handles the WebSocket transport and `src/sources/onebot-message.ts` normalizes OneBot events into QQ messages and replies. `src/app/qq-threads.ts` owns persisted QQ message-to-Thread correlations.
 
 Registry configuration methods include `kind`, `instances`, `instance`, `validate`, `validatePolicy`, `policyPart`, `channelAllowed`, `declarations`, `environments`, `find` and `scope`. `find` asks each kind that supports search.
 
@@ -238,7 +240,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 Each model request binds the Session to the current prompt revision. The revisions it used are stored durably: `promptVersion` identifies the active one and `mayRead` restricts which versions a worker can inspect. Registrations are tracked in one map per agent.
 
-`status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state.
+`status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state. `status().failures` lists the latest run failure of each managed main or worker Session with its id, sanitized message and time; event history restores it after reload, and the next turn clears it.
 
 ### Glue
 
@@ -329,7 +331,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
-| `src/app/sessions.ts` | Sessions |
+| `src/app/sessions.ts` | Sessions: managed Session lifecycle, prompt/tool installation, and `status().failures` for the latest run error of each main or worker Session |
+| `src/app/session-failures.ts` | Projects durable `turn/start` and `turn/end` events into one recoverable latest failure per managed Session; sanitizes exposed messages |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -343,7 +346,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
-| `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
+| `src/app/qq-source.ts` | QQ Source connection lifecycle and credential-backed status |
+| `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
+| `src/app/artifacts.ts` | Immutable ticket-scoped deliverable snapshots and digest verification |
+| `src/app/watchdog.ts` | Bounded task and infrastructure snapshots for an independent external control loop |
+| `src/app/schedules.ts` | Persistent local command schedules, revision guards, coalesced timer occurrences and Runtime-owned cancellation |
+| `src/client/artifacts.tsx` | Authorized personal-task file downloads with busy state and retryable errors |
+| `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
+| `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
+| `src/app/task-rooms.ts` | Owner-visible task-room projections, targeted human input and paginated execution details |
+| `src/app/room-journal.ts` | Transactional indexed room history, report revisions and current/historical membership |
+| `src/app/api.ts` | `Api`, including `GET qq/status` and `PUT qq/token`, every route's parameters, query, body and response, and the list filters; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
@@ -356,11 +369,20 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
+| `src/infra/platform.ts` | Native path, argument and environment adapters for Windows and Unix |
+| `src/infra/private-directory.ts` | Protect the state directory with Unix modes or a Windows owner-only inheritable DACL |
+| `src/infra/http-compat.ts` | Opt-in CNB SSH transport adapter: one HTTP request per socket while preserving WebSocket upgrades |
+| `src/infra/persistent-path.ts` | Opt-in CNB storage coverage checks for state, worker and schedule directories, including cache exclusions and symlink ancestors |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
+| `src/sources/onebot-client.ts` | OneBot v11 forward and reverse WebSocket clients, connection lifecycle, and outbound requests |
+| `src/sources/onebot-message.ts` | OneBot v11 event decoding, QQ message segments, attachment markers, and message normalization |
+| `src/sources/qq-attachments.ts` | Bounded credential-backed NapCat attachment resolution and byte transfer |
+| `src/sources/qq-media.ts` | Image modality checks and bounded timestamped video frames for model-visible media |
+| `src/infra/credential-guard.ts` | Worker CLI argv guard against credential export and account changes |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
@@ -376,13 +398,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
+| `src/client/personal.tsx` | Personal-mode Web task creation, conversation history, follow-ups and related Ticket results |
+| `src/client/rooms.tsx` | Group-style task supervision, recipients, live message pagination and lazy execution details |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
+| `src/client/qq.tsx` | QQ connection status, NapCat setup guidance, and separate token controls embedded in the Source card |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
+| `src/client/schedules.tsx` | Local scheduled-command forms, revisions, enable/disable, manual runs and execution summaries |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
 | `src/client/prompt-config.ts` | The prompt configuration by section, by the team sections, skill names, built-in parts (`part/<key>`, with `withOverride`) and part headings the prompt views give, and the line diff of the full prompt, as pure functions |
@@ -410,6 +436,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+| `tests/onebot-client.spec.ts`, `tests/onebot-message.spec.ts` | OneBot v11 connection behavior and normalized QQ events, replies, and attachment metadata |
+| `tests/qq-source.spec.ts` | QQ admission, source policy, reply delivery, credentials, and the live connection lifecycle |
+| `tests/qq-attachments.spec.ts` | NapCat file resolution, download limits, cancellation and source validation |
+| `tests/qq-media.spec.ts` | Image input capability and real FFmpeg frame extraction with media limits |
+| `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
+| `tests/watchdog.spec.ts` | Independent process monitoring, assessor input, quiet reports and bounded recovery |
+| `tests/schedules.spec.ts` | Scheduled command validation, persistence, serial execution, timeout, pause, restart and stale-result isolation |
+| `tests/panel-schedules.spec.tsx` | Scheduled-command creation, edits, revision conflicts, execution controls and confirmed deletion |
+| `tests/panel-artifacts.spec.tsx` | Web download authorization header, filename, busy state and refusal feedback |
+| `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
@@ -420,13 +456,21 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cache.spec.ts` | `TextCache` |
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
+| `tests/conversational-status.spec.ts` | Router-first conversations: read-only status for working/completed/stopped tickets, requester access, mixed requests and attachment retries |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
+| `tests/session-failures.spec.ts` | Durable Session failure restoration, clearing on a later turn, live updates, credential redaction and message length limits |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
+| `tests/http-compat.spec.ts` | CNB no-reuse opt-in, guarded disposal, host compatibility checks, real HTTP connection closure and WebSocket upgrades |
+| `tests/web-tasks.spec.ts` | Personal Web task admission, idempotency, Engine intake, persistent conversation history, pagination and reply delivery |
+| `tests/core-collaboration.spec.ts` | Directed input, subscription collaboration, peer delegation and durable deduplication |
+| `tests/collaboration-tools.spec.ts` | Runtime collaboration tools and per-recipient resource visibility |
+| `tests/task-rooms.spec.ts` | Room journal persistence, message routing, report history and execution detail authorization |
+| `tests/panel-rooms.spec.tsx` | Room UI, live pagination, recipients, safe retries and lazy execution records |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
@@ -437,9 +481,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
+| `tests/service-windows.spec.ts` | Native Windows service management with fixture processes |
+| `tests/private-directory.spec.ts` | Native state-directory permissions and inherited Windows file access |
+| `tests/persistent-path.spec.ts` | CNB archived-path containment, future directories, generated caches, symlink buckets and unchanged non-CNB behavior |
+| `tests/windows-config.spec.ts` | Windows execution paths and reserved command-name protection |
+| `tests/linux-setup.spec.ts` | Linux profile creation, YAML path encoding and preservation of existing configuration |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
-| `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
+| `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx`, `panel-qq.spec.tsx` | The settings groups, drafts and history, the prompts, Deployment, search, glossary, route memory, and QQ status and token controls |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
@@ -504,15 +553,13 @@ The main Session has 14 application tools:
 
 Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
 
-The main Session also has DeepSeek Harness's `skill`, `bash`, `read`, `read_image`, `job_output`, `job_list` and `job_kill`. Avoiding code reads is a prompt rule, not a tool restriction.
+The main Session has DeepSeek Harness's `skill` and its registered application tools. Its preset includes no shell, filesystem or job tools; `Sessions` also refuses inherited work tools on a main Session, including one resumed under an older broader preset. Its application `orchestrator_read` tool reads managed resources.
 
 ### Presets and wait limits
 
-New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`). Shell commands and job waits return after 5 seconds. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
+New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`). It keeps time context, agent instructions, skills and compaction, with no task-execution plugins. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
 
-The `noWait` guard in `src/app/sessions.ts` refuses main-Session shell commands that invoke `sleep` at a command position, shell `timeoutMs` above 30 seconds, and `job_output` waits above 5 seconds. Reports and job results arrive automatically, so waiting only delays incoming candidates.
-
-Existing main Sessions on `standard` also need explicit timeouts for foreground commands and job waits; otherwise that preset's defaults hold the step for 60 and 30 seconds respectively. The host determines the current preset through `presetForSession`, falls back to the Session projection or header, and assumes `standard` if it cannot read the value.
+`Sessions` restricts inherited main-Session tools to `skill` and guards legacy Sessions against shell, filesystem, job, web and other worker tools. Registered `orchestrator_*` tools remain available, including `orchestrator_read`; Executor Sessions and their subagents retain the worker's tools and background-work behavior.
 
 ### Executor tools
 
@@ -603,7 +650,7 @@ Most built-in instructions live in `prompts/*.md`, with one sentence per line jo
 
 ## Configuration reload
 
-Every plugin configuration key except `stateDir` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
+Every plugin configuration key except `stateDir` is volatile and exposed through DeepSeek Harness's configuration form. The host fences writes by revision and persists them to `cordis.patch.yml`. Limits are read on use and apply in place. Each Superagent activation captures its operating mode; a committed `mode` change schedules a restart of that plugin through `loader/volatile-update`. The Deployment page merges the form's exposed fields over runtime machine values so older form projections retain the correct mode.
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

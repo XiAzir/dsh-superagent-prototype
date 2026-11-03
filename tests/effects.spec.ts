@@ -67,6 +67,18 @@ it('runs a kind oldest first, as many at once as its limit allows, and holds it 
   await effects.idle()
 })
 
+it('keeps grouped lanes FIFO, lets other lanes pass a long same-lane queue, and bounds concurrency', async () => {
+  const hold = deferred<void>()
+  const run = vi.fn(async (_payload: { text: string }, key: string) => { if (key === 'same-1') await hold.promise })
+  effects.handle('relay', run, { limit: () => 2, group: (_payload, key) => key.startsWith('same-') ? 'same' : key })
+  for (let index = 1; index <= 24; index++) effects.enqueue('relay', `same-${index}`, relay(String(index)))
+  effects.enqueue('relay', 'other', relay('other'))
+  await vi.waitFor(() => expect(run.mock.calls.map(([, key]) => key)).toEqual(['same-1', 'other']))
+  hold.resolve()
+  await effects.idle()
+  expect(run.mock.calls.slice(2).map(([, key]) => key)).toEqual(Array.from({ length: 23 }, (_, index) => `same-${index + 2}`))
+})
+
 it('keeps an effect\'s place in its queue when it is queued again with a new payload', async () => {
   const run = vi.fn(async (_payload: { ticketId: string; assignmentId: string }, _key: string) => {})
   let room = 0

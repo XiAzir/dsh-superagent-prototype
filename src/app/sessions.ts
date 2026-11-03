@@ -13,6 +13,7 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
+import { SessionFailures } from './session-failures.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
@@ -60,30 +61,10 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
-/** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
-const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
-  + 'end the turn instead of waiting for them.'
-/** What a main Session under `standard` is told when its command would wait the shell's default. */
-const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
-  + 'as a waiting step holds back new candidates.'
-/** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
-const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
-/**
- * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
- * job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
- * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
- * job wait its timeout; the router preset ends both after 5 seconds.
- */
-function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
-  const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
-  if (name === 'bash') {
-    const sleeps = typeof args.command === 'string' && SLEEP.test(args.command)
-    if (sleeps || typeof args.timeoutMs === 'number' && args.timeoutMs > 30_000) return NO_WAIT
-    if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
-  }
-  if (name === 'job_output' && args.wait === true && (typeof args.timeout_ms === 'number' ? args.timeout_ms > 5_000 : !routed())) return NO_WAIT
-  return undefined
-}
+/** Inherited work tools are refused for Routers, including Sessions created earlier with a broader preset. */
+const ROUTER_DENIED_TOOLS = new Set([...WORK_TOOLS.filter(name => name !== 'skill'), 'pwsh', 'ask_user_question', 'plugin_manager',
+  'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit'])
+const ROUTER_TOOL_REFUSAL = 'The main Session routes work through its orchestrator tools; Executor Sessions handle code, files, commands and other task execution.'
 
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
@@ -95,6 +76,7 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  private readonly failures = new SessionFailures()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -116,7 +98,13 @@ export class Sessions {
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
+      this.failures.observe(agent.id, event)
       this.updateModelHealth()
+    })
+    ctx.on('agent/error', ({ agent, error }) => {
+      const binding = this.bindings.get(agent)
+      if (!binding || binding.subagent) return
+      this.failures.failed(agent.id, error)
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
     // Opening a Session in DSH's Web UI before its first turn may select the default preset for it: select ours again. After
@@ -191,7 +179,7 @@ export class Sessions {
       const sessionId = name.slice(KV.sessions.prompts.prefix.length), revision = store.get(name)?.at(-1)
       return this.ctx.agents.get(sessionId as SessionId) && revision !== undefined ? [{ sessionId, revision }] : []
     })
-    return { revision: prompts.current().revision, sessions, notificationPending: effects.pending('notice', 'prompts') }
+    return { revision: prompts.current().revision, sessions, failures: this.failures.list(), notificationPending: effects.pending('notice', 'prompts') }
   }
   /** Returns the prompt version a Session runs under (the one bound on its latest model request, or the current version). */
   promptVersion(sessionId: string): PromptVersion {
@@ -202,14 +190,15 @@ export class Sessions {
   mayRead(sessionId: string, revision: number): boolean {
     return revision === this.promptVersion(sessionId).revision || (this.host.store.get(KV.sessions.prompts(sessionId)) ?? []).includes(revision)
   }
-  /** Returns a tool registrar for `agent` that renders tool output as JSON text and attaches `output.image` as an image when present. */
+  /** Returns a tool registrar that renders structured output and ordered single/multiple image references. */
   private registerTool(agent: Agent, binding: SessionBinding): RegisterTool {
     return (name, description, schema, execute) => {
       binding.disposers.push(agent.ctx.tools.register({ name, description, parameters: z.toJSONSchema(schema),
         output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => {
           const text = { type: 'text' as const, text: JSON.stringify(value) }
-          const image = value && typeof value === 'object' && 'image' in value ? (value as { image: never }).image : undefined
-          return image ? [text, { type: 'image' as const, attachment: image }] : [text]
+          const output = value && typeof value === 'object' ? value as { image?: never; images?: never[] } : undefined
+          const images = [...output?.image ? [output.image] : [], ...Array.isArray(output?.images) ? output.images : []]
+          return [text, ...images.slice(0, 8).map(attachment => ({ type: 'image' as const, attachment }))]
         } },
         execute: (args, execution) => execute(schema.parse(args), execution.signal) }))
     }
@@ -237,7 +226,9 @@ export class Sessions {
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
-    this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+    const events = agent.session.snapshotEvents()
+    this.retryHealth.restore(agent.id, events)
+    this.failures.restore(agent.id, events)
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
     this.updateModelHealth()
     // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
@@ -260,25 +251,14 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+      const parent = scopeParentOf(agent)
+      const allow = ['skill'].filter(name => agent.ctx.tools.get(name, parent))
+      binding.disposers.push(agent.ctx.tools.restrict({ allow }),
+        agent.ctx.tools.guard(({ name }) => ROUTER_DENIED_TOOLS.has(name) ? ROUTER_TOOL_REFUSAL : undefined))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
     }
-  }
-  /**
-   * Whether a Session runs the router preset: as DSH's preset registry last selected it, read through the session projection
-   * on a DSH whose registry has no `presetForSession`, else as it was created; `standard`, the safer caps, when unreadable.
-   */
-  private routed(agent: Agent): boolean {
-    try {
-      const presets = this.ctx.get('agentPresets') as { presetForSession?: (session: Agent['session']) => string | null } | undefined
-      const projections = this.ctx.get('sessionProjections') as { stateOf?: (session: Agent['session'], key: string) => unknown } | undefined
-      const selected = typeof presets?.presetForSession === 'function' ? presets.presetForSession(agent.session)
-        : projections?.stateOf?.(agent.session, 'agentPreset')
-      return (selected ?? agent.session.header.agentPreset) === ROUTER_PRESET
-    } catch { return false }
   }
   /**
    * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket

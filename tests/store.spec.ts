@@ -246,10 +246,11 @@ it('lists in the same order in SQLite and in memory, and undoes a failed nested 
   store.close()
 })
 
-it('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
+it('sets private Unix modes and keeps the database owner-writable on Windows (whose startup DACL controls access)', () => {
   const path = join(directory, 'state', 'orchestrator.sqlite')
   new Store(path).close()
-  expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
+  if (process.platform === 'win32') expect(statSync(path).mode & 0o600).toBe(0o600)
+  else expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
 })
 
 it('reads `%` and `_` in a key prefix and a search query as written, not as patterns', () => {

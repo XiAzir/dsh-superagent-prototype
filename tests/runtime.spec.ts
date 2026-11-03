@@ -3,7 +3,7 @@ import { bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
@@ -11,7 +11,6 @@ import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
-import { masterPrompt } from '../src/app/context.ts'
 import { reference, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
 import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
@@ -85,7 +84,9 @@ const OTHER = () => join(directory, 'other-gh')
 const BOT = () => join(directory, 'lark-bot')
 const HELPERS = 'git config -z --show-origin --get-all credential.https://github.com.helper'
 const SCOPED = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
-const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
+const PREPARE_SHELL = process.platform === 'win32' ? ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command'] : ['sh', '-c']
+const shimNames = (names: string[]) => names.flatMap(name => process.platform === 'win32' ? [`${name}.cmd`, `${name}.ps1`] : [name]).sort()
+const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; env?: Record<string, string> }) => {
   // Strip leading `env` and `KEY=VALUE` arguments before looking up the command response.
   const argv = [...spec.argv]
   while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -164,7 +165,8 @@ beforeEach(async () => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const preset = {}
-      const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
+      const inherited = ['bash', 'pwsh', 'read', 'write', 'edit', 'read_image', 'glob', 'skill', 'job_output', 'job_list', 'job_kill',
+        'grep', 'web_search', 'web_fetch', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent',
         'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
@@ -255,7 +257,7 @@ it('fans a person\'s later thread message out to the live worker as context and 
   expect(runtime.store.get(resource)).toBeUndefined()
   expect(runtime.store.tickets.get(ticket.id)!.inputs).toEqual([expect.objectContaining({ kind: 'trigger', triggerId: followup.id })])
   expect(relays(runtime.masterId)).toEqual([{ kind: 'follow_up', trigger_id: followup.id, from: 'ou_guest', thread: `feishu:${CHAT}:om_1`,
-    at: followup.at, text: '顺便看看日志', delivered_to: [{ ticket_id: ticket.id, title: '修复回归', state: 'working' }],
+    at: followup.at, text: '顺便看看日志', delivered_to: [{ ticket_id: ticket.id, title: '修复回归', state: 'working', read: `ticket/${ticket.id}` }],
       note: expect.stringContaining('worker has it and decides') }])
   expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_1`).map(decision => decision.triggerIds)).toEqual([[ticket.origin.triggerId]])
   expect(await runTool(sessionId, 'orchestrator_read', { resource: `trigger/${followup.id}` }))
@@ -314,7 +316,7 @@ it('accepts silently under a rule that says so, gives the worker the rule proced
   // Nothing left for a human: the ticket closes instead of waiting, and the rule's closing sentence can still be delivered.
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'dropped', summary: 'too complex; recorded in #123' })
   expect(runtime.store.tickets.get(ticket.id)).toMatchObject({ ended: expect.objectContaining({ by: 'executor', outcome: 'dropped' }) })
-  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '看到这个问题我试了一下，能复现，修复需要较大改动，已记在 #123。' })).toEqual({ status: 'sent' })
+  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '看到这个问题我试了一下，能复现，修复需要较大改动，已记在 #123。' })).toEqual({ receipt_id: expect.any(String), status: 'pending' })
 })
 
 it('records worker reports, binds the task PR, ends the ticket on ready without a PR, and relays attention', async () => {
@@ -326,7 +328,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(runtime.store.tickets.get(ticket.id)!.attention).toMatchObject({ question: 'Desktop too?' })
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_attention', ticket: { ticket_id: ticket.id, attention: { question: 'Desktop too?' } } })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'other', text: 'x' })).rejects.toThrow('current attention question')
-  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ status: 'sent' })
+  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ receipt_id: expect.any(String), status: 'pending' })
   await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42, human_action: null })
   const bound = runtime.store.tickets.get(ticket.id)!
   expect(pullOf(bound)).toBe(42)
@@ -335,7 +337,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed' })
   expect(runtime.store.tickets.get(ticket.id)!.ended).toBeUndefined()
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'ready' })
-  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '已提交 PR #42，待 review。' })).toEqual({ status: 'sent' })
+  expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '已提交 PR #42，待 review。' })).toEqual({ receipt_id: expect.any(String), status: 'pending' })
   const mergedAt = new Date().toISOString()
   const merged = { number: 42, state: 'closed', merged: true, merged_at: mergedAt, html_url: 'https://github.com/acme/widgets/pull/42',
     user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
@@ -840,6 +842,25 @@ it('waits for setup without the agent\'s GitHub CLI: the panel works, and nothin
   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(2))
 })
 
+it('starts personal mode without GitHub or Feishu accounts and seeds Web owner access', async () => {
+  answers[HELPERS] = ''
+  const next = await restart({ mode: 'personal' })
+  subprocess.spawn.mockClear()
+  await next.ready
+  expect(next.setupProblem).toBeUndefined()
+  expect(next.configured()).toBe(true)
+  expect(next.deployment).toMatchObject({ mode: 'personal' })
+  expect(next.deployment).not.toHaveProperty('repository')
+  expect(next.deployment).not.toHaveProperty('github')
+  expect(next.health.runtime).toMatchObject({ state: 'ready' })
+  const argv = subprocess.spawn.mock.calls.flatMap(([spec]) => [...spec.argv])
+  expect(argv).not.toContain(AGENT())
+  expect(argv).not.toContain(BOT())
+  expect(next.store.settings().sources.web).toEqual({ enabled: true, config: {} })
+  expect(next.store.settings().policy.sources.web).toMatchObject({ allowed: [{ id: 'owner', name: '我' }] })
+  expect(sections.get(next.masterId)?.text({})).toContain('For a simple question that needs no worker')
+})
+
 it('reports each setup problem where the operator fixes it, and checks the agent CLI the way worker shells run it', async () => {
   const needs = async (place: string, code: string, values: Record<string, string>, accounts: Accounts = {}) => {
     const next = await restart({}, accounts)
@@ -850,10 +871,9 @@ it('reports each setup problem where the operator fixes it, and checks the agent
   await needs('github', 'repositoryReadOnly', { account: 'agent-bot', repository: 'acme/widgets' })
   answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
   // The agent CLI runs in the workers' environment: without the shims on PATH.
-  const check = subprocess.spawn.mock.calls.map(([spec]) => spec.argv).find(argv => argv.includes(AGENT()))!
-  expect(check[0]).toBe('env')
-  expect(check[1]!.startsWith('PATH=')).toBe(true)
-  expect(check[1]!.slice('PATH='.length).split(':')).not.toContain(join(directory, 'worker-bin'))
+  const check = subprocess.spawn.mock.calls.map(([spec]) => spec).find(spec => spec.argv.includes(AGENT()))!
+  expect(check.argv[0]).toBe(AGENT())
+  expect(check.env?.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
   const valid = { ...answers }
   // git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the operator's configuration.
   answers = { ...valid, [HELPERS]: 'file:/home/me/.gitconfig\0!gh auth git-credential\0' }
@@ -967,27 +987,31 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   await broken.ready
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(join(directory, 'worker-bin'))
+  expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
-  expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
+  const windows = process.platform === 'win32'
+  const shim = (name: string) => readFileSync(join(bin, name + (windows ? '.ps1' : '')), 'utf8')
+  const shimValue = (value: string) => windows ? Buffer.from(value, 'utf16le').toString('base64') : value
+  expect(readdirSync(bin).sort()).toEqual(shimNames(['gh', 'lark-cli']))
+  expect(shim('lark-cli')).toContain(shimValue(BOT()))
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
-  expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
-  expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
-  expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
-  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${credentialHelper(AGENT())}"`)
+  expect(readdirSync(bin).sort()).toEqual(shimNames(['gh', 'lark-cli', 'personal-gh']))
+  expect(shim('personal-gh')).toContain(shimValue('personal-gh is blocked in this installation; use gh, which acts as agent-bot.'))
+  expect(shim('lark-cli')).toContain(shimValue('lark-cli is unavailable: this installation has no Feishu bot.'))
+  expect(shim('gh')).toContain(shimValue(AGENT()))
+  const escapedHelper = credentialHelper(AGENT()).replace(/[\\"]/g, char => `\\${char}`)
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${escapedHelper}"`)
   expect(process.env).toMatchObject({ GIT_CONFIG_GLOBAL: workerGitConfig(directory), GIT_CONFIG_NOSYSTEM: '1' })
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
-  expect(process.env.PATH?.split(':')[0]).toBe(bin)
+  expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
   await next.stop()
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(bin)
+  expect(process.env.PATH?.split(delimiter)).not.toContain(bin)
 })
 
 it('waits for setup when the shim directory holds a file dsh-superagent did not write, and leaves the file alone', async () => {
@@ -1004,9 +1028,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(shimNames(['gh', 'lark-cli', 'personal-gh']))
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(shimNames(['gh', 'lark-cli']))
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1078,17 +1102,18 @@ it('leaves auto-merge to the delivery requirements, with the agent\'s own gh and
 
 it('runs the prepare command once for a new ticket, under the execution root with the ticket\'s environment, and fails the ticket with its output', async () => {
   const prepare = (command: string) => runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: command } })
-  const runs = () => subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> }).filter(spec => spec.argv[0] === 'sh')
+  const shell = process.platform === 'win32' ? ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command'] : ['sh', '-c']
+  const runs = () => subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> }).filter(spec => spec.argv[0] === shell[0])
   prepare('git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"')
   const { ticket } = await acceptedTicket()
-  expect(runs()).toEqual([expect.objectContaining({ argv: ['sh', '-c', 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"'], cwd: join(directory, 'work'),
+  expect(runs()).toEqual([expect.objectContaining({ argv: [...shell, 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"'], cwd: join(directory, 'work'),
     env: expect.objectContaining({ DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_NAME: ticket.execution!.name, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'acme/widgets', DSH_SUPERAGENT_FEISHU_CHAT: CHAT }) })])
   // A retry reuses the prepared directory.
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'failed', summary: 'offline' })
   await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
   expect(runs()).toHaveLength(1)
-  answers['sh -c exit 3'] = new Error('fatal: no such clone')
+  answers[[...shell, 'exit 3'].join(' ')] = new Error('fatal: no such clone')
   prepare('exit 3')
   const failed = await acceptedTicket(feishu('9', '@bot 修一下标题'))
   await runtime.idle()
@@ -1491,68 +1516,25 @@ it('fails a ticket at once on a worker error that is not passing, and relays it'
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: ticket.id }, state: 'failed' })
 })
 
-it('refuses the main Session a bash command that runs sleep and a long job wait, as reports arrive by themselves, and no worker', async () => {
-  const bash = (command: string) => ({ name: 'bash', arguments: { command, description: 'x' } })
+it('removes task execution from the Router in new and legacy Sessions while preserving application routing tools and worker tools', async () => {
   const main = guards.get(runtime.masterId)!
-  for (const command of ['sleep 60; echo done', 'cd x && sleep 5', 'gh pr checks 7 || sleep 30', 'echo a\nsleep 90', 'while true; do sleep 30; done',
-    '(sleep 5)', '/bin/sleep 240', 'while sleep 30; do gh pr checks 7; done', 'if sleep 5; then gh pr view 7; fi', '{ sleep 60; }', '! sleep 5',
-    'nohup sleep 60', 'exec sleep 60', 'time sleep 60', 'until sleep 1; do :; done', 'command sleep 5', 'env sleep 5'])
-    expect(main(bash(command)), command).toMatch(/^Reports, follow_up notices, new candidates and a background job's end/)
-  // A command that names sleep as data, not at a command position, runs.
-  for (const command of ['gh api repos/acme/widgets/pulls', 'echo "sleep"', 'grep sleep file', 'sleeper --help', 'command -v sleep'])
-    expect(main(bash(command)), command).toBeUndefined()
-  // A command that asks to hold the step longer than 30 seconds, however it waits, under any preset.
-  const timed = (command: string, args: { timeoutMs?: number; run_in_background?: boolean } = {}) =>
-    ({ name: 'bash', arguments: { command, description: 'x', ...args } })
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 120_000 }))).toMatch(/^Reports/)
-  expect(main(timed("python3 -c 'import time;time.sleep(240)'", { timeoutMs: 600_000 }))).toMatch(/^Reports/)
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
-  // Under the router preset, the shell moves a command without a timeout to a background job after 5 seconds, and a job
-  // wait without one ends after 5 seconds too; a longer job wait waits for nothing that arrives that way.
-  expect(main(timed('gh pr checks 7 --watch'))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 30_000 } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j' } })).toBeUndefined()
-  // A main Session created before runs under standard, whose shell waits 60 seconds by default and whose job waits last 30:
-  // a command without a timeout runs in the background or names one, and a job wait names one.
-  ;(agents.get(runtime.masterId) as unknown as { session: { header: { agentPreset: string } } }).session.header = { agentPreset: 'standard' }
-  expect(main(timed('gh pr checks 7 --watch'))).toMatch(/^This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000/)
-  expect(main(timed('gh pr checks 7 --watch', { run_in_background: true }))).toBeUndefined()
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
-  // A worker waits for its own work as it needs.
-  const { sessionId } = await acceptedTicket()
-  expect(guards.get(sessionId)!(bash('sleep 60'))).toBeUndefined()
-  // The main Session's role says so.
-  expect(masterPrompt).toContain('Worker reports, follow_up notices, new candidates and a background job\'s end, with its output, arrive by themselves as messages')
-})
+  const taskTools = ['bash', 'pwsh', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'job_output', 'job_list', 'job_kill',
+    'web_search', 'web_fetch', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+  for (const name of taskTools) expect(main({ name, arguments: {} }), name).toMatch(/Executor.*handle/)
+  for (const name of ['orchestrator_read', 'orchestrator_route', 'skill']) expect(main({ name, arguments: {} }), name).toBeUndefined()
+  expect([...tools.get(runtime.masterId)!.keys()]).toContain('orchestrator_read')
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill'] }])
 
-it('reads the main Session\'s preset from a registry with or without presetForSession, and takes standard\'s caps when it cannot', async () => {
-  const watch = { name: 'bash', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
-  const route = { name: 'orchestrator_route', arguments: { decisions: [] } }
-  const guard = async (registry: Record<string, unknown>, projections?: Record<string, unknown>) => {
-    services.agentPresets = registry
-    if (projections) services.sessionProjections = projections; else delete services.sessionProjections
-    await (await restart()).ready
-    return guards.get(runtime.masterId)!
-  }
-  // A released DSH's registry has no presetForSession: the projection says standard, so standard's caps apply, and the
-  // other tools run.
-  let main = await guard({ select: vi.fn() }, { stateOf: vi.fn((_session: unknown, key: string) => key === 'agentPreset' ? 'standard' : undefined) })
-  expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-  // Without the projection either, the preset it was created with counts: the router preset.
-  main = await guard({ select: vi.fn() })
-  expect([main(route), main(watch)]).toEqual([undefined, undefined])
-  // The registry says standard though the Session was created with the router preset: standard's caps apply.
-  main = await guard({ select: vi.fn(), presetForSession: () => 'standard' })
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-  // A registry that fails is read as standard, the safer caps, and the guard does not throw.
-  main = await guard({ select: vi.fn(), presetForSession: () => { throw new Error('no projection') } })
-  expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
+  // Old main Sessions retain the guard even while their header still names standard.
+  ;(agents.get(runtime.masterId) as unknown as { session: { header: { agentPreset: string } } }).session.header = { agentPreset: 'standard' }
+  expect(main({ name: 'bash', arguments: { command: 'git status' } })).toMatch(/Executor.*handle/)
+  expect(main({ name: 'orchestrator_read', arguments: { resource: 'tickets' } })).toBeUndefined()
+
+  const { sessionId } = await acceptedTicket()
+  expect(guards.get(sessionId)!({ name: 'bash', arguments: { command: 'git status' } })).toBeUndefined()
+  expect(guards.get(sessionId)!()).toBeUndefined()
+  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill',
+    'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent'] }])
 })
 
 it('refuses an ended ticket\'s worker its tools, and restricts the main Session to the tools it may use', async () => {
@@ -1560,10 +1542,11 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill'] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
-  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill',
+    'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent'] }])
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {
@@ -1597,16 +1580,16 @@ it('runs a launch that fails for a passing reason again on the launch backoff th
     controller.resolveAgent.mockImplementation(original)
   }
   // A prepare command whose output names a passing failure is not run again on its own.
-  const runs = () => subprocess.spawn.mock.calls.filter(([spec]) => (spec as { argv: string[] }).argv[0] === 'sh').length
+  const runs = () => subprocess.spawn.mock.calls.filter(([spec]) => (spec as { argv: string[] }).argv[0] === PREPARE_SHELL[0]).length
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'exit 3' } })
-  answers['sh -c exit 3'] = new Error('fatal: unable to access: The requested URL returned error: 503')
+  answers[[...PREPARE_SHELL, 'exit 3'].join(' ')] = new Error('fatal: unable to access: The requested URL returned error: 503')
   const before = runs()
   const prepared = await acceptedTicket(feishu('40', '@bot 修 prepare', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(prepared.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('503') })
   expect(runs()).toBe(before + 1)
   // A retry runs the prepare command again, for the directory it left empty was removed; resuming relaunches no failed launch.
-  delete answers['sh -c exit 3']
+  delete answers[[...PREPARE_SHELL, 'exit 3'].join(' ')]
   runtime.executor.resume()
   await runtime.idle()
   expect(runs()).toBe(before + 1)
@@ -1618,12 +1601,12 @@ it('runs a launch that fails for a passing reason again on the launch backoff th
 
 it('launches a queued Assignment once when the host resumes, and gives a failed launch\'s slot back', async () => {
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, maxWorkers: 1, prepare: 'exit 3' } })
-  answers['sh -c exit 3'] = new Error('fatal: no such clone')
+  answers[[...PREPARE_SHELL, 'exit 3'].join(' ')] = new Error('fatal: no such clone')
   const failed = await acceptedTicket(feishu('50', '@bot 修 一', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(failed.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed' })
   // The failed launch holds no slot: the next ticket launches in the only one.
-  delete answers['sh -c exit 3']
+  delete answers[[...PREPARE_SHELL, 'exit 3'].join(' ')]
   const next = await acceptedTicket(feishu('51', '@bot 修 二', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(next.ticket.id)!.assignments.at(-1)).toMatchObject({ state: 'running' })
@@ -1717,7 +1700,8 @@ it('gives a subagent of a worker only the worker\'s work tools, and none once th
   const child = agents.get('child-1')! as unknown as { session: { header: { parentSession?: string } } }
   child.session.header = { parentSession: sessionId }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
-  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill',
+    'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent'] }])
   expect(guards.get('child-1')!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('child-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
@@ -1739,7 +1723,8 @@ it('gives a subagent of a worker\'s subagent the same work tools and guard', asy
     agent.session.header = { parentSession: parent }
     await created.parallel('agent/created', { agent } as never)
   }
-  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill',
+    'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent'] }])
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })

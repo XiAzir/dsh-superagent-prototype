@@ -24,6 +24,50 @@ it('opens the Decisions under Policy from the flow line with their reasons, Deci
   expect(server.requests.some(request => request.path === 'decisions?limit=30&kind=ignore')).toBe(true)
 })
 
+it('loads Decision pages past the 200 row host limit and keeps pages separate across filters', async () => {
+  server.decisions = Array.from({ length: 241 }, (_, index) => ({ ...server.decisions[0]!, id: `d${index}` }))
+  await mount()
+  await click(zh['tab.eval'])
+  for (let page = 1; page < 9; page++) await click(zh.loadMore)
+  expect(all('.dt-list > li')).toHaveLength(241)
+  expect(server.requests.some(request => request.path === 'decisions?limit=30&offset=210&kind=accept,reopen')).toBe(true)
+  await click(zh['decision.ignore'])
+  expect(all('.dt-list > li')).toHaveLength(0)
+  expect(server.requests.some(request => request.path === 'decisions?limit=30&kind=ignore')).toBe(true)
+})
+
+it('keeps Decision rows after a page request fails and retries from the same offset', async () => {
+  server.decisions = Array.from({ length: 31 }, (_, index) => ({ ...server.decisions[0]!, id: `retry-${index}` }))
+  await mount()
+  await click(zh['tab.eval'])
+  server.down = true
+  await click(zh.loadMore)
+  expect(all('.dt-list > li')).toHaveLength(30)
+  expect(find(zh.loadMore).getAttribute('aria-busy')).toBe('false')
+  server.down = false
+  await click(zh.loadMore)
+  expect(all('.dt-list > li')).toHaveLength(31)
+  expect(server.requests.filter(request => request.path.includes('offset=30')).length).toBe(1)
+})
+
+it('drops a delayed response when the filter leaves and returns to the same query', async () => {
+  const original = server.decisions[0]!
+  let release!: () => void
+  server.decisionDelay = new Promise<void>(resolve => { release = resolve })
+  server.decisions = [{ ...original, id: 'stale', preview: 'stale row' }]
+  await mount()
+  await act(async () => { tab(zh['tab.eval']).click() })
+  await act(async () => { find(zh['decisionFilter.stop']).click() })
+  server.decisions = [{ ...original, id: 'fresh', preview: 'fresh row' }]
+  await act(async () => { find(zh['decisionFilter.work']).click() })
+  release()
+  server.decisionDelay = undefined
+  await settle()
+  expect(all('.dt-list > li')).toHaveLength(1)
+  expect(text()).toContain('fresh row')
+  expect(text()).not.toContain('stale row')
+})
+
 it('keeps a Policy draft across remounts, and merges another save into it sender by sender and rule by rule', async () => {
   const addUser = async () => {
     await click(all('.dt-part button').find(button => button.textContent === '添加')!)

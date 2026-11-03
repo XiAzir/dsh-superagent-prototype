@@ -9,6 +9,7 @@ import { SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave }
 import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.ts'
 import { Versions } from './versions.ts'
 import { storeReads } from './store-read.ts'
+import { RoomJournal } from './room-journal.ts'
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
@@ -23,6 +24,8 @@ export interface SettingsVersion {
   revision: number; savedAt: string; source: SettingsOrigin | 'internal'; block?: SettingsSave
   policyVersion: string; policyChanged: boolean; notified: string[]; settings: Settings
 }
+/** Messages-free projection used to page the Web task list without loading conversation bodies. */
+export interface WebTaskIndexRecord { id: string; title: string; createdAt: string; updatedAt: string; lastUserAt: string }
 /**
  * Generated columns and partial indexes defining active working sets so passes scan only active rows.
  * Older databases missing a column get it added on open and populated by SQLite from stored JSON rows.
@@ -50,6 +53,7 @@ export { SCHEMA_VERSION }
  */
 export class Store implements Repositories {
   readonly db: DatabaseSync
+  readonly rooms: RoomJournal
   /**
    * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
    * @param report - Receives errors thrown by `afterCommit` callbacks without failing the committed transaction.
@@ -59,6 +63,7 @@ export class Store implements Repositories {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(path)
     this.read = storeReads(this.db)
+    this.rooms = new RoomJournal(this.db)
     try {
       chmodSync(path, 0o600)
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
@@ -75,6 +80,10 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS ticket (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decision (id TEXT PRIMARY KEY, thread TEXT NOT NULL, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS web_task_summary (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, last_user_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS web_task_ticket (web_task_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+              PRIMARY KEY (web_task_id, ticket_id));
             CREATE TABLE IF NOT EXISTS trigger_thread (thread TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, human INTEGER NOT NULL,
               PRIMARY KEY (thread, id));
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -84,9 +93,14 @@ export class Store implements Repositories {
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
+            CREATE INDEX IF NOT EXISTS web_task_summary_updated ON web_task_summary(updated_at DESC, id ASC);
+            CREATE INDEX IF NOT EXISTS web_task_ticket_ticket ON web_task_ticket(ticket_id, web_task_id);
           `)
+          this.rooms.setup()
           this.addColumns()
+          this.backfillWebTaskIndex()
           if (migrating) migrateTo11(this)
+          this.rooms.backfill()
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
         })
       } catch (error) {
@@ -98,6 +112,41 @@ export class Store implements Repositories {
       this.db.close()
       throw error
     }
+  }
+  /** Builds the persistent list projection once from older Web task KV records. */
+  private backfillWebTaskIndex(): void {
+    const marker = 'web-task-summary-index-v2-ready'
+    if (this.get(marker as Key<boolean>)) return
+    this.db.exec('DELETE FROM web_task_ticket')
+    const insert = this.db.prepare(`INSERT INTO web_task_summary (id, title, created_at, updated_at, last_user_at)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title=excluded.title, created_at=excluded.created_at,
+      updated_at=excluded.updated_at, last_user_at=excluded.last_user_at`)
+    for (const row of this.db.prepare("SELECT key, value FROM kv WHERE key LIKE 'web-task:%'").iterate()) {
+      try {
+        const task = JSON.parse(String(row.value)) as { id: string; title: string; createdAt: string; updatedAt: string; messages?: { role: string; at: string }[] }
+        const lastUserAt = [...(task.messages ?? [])].reverse().find(message => message.role === 'user')?.at ?? task.createdAt
+        insert.run(task.id, task.title, task.createdAt, task.updatedAt, lastUserAt)
+      } catch { /* Keep malformed legacy records available through their original KV key. */ }
+    }
+    const link = this.db.prepare('INSERT OR IGNORE INTO web_task_ticket (web_task_id, ticket_id) VALUES (?, ?)')
+    for (const row of this.db.prepare("SELECT key, value FROM thread WHERE key LIKE 'web:%'").iterate()) {
+      const taskId = String(row.key).slice('web:'.length)
+      if (!this.db.prepare('SELECT 1 FROM web_task_summary WHERE id=?').get(taskId)) continue
+      try {
+        const thread = JSON.parse(String(row.value)) as Thread
+        for (const ticketId of thread.subscriptions) link.run(taskId, ticketId)
+      } catch { /* A malformed thread remains available in its original record. */ }
+    }
+    this.db.exec(`UPDATE web_task_summary AS s SET updated_at = MAX(s.updated_at,
+      COALESCE((SELECT MAX(t.value ->> '$.updatedAt') FROM web_task_ticket x JOIN ticket t ON t.id=x.ticket_id WHERE x.web_task_id=s.id), s.updated_at),
+      COALESCE((SELECT MAX(d.value ->> '$.at') FROM decision d WHERE d.thread='web:' || s.id), s.updated_at))`)
+    this.set(marker as Key<boolean>, true)
+  }
+  /** Advances an indexed Web task's activity time from its currently subscribed tickets and recorded decisions. */
+  private refreshWebTaskActivity(id: string): void {
+    this.db.prepare(`UPDATE web_task_summary AS s SET updated_at = MAX(s.updated_at,
+      COALESCE((SELECT MAX(t.value ->> '$.updatedAt') FROM web_task_ticket x JOIN ticket t ON t.id=x.ticket_id WHERE x.web_task_id=s.id), s.updated_at),
+      COALESCE((SELECT MAX(d.value ->> '$.at') FROM decision d WHERE d.thread='web:' || s.id), s.updated_at)) WHERE s.id=?`).run(id)
   }
   /** Reconciles generated working-set columns and indexes when opening databases created by earlier versions. */
   private addColumns(): void {
@@ -180,6 +229,22 @@ export class Store implements Repositories {
     return this.db.prepare("SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'").all(pattern).map(row => String(row.key))
   }
 
+  /** Persisted, messages-free Web task index; write paths maintain activity times so pages use the ordering index. */
+  readonly webTasks = {
+    save: (task: WebTaskIndexRecord): void => this.atomic(() => {
+      this.db.prepare(`INSERT INTO web_task_summary (id, title, created_at, updated_at, last_user_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET title=excluded.title, created_at=excluded.created_at,
+        updated_at=MAX(updated_at, excluded.updated_at), last_user_at=MAX(last_user_at, excluded.last_user_at)`)
+        .run(task.id, task.title, task.createdAt, task.updatedAt, task.lastUserAt)
+      this.refreshWebTaskActivity(task.id)
+    }),
+    page: (offset: number, limit: number): WebTaskIndexRecord[] => this.db.prepare(`SELECT id, title, created_at AS createdAt,
+      updated_at AS updatedAt, last_user_at AS lastUserAt FROM web_task_summary
+      ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`).all(limit, offset).map(row => ({
+        id: String(row.id), title: String(row.title), createdAt: String(row.createdAt), updatedAt: String(row.updatedAt), lastUserAt: String(row.lastUserAt),
+      })),
+  }
+
   /** Versioned settings snapshots; the current settings are the snapshot of the latest revision. */
   private readonly settingsVersions = new Versions<SettingsVersion>(this, KV.settings.revision, KV.settings.version)
   /** Current validated settings. */
@@ -203,13 +268,24 @@ export class Store implements Repositories {
     save: (trigger: Trigger): void => this.atomic(() => {
       this.db.prepare('INSERT INTO trigger VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, at=excluded.at').run(trigger.id, JSON.stringify(trigger), trigger.at)
       this.indexThreads(trigger)
+      this.rooms.trigger(trigger)
     }),
     disposition: (id: string): TriggerDisposition | undefined => { const row = this.db.prepare('SELECT value FROM disposition WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as TriggerDisposition : undefined },
     saveDisposition: (id: string, value: TriggerDisposition): void => { this.db.prepare('INSERT INTO disposition VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(id, JSON.stringify(value)) },
   }
   readonly threads = {
     get: (keyValue: string): Thread | undefined => { const row = this.db.prepare('SELECT value FROM thread WHERE key=?').get(keyValue); return row ? JSON.parse(String(row.value)) as Thread : undefined },
-    save: (thread: Thread): void => { this.db.prepare('INSERT INTO thread VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(thread.key, JSON.stringify(thread)) },
+    save: (thread: Thread): void => this.atomic(() => {
+      this.db.prepare('INSERT INTO thread VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(thread.key, JSON.stringify(thread))
+      this.rooms.thread(thread)
+      if (!thread.key.startsWith('web:')) return
+      const taskId = thread.key.slice('web:'.length)
+      if (!this.db.prepare('SELECT 1 FROM web_task_summary WHERE id=?').get(taskId)) return
+      this.db.prepare('DELETE FROM web_task_ticket WHERE web_task_id=?').run(taskId)
+      const link = this.db.prepare('INSERT OR IGNORE INTO web_task_ticket (web_task_id, ticket_id) VALUES (?, ?)')
+      for (const ticketId of thread.subscriptions) link.run(taskId, ticketId)
+      this.refreshWebTaskActivity(taskId)
+    }),
     list: (): Thread[] => this.db.prepare('SELECT value FROM thread ORDER BY rowid').all().map(row => JSON.parse(String(row.value)) as Thread),
     active: (): Thread[] => this.values('SELECT value FROM thread WHERE active = 1 ORDER BY rowid'),
     /** Updates human-facing thread metadata (`label`, `url`, and `facts`, where `null` removes a fact by ID); no-op if the thread does not exist. */
@@ -232,7 +308,13 @@ export class Store implements Repositories {
   }
   readonly tickets = {
     get: (id: string): Ticket | undefined => { const row = this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Ticket : undefined },
-    save: (ticket: Ticket): void => { this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket)) },
+    save: (ticket: Ticket): void => this.atomic(() => {
+      const previous = this.tickets.get(ticket.id)
+      this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket))
+      this.rooms.ticket(ticket, previous)
+      this.db.prepare(`UPDATE web_task_summary SET updated_at=MAX(updated_at, ?)
+        WHERE id IN (SELECT web_task_id FROM web_task_ticket WHERE ticket_id=?)`).run(ticket.updatedAt, ticket.id)
+    }),
     /** Newest first. */
     list: (): Ticket[] => this.values('SELECT value FROM ticket ORDER BY rowid DESC'),
     /** Newest first. */
@@ -242,7 +324,11 @@ export class Store implements Repositories {
   }
   readonly decisions = {
     get: (id: string): Decision | undefined => { const row = this.db.prepare('SELECT value FROM decision WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Decision : undefined },
-    save: (decision: Decision): void => { this.db.prepare('INSERT INTO decision VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, thread=excluded.thread').run(decision.id, decision.threadKey, JSON.stringify(decision)) },
+    save: (decision: Decision): void => this.atomic(() => {
+      this.db.prepare('INSERT INTO decision VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, thread=excluded.thread').run(decision.id, decision.threadKey, JSON.stringify(decision))
+      if (decision.threadKey.startsWith('web:')) this.db.prepare('UPDATE web_task_summary SET updated_at=MAX(updated_at, ?) WHERE id=?')
+        .run(decision.at, decision.threadKey.slice('web:'.length))
+    }),
     byThread: (threadKeyValue: string): Decision[] => this.db.prepare('SELECT value FROM decision WHERE thread=? ORDER BY rowid').all(threadKeyValue).map(row => JSON.parse(String(row.value)) as Decision),
   }
   /** Read-only queries for management views, orchestrator tools, and source polling (see `storeReads`). */
@@ -255,17 +341,23 @@ export class Store implements Repositories {
     get: (id: string): Receipt | undefined => this.values<Receipt>('SELECT value FROM outbox WHERE id = ?', id)[0],
     /** Pending message receipts, oldest first. */
     waiting: (): Receipt[] => this.values("SELECT value FROM outbox WHERE value ->> '$.status' = 'pending' ORDER BY rowid"),
-    /** True if an earlier message for the same ticket and conversation is still pending with fewer than `failures` consecutive failed `reply` effect attempts. */
+    /** True if an earlier message for the same ticket, conversation and delivery lane is pending below the failure threshold. */
     behind: (id: string, failures: number): boolean => !!this.db.prepare(`SELECT 1 FROM outbox earlier
       JOIN outbox message ON message.id = ? LEFT JOIN effect ON effect.kind = 'reply' AND effect.key = earlier.id
-      WHERE earlier.pending = message.pending AND earlier.rowid < message.rowid AND IFNULL(effect.attempts, 0) < ? LIMIT 1`).get(id, failures),
+      WHERE earlier.pending = message.pending AND earlier.rowid < message.rowid
+        AND COALESCE(earlier.value ->> '$.delivery', 'normal') = COALESCE(message.value ->> '$.delivery', 'normal')
+        AND IFNULL(effect.attempts, 0) < ? LIMIT 1`).get(id, failures),
     /**
      * Records a new pending message receipt; an already-recorded message ID keeps its original receipt.
      * @returns Whether the message ID was newly recorded.
      */
     add: (message: OutboundMessage): boolean => {
       const receipt: Receipt = { ...message, status: 'pending' }
-      return Number(this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)').run(message.id, JSON.stringify(receipt)).changes) > 0
+      return this.atomic(() => {
+        const added = Number(this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)').run(message.id, JSON.stringify(receipt)).changes) > 0
+        if (added) this.rooms.reply(message)
+        return added
+      })
     },
     /**
      * Marks a pending receipt as sent or dropped (with drop reason and timestamp), recreating the receipt if the message

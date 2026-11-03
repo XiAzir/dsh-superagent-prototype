@@ -7,7 +7,6 @@ and 3 when it runs and waits for setup. A restart fixes neither 2 nor 3: they ne
 """
 
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,10 +20,36 @@ import time
 import urllib.error
 import urllib.request
 
+if os.name == 'nt':
+    # Keep the POSIX implementation below intact; Windows uses native process and lock handling.
+    import runpy
+    runpy.run_path(str(Path(__file__).with_name('dsh-superagent-windows.py')), run_name='__main__')
+    raise SystemExit
+
+import fcntl
+
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / '.artifacts'
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
+
+# tmux keeps its server/session environment across service restarts. Refresh these
+# explicit application paths for each new pane, including an existing session.
+APPLICATION_ENV = ('HOME', 'DSH_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
+                   'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'TMP', 'TEMP', 'PNPM_HOME',
+                   'npm_config_cache', 'npm_config_store_dir', 'DSH_SUPERAGENT_WORK_DIR',
+                   'DSH_SUPERAGENT_DATA_ROOT', 'DSH_SUPERAGENT_HTTP_CLOSE')
+
+
+def service_directory():
+    """An optional deployment-specific work directory; local startup stays unchanged."""
+    configured = os.environ.get('DSH_SUPERAGENT_WORK_DIR', '')
+    if not configured:
+        return ROOT
+    directory = Path(configured)
+    if not directory.is_absolute() or not directory.is_dir():
+        raise RuntimeError('DSH_SUPERAGENT_WORK_DIR must name an existing absolute directory.')
+    return directory.resolve()
 
 
 def control(profile):
@@ -39,8 +64,27 @@ def stopped(profile):
     return (control(profile) / 'manually-stopped').exists()
 
 
+def dsh_entry(args):
+    """Return whether argv names the DSH executable, including `node /path/to/dsh` on Node 24."""
+    if not args:
+        return False
+    first = Path(args[0]).name
+    if first in ('node', 'nodejs'):
+        # ps joins argv with spaces. Rejoin the entrypoint tokens so a path with spaces still
+        # ends in the exact DSH launcher name; stop before the first option or DSH app argument.
+        entry = []
+        for word in args[1:]:
+            if word.startswith('-'):
+                break
+            entry.append(word)
+        return bool(entry) and Path(' '.join(entry)).name in ('dsh', 'dsh.js')
+    return first == 'dsh'
+
+
 def serves(args, profile):
-    """Return whether command-line arguments belong to the main DSH service process for `profile`."""
+    """Return whether command-line arguments belong to the DSH executable for `profile`."""
+    if not dsh_entry(args):
+        return False
     words, matched, value = [], False, False
     for word in args[1:]:
         if value:
@@ -54,8 +98,19 @@ def serves(args, profile):
     return matched and 'plugin' not in words
 
 
+def service_process(name, args, profile):
+    """Match a DSH process by both its OS process name and DSH-specific argv."""
+    if name not in ('node', 'nodejs', 'dsh', 'MainThread'):
+        return False
+    # Node 24 reports its principal thread as `MainThread`, so require both a Node argv[0]
+    # and the DSH launcher argv[1] for that comm name. Generic MainThread processes are ignored.
+    if name == 'MainThread' and (not args or Path(args[0]).name not in ('node', 'nodejs')):
+        return False
+    return serves(args, profile)
+
+
 def ps(*options, check=False):
-    """Yield `(pid, comm, args)` tuples from `ps`; arguments are split on whitespace, so paths with spaces become several words and only `--profile` and subcommands are inspected."""
+    """Yield `(pid, comm, args)` tuples; ps splits argv on whitespace, so DSH entrypoint tokens are rejoined before checking the profile and subcommand."""
     result = subprocess.run(['ps', '-ww', *options, '-o', 'pid=,ucomm=,args='], check=check, capture_output=True, text=True)
     for line in result.stdout.splitlines():
         parts = line.split(None, 2)
@@ -65,12 +120,12 @@ def ps(*options, check=False):
 
 def running(pid, profile):
     """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
-    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
+    return any(found == pid and service_process(name, args, profile) for found, name, args in ps('-p', str(pid)))
 
 
 def processes(profile):
     """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
-    found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
+    found = [pid for pid, name, args in ps('-ax', check=True) if service_process(name, args, profile)]
     try:
         pid = int((control(profile) / 'service.pid').read_text())
     except (OSError, ValueError):
@@ -122,7 +177,7 @@ def outcome(pids, current):
 def status(args):
     pids = processes(args.profile)
     current = state(args.url) if pids else None
-    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
+    print(json.dumps({'pids': pids, 'cwd': str(service_directory()), 'url': args.url,
                       'manually_stopped': stopped(args.profile), 'health': current and current['health'],
                       'errors': current and current['errors'], 'setup': current and current['setup'],
                       'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
@@ -157,6 +212,7 @@ def prune_logs(profile):
 
 
 def start(args):
+    directory = service_directory()
     session = 'dsh-' + args.profile
     pids = processes(args.profile)
     if len(pids) > 1:
@@ -178,7 +234,10 @@ def start(args):
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
         # Reuse an existing tmux session without disturbing other windows.
         target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
-        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
+        environment = [value for name in APPLICATION_ENV if name in os.environ
+                       for value in ('-e', name + '=' + os.environ[name])]
+        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server',
+                               *environment, '-c', str(directory), command],
                               check=True, capture_output=True, text=True).stdout.strip()
         if pane.isdigit():
             (control(args.profile) / 'service.pid').write_text(pane + '\n')

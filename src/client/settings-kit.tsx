@@ -73,6 +73,7 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
   const { t, call } = usePanel()
   const [catalog, setCatalog] = useState<ApiResponse<'GET models'>>()
   const [error, setError] = useState<string>()
+  const [manualProvider, setManualProvider] = useState(false)
   useEffect(() => { call('GET models').then(setCatalog, failure => setError(errorText(failure))) }, [call])
   const current = { provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' }
   const set = (next: Partial<typeof current>) => {
@@ -80,9 +81,12 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
     onChange(provider.trim() || model.trim() || effort.trim() ? { provider, model, ...effort ? { reasoningEffort: effort } : {} } : null)
   }
   const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
+  const providers = catalog?.groups ?? []
+  const knownProvider = providers.some(group => group.id === current.provider)
+  const customProvider = manualProvider || (!!catalog && !!current.provider && !knownProvider)
   const fallback = catalog?.default
   const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
+    <Input list={name === 'provider' ? undefined : `${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
       onChange={event => set({ [name]: event.target.value })} />
   </Field>
   return <div className="dt-model">
@@ -90,11 +94,26 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
       ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
     {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
     <div className="dt-grid3">
-      {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
+      <div className="dt-model-provider">
+        <Field label={t('modelProvider')}>
+          <select className="dt-select" value={customProvider ? ':manual:' : current.provider} aria-busy={!catalog && !error}
+            onChange={event => {
+              const provider = event.target.value
+              setManualProvider(provider === ':manual:')
+              if (provider === ':manual:') return
+              if (!provider || provider !== current.provider) set({ provider, model: '', effort: '' })
+            }}>
+            <option value="">{t('modelInherit')}</option>
+            {!customProvider && current.provider && !knownProvider && <option value={current.provider}>{current.provider}</option>}
+            {providers.map(group => <option key={group.id} value={group.id}>{group.name} · {group.id}</option>)}
+            <option value=":manual:">{t('modelProviderManual')}</option>
+          </select>
+        </Field>
+        {customProvider && input('provider', t('modelProviderId'), t('modelProviderId'))}
+      </div>
+      {input('model', t('modelName'), t('modelInherit'))}{input('effort',
         t('modelEffort'), t('modelEffortDefault'))}
     </div>
-    <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
-      value={group.id}>{group.name}</option>)}</datalist>
     <datalist id={`${id}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
     <datalist id={`${id}-efforts`}>
       {(models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}

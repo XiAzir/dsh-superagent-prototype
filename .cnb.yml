@@ -1,0 +1,47 @@
+# Public source and generic deployment template. Configure private imports below.
+main:
+  push:
+    - runner:
+        cpus: 2
+      docker:
+        build: .ide/Dockerfile
+      stages:
+        - name: Install locked dependencies
+          script: pnpm install --frozen-lockfile
+        - name: Typecheck, test and build on Linux
+          script: pnpm check
+        - name: Validate persistent runtime
+          script: python3 -m unittest discover -s deploy/cnb -p 'test_*.py' -v
+        - name: Validate persistence over real HTTP
+          script: python3 deploy/cnb/integration-test.py
+        - name: Validate protected public web gateway
+          script: node --test deploy/cnb/test_web_gateway.mjs
+
+  # CNB provides SSH / WebIDE. Runtime data is restored from external storage.
+  vscode:
+    - runner:
+        cpus: 4
+      docker:
+        build: .ide/Dockerfile
+      # Configure an access-restricted secret repository before enabling persistence:
+      # imports:
+      #   - https://cnb.cool/<owner>/<private-config-repository>/-/blob/main/runtime.json
+      services:
+        - docker
+        - name: vscode
+          options:
+            keepAliveTimeout: 18h
+      stages:
+        - name: Restore and start persistent Superagent
+          script: |
+            if [ -n "${SUPERAGENT_ARCHIVE_URL:-}" ] && [ -n "${SUPERAGENT_ARCHIVE_TOKEN:-}" ]; then
+              python3 deploy/cnb/runtime.py start --timeout 900
+            else
+              echo 'Configure private archive credentials for persistent hosting, or follow docs/linux.md for a local workspace profile.'
+            fi
+      endStages:
+        - name: Save runtime state before workspace shutdown
+          script: |
+            if [ -f /workspace/.superagent-runtime/control/credentials.json ]; then
+              python3 deploy/cnb/runtime.py shutdown
+            fi

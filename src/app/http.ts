@@ -1,6 +1,8 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
@@ -11,9 +13,9 @@ import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, b
 import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
-import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
+import { UserError, type Engine, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
-import type { DshExecutor } from '../executor/dsh.ts'
+import { workerSessionId, type DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
@@ -22,21 +24,32 @@ import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
+import type { ArtifactRegistry } from './artifacts.ts'
 import { overview } from './views/overview.ts'
 import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import { WebTasks, WebTaskError } from './web-tasks.ts'
+import { TaskRooms } from './task-rooms.ts'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { QqSourceError, type QqBridge } from './qq-source.ts'
+import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
+import { ScheduleConfigSchema, ScheduleConflict, ScheduleLimit, ScheduleNotFound, type Schedules } from './schedules.ts'
 
 export interface HttpHost {
+  readonly qq?: QqBridge | undefined
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
+  readonly artifacts?: Pick<ArtifactRegistry, 'verify'> | undefined
+  readonly schedules?: Pick<Schedules, 'list' | 'create' | 'update' | 'runNow' | 'remove'> | undefined
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople
+  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct'>
+  inspectWorker?(ticketId: string): Promise<readonly SessionEvent[]>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -58,7 +71,7 @@ export interface HttpHost {
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404, message: string) { super(message) } }
+class RouteError extends Error { constructor(readonly status: 400 | 404 | 503, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -74,11 +87,21 @@ function json(res: ServerResponse, status: number, value: unknown): void {
 }
 export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
   const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || typeof host !== 'string') return false
+  const authority = /^(127\.0\.0\.1|localhost):([1-9]\d{0,4})$/.exec(host)
+  if (!authority || Number(authority[2]) > 65535) return false
+  if (req.headers['x-orchestrator-request'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') return false
+  return req.headers.origin === undefined || req.headers.origin === `http://${host}`
 }
+const MAX_WEB_ARTIFACT_BYTES = 50 * 1024 * 1024
+const encodedFilename = (name: string): string => encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof QqSourceError) return [error.status, { error: error.message }]
+  if (error instanceof WebTaskError) return [error.status, { error: error.message }]
+  if (error instanceof ScheduleConflict) return [409, { error: error.message }]
+  if (error instanceof ScheduleNotFound) return [404, { error: error.message }]
+  if (error instanceof ScheduleLimit) return [400, { error: error.message }]
   if (error instanceof z.ZodError) {
     const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
@@ -90,15 +113,15 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   return [500, { error: error instanceof Error ? error.message : String(error) }]
 }
 
-function machineView({ stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }: Machine) {
-  return { stateDir, promptMaxChars: promptMaxChars.get(), admissionContextMaxPages: admissionContextMaxPages.get(),
+function machineView({ stateDir, mode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }: Machine) {
+  return { stateDir, mode: mode ?? 'repository', promptMaxChars: promptMaxChars.get(), admissionContextMaxPages: admissionContextMaxPages.get(),
     admissionContextTimeoutMs: admissionContextTimeoutMs.get() }
 }
 function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
   return {
     machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
-    accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
+    accounts: resolved ? { repository: resolved.repository ?? '', agent: resolved.github?.login ?? '', feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
@@ -106,6 +129,7 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
+    mode: runtime.machine.mode ?? 'repository', masterReady: runtime.configured() && runtime.health.runtime?.state === 'ready',
     masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
@@ -150,10 +174,79 @@ const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().no
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
+  const rooms = () => new TaskRooms({ store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
+    configured: () => runtime.configured(), requestPass: () => runtime.requestPass(),
+    artifacts: runtime.artifacts,
+    ...runtime.inspectWorker ? { inspectWorker: (id: string) => runtime.inspectWorker!(id) } : {} })
+  const web = () => {
+    const failures = runtime.sessions?.status?.().failures ?? []
+    return new WebTasks({ store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
+      health: () => runtime.health, receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() },
+      failure: ticketIds => {
+        const ids = new Set([runtime.masterId, ...ticketIds.map(workerSessionId)])
+        return failures.filter(failure => ids.has(failure.sessionId)).sort((a, b) => a.at.localeCompare(b.at)).at(-1)
+      } })
+  }
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
+  const schedules = () => runtime.schedules ?? (() => { throw new RouteError(503, 'Schedules are not ready') })()
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET rooms': ({ query }) => {
+      const page = z.object({ offset, limit: limit(50, 100) }).parse(query)
+      return rooms().list(page.offset, page.limit)
+    },
+    'GET rooms/:key': ({ params, query }) => {
+      const page = z.object({ before: z.string().optional(), limit: limit(50, 100) }).parse(query)
+      return rooms().get(params.key, page.before, page.limit)
+    },
+    'POST rooms/:key/messages': async ({ params, body }) => rooms().post(params.key, await body()),
+    'GET rooms/:key/workers/:ticketId/activity': ({ params, query }) => {
+      const page = z.object({ offset, limit: limit(30, 50) }).parse(query)
+      return rooms().activity(params.key, params.ticketId, page.offset, page.limit)
+    },
+    'GET schedules': () => schedules().list(),
+    'POST schedules': async ({ body }) => {
+      const request = z.object({ config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))
+      return { item: schedules().create(request.config) }
+    },
+    'PUT schedules/:id': async ({ params, body }) => {
+      const request = z.object({ revision: z.number().int().nonnegative(), config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))
+      return { item: schedules().update(params.id, request.revision, request.config) }
+    },
+    'POST schedules/:id/run': ({ params }) => schedules().runNow(params.id),
+    'DELETE schedules/:id': async ({ params, body }) => {
+      const request = z.object({ revision: z.number().int().nonnegative() }).strict().parse(await body(4096))
+      return schedules().remove(params.id, request.revision)
+    },
+    'GET qq/status': () => {
+      if (!runtime.qq) throw new QqSourceError(503, 'QQ 接入模块尚未启动。')
+      return runtime.qq.status()
+    },
+    'PUT qq/token': async ({ body }) => {
+      if (!runtime.qq) throw new QqSourceError(503, 'QQ 接入模块尚未启动。')
+      return runtime.qq.setToken(z.object({ value: z.string().max(4000) }).strict().parse(await body()).value)
+    },
+    'GET web/tasks': ({ query }) => {
+      const parsed = z.object({ offset: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(100).default(50) }).parse(query)
+      return web().list(parsed.offset, parsed.limit)
+    },
+    'GET web/tasks/:id': ({ params }) => web().get(params.id),
+    'POST web/tasks': async ({ body }) => web().create(await body()),
+    'POST web/tasks/:id/messages': async ({ params, body }) => web().followup(params.id, await body()),
     'GET state': () => stateView(runtime),
+    'GET watchdog/snapshot': ({ query }) => {
+      const parsed = z.object({ offset: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(100).default(100),
+        candidateAfterMs: z.coerce.number().int().min(60_000).max(30 * 24 * 60 * 60_000).default(30 * 60_000) }).parse(query)
+      const snapshot = watchdogSnapshot(runtime, { offset: parsed.offset, maxTickets: parsed.limit, candidateAfterMs: parsed.candidateAfterMs })
+      return { ...snapshot, baseline: baselineAssessment(snapshot) }
+    },
+    'POST watchdog/tickets/:id/request-status': ({ params }) => {
+      const id = ticket(params.id)
+      // Engine only queues this bounded nudge for a live worker whose latest report explicitly says `waiting`.
+      const requested = runtime.engine.requestStatus(id)
+      if (requested) runtime.requestPass()
+      return { requested }
+    },
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
@@ -237,6 +330,34 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        const artifactRoute = /^\/orchestrator\/api\/web\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
+        const roomArtifactRoute = /^\/orchestrator\/api\/rooms\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
+        if (artifactRoute || roomArtifactRoute) {
+          if (req.method !== 'GET') throw new RouteError(404, 'Unknown operation')
+          const matched = (artifactRoute ?? roomArtifactRoute)!
+          const conversation = decoded(matched[1]!)
+          const id = decoded(matched[2]!)
+          const tasks = new WebTasks({ store: runtime.store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
+            health: () => runtime.health, artifacts: runtime.artifacts,
+            receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() } })
+          const rooms = new TaskRooms({ store: runtime.store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
+            configured: () => runtime.configured(), requestPass: () => runtime.requestPass(), artifacts: runtime.artifacts })
+          const readArtifact = () => roomArtifactRoute ? rooms.artifact(conversation, id) : tasks.artifact(conversation, id)
+          const artifact = await readArtifact()
+          if (artifact.size > MAX_WEB_ARTIFACT_BYTES) throw new RouteError(404, 'Delivered artifact exceeds the download limit')
+          const bytes = await readFile(artifact.path)
+          if (bytes.byteLength !== artifact.size || bytes.byteLength > MAX_WEB_ARTIFACT_BYTES
+            || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw new Error('Artifact spool content changed during Web delivery')
+          const current = await readArtifact()
+          if (current.ticketId !== artifact.ticketId || current.size !== artifact.size || current.sha256 !== artifact.sha256) {
+            throw new WebTaskError(404, '交付文件不存在。')
+          }
+          res.writeHead(200, { 'content-type': 'application/octet-stream',
+            'content-disposition': `attachment; filename="download"; filename*=UTF-8''${encodedFilename(artifact.name)}`,
+            'content-length': String(bytes.byteLength), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
+          res.end(bytes)
+          return
+        }
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)

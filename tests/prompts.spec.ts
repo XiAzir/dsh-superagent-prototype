@@ -123,6 +123,40 @@ it('registers the built-in Source skills, Feishu only with a Feishu bot, before 
   })
 })
 
+it('adds bounded personal task guidance and omits the GitHub skill when no account is configured', () => {
+  withStore(store => {
+    const prompts = new Prompts(store, () => 100000, variables, () => false, () => false, () => true)
+    const main = prompts.compose(defaultPrompts(), 'orchestrator')
+    const worker = prompts.compose(defaultPrompts(), 'worker')
+    expect(prompts.preview(defaultPrompts()).orchestrator).toBe(main)
+    expect(prompts.preview(defaultPrompts()).worker).toBe(worker)
+    expect(main).toContain('For a simple question that needs no worker')
+    expect(main).toContain('orchestrator_reply')
+    expect(main).toContain('Then call orchestrator_route with kind=ignore')
+    expect(worker).toContain('orchestrator_report')
+    expect(main).not.toContain("deployment's repository")
+    expect(worker).not.toContain('Use gh for ALL GitHub operations')
+    expect(worker).not.toContain('executor_reply')
+    expect(worker).toContain('repository and account are configured')
+    expect(prompts.skills(defaultPrompts()).map(([name]) => name)).toEqual([])
+  })
+})
+
+it('guides workers to publish only consequential peer context and routes bounded delegation through the Router', () => {
+  withStore(store => {
+    const prompts = promptsOf(store)
+    for (const personal of [false, true]) {
+      const configured = new Prompts(store, () => 100000, variables, () => true, () => true, () => personal)
+      const worker = configured.compose(defaultPrompts(), 'worker')
+      const router = configured.compose(defaultPrompts(), 'orchestrator')
+      expect(worker).toContain('orchestrator_thread_publish')
+      expect(worker).toContain('ask Router to arrange bounded')
+      expect(worker).not.toContain('orchestrator_delegate')
+      expect(router).toContain('mandate')
+    }
+  })
+})
+
 
 describe('overrides of built-in parts', () => {
   const settings = () => SettingsSchema.parse({})

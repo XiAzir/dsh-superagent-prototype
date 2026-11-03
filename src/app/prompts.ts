@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { UserError, key } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
+import { promptFile } from './skill-files.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -43,6 +44,14 @@ export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {}
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
 const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.'
+const PERSONAL_PARTS: Partial<Record<PartKey, string>> = {
+  'runtime/shared': promptFile('personal/shared'), 'runtime/orchestrator': promptFile('personal/orchestrator'),
+  'runtime/worker': promptFile('personal/worker'), 'runtime/replies': `## replies\n${promptFile('personal/replies')}`,
+  'runtime/dispatch': `## dispatch\n${promptFile('personal/dispatch')}`, 'runtime/work': `## work\n${promptFile('personal/work')}`,
+  'runtime/admission': promptFile('personal/admission'),
+  'runtime/handoff/orchestrator': promptFile('personal/handoff-orchestrator'), 'runtime/handoff/worker': promptFile('personal/handoff-worker'),
+}
+const PERSONAL_TEAM = { communication: promptFile('personal/communication'), scope: promptFile('personal/scope'), delivery: promptFile('personal/delivery') }
 type Role = 'orchestrator' | 'worker'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
@@ -135,16 +144,27 @@ export class PromptConflict extends Error {}
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
-    private readonly feishu: () => boolean) {
+    private readonly feishu: () => boolean, private readonly github: () => boolean = () => true, private readonly personal: () => boolean = () => false) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
+  private modeConfig(config: PromptConfig): PromptConfig {
+    if (!this.personal()) return config
+    const overrides = { ...config.overrides }
+    for (const [part, text] of Object.entries(PERSONAL_PARTS) as [PartKey, string][]) {
+      if (!Object.hasOwn(overrides, part)) overrides[part] = { text, base: builtInBase(builtInParts()[part].text) }
+    }
+    return { ...config, ...(config.communication === teamDefaults.communication ? { communication: PERSONAL_TEAM.communication } : {}),
+      ...(config.scope === teamDefaults.scope ? { scope: PERSONAL_TEAM.scope } : {}),
+      ...(config.delivery === teamDefaults.delivery ? { delivery: PERSONAL_TEAM.delivery } : {}), overrides }
+  }
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    const modeConfig = this.modeConfig(config)
+    return composePrompt(modeConfig, role, environmentSection(modeConfig, variables), role === 'orchestrator' ? policySection(this.store.settings(), modeConfig) : undefined)
   }
   /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    return [...this.feishu() ? ['feishu'] : [], ...this.github() ? ['github'] : [], ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
   }
   current(): PromptVersion {
     const revision = this.versions.revision()
@@ -193,7 +213,7 @@ export class Prompts {
     })
   }
   preview(value: unknown) {
-    const config = this.validate(value)
+    const config = this.modeConfig(this.validate(value))
     const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
     return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
       parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment) },

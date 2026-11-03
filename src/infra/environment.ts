@@ -5,26 +5,36 @@
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
-import { delimiter, join, resolve } from 'node:path'
+import { delimiter, join, resolve, win32 } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { commandEnvironment, windowsCommandTarget } from './platform.ts'
+import { CREDENTIAL_GUARD_PROGRAM } from './credential-guard.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
+const WINDOWS_MARKER = 'REM Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
+const commandKey = (name: string): string => process.platform === 'win32'
+  ? win32.basename(name).replace(/\.(?:com|exe|cmd|bat|ps1)$/i, '').toLowerCase()
+  : name
+export const isWorkerCommand = (name: string): boolean => WORKER_COMMANDS.some(command => commandKey(name) === commandKey(command))
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+export const credentialHelper = (cli: string): string => process.platform === 'win32'
+  ? `!pwsh -NoProfile -NonInteractive -Command ${shellQuote(`$cli=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${Buffer.from(windowsCommandTarget(cli), 'utf16le').toString('base64')}')); & $cli auth git-credential @args`)}`
+  : `!${shellQuote(cli)} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
-  return real(a) === real(b)
+  const left = real(a), right = real(b)
+  return process.platform === 'win32' ? left.toLocaleLowerCase('en-US') === right.toLocaleLowerCase('en-US') : left === right
 }
 export function withoutDirectory(path: string, dir: string): string {
   return path.split(delimiter).filter(entry => !sameDirectory(entry, dir)).join(delimiter)
@@ -60,8 +70,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 /** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
-  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
+  const head = (await readFile(file, 'utf8')).replaceAll('\r\n', '\n').split('\n', 2)
+  return [MARKER, WINDOWS_MARKER, ...LEGACY_MARKERS, ...LEGACY_MARKERS.map(marker => `REM${marker.slice(1)}`)].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -74,7 +84,8 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
 
 /**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
- * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
+ * Each shim strips the shim directory from PATH, applies the credential/account guard, then runs the real CLI.
+ * This is a default-PATH guardrail: workers run as the operator's OS user, whose home-directory files remain readable.
  */
 export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
@@ -84,7 +95,40 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   for (const name of before) { const file = join(dir, name); if (!await written(file)) throw new SetupError('foreignFile', { file }) }
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
   const kept = new Set<string>()
-  const shim = async (name: string, body: string): Promise<void> => {
+  const shim = async (name: string, body: string, windowsAction: { program: string } | { message: string }): Promise<void> => {
+    if (process.platform === 'win32') {
+      const value = 'program' in windowsAction ? windowsCommandTarget(windowsAction.program) : windowsAction.message
+      const encoded = Buffer.from(value, 'utf16le').toString('base64')
+      const ps = join(dir, `${name}.ps1`)
+      const psTemporary = join(dir, `.${name}.${process.pid}.tmp.ps1`)
+      const powershell = [
+        `# ${MARKER.slice(2)}`,
+        "param()",
+        "$ErrorActionPreference = 'Stop'",
+        "$self = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\\')",
+        "$env:PATH = (($env:PATH -split ';' | Where-Object { $_ -and [IO.Path]::GetFullPath($_).TrimEnd('\\') -ine $self }) -join ';')",
+        `$value = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'))`,
+        ...('program' in windowsAction
+          ? [
+            `$guard = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(CREDENTIAL_GUARD_PROGRAM, 'utf8').toString('base64')}'))`,
+            `& node -e $guard '${name}' @args`,
+            'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+            '& $value @args', 'exit $LASTEXITCODE',
+          ]
+          : ['[Console]::Error.WriteLine($value)', 'exit 1']),
+      ].join('\r\n') + '\r\n'
+      const cmd = join(dir, `${name}.cmd`)
+      const cmdTemporary = join(dir, `.${name}.${process.pid}.tmp.cmd`)
+      await writeFile(psTemporary, powershell)
+      await rename(psTemporary, ps)
+      // A raw cmd.exe entry cannot preserve an arbitrary argv without reparsing it as shell syntax.
+      // commandInvocation selects this paired .ps1 so callers can retain argv; direct batch use fails closed.
+      const entry = `@echo off\r\n${WINDOWS_MARKER}\r\necho Invoke this command through the dsh-superagent PowerShell adapter. 1>&2\r\nexit /b 1\r\n`
+      await writeFile(cmdTemporary, entry)
+      await rename(cmdTemporary, cmd)
+      kept.add(`${name}.ps1`); kept.add(`${name}.cmd`)
+      return
+    }
     const temporary = join(dir, `.${name}.${process.pid}.tmp`)
     await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
     await rename(temporary, join(dir, name))
@@ -95,12 +139,24 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  // Resolve Node before removing the shim directory from PATH; deployments may provide a PATH that omits Node itself.
+  const guard = (name: string): string => `${shellQuote(process.execPath)} -e ${shellQuote(CREDENTIAL_GUARD_PROGRAM)} ${shellQuote(name)} "$@" || exit $?`
+  const run = (name: string, program: string): string => `${withoutShims}\n${guard(name)}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+  await shim('gh', github ? run('gh', github.cli) : fail('gh is unavailable: this installation has no GitHub Source.'), github ? { program: github.cli } : { message: 'gh is unavailable: this installation has no GitHub Source.' })
+  await shim('lark-cli', feishu ? run('lark-cli', feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'), feishu ? { program: feishu.cli } : { message: 'lark-cli is unavailable: this installation has no Feishu bot.' })
+  const blocked = new Set<string>()
+  for (const configuredName of blockedCommands) {
+    const name = process.platform === 'win32'
+      ? win32.basename(configuredName).replace(/\.(?:com|exe|cmd|bat|ps1)$/i, '')
+      : configuredName
+    const key = commandKey(name)
+    if (isWorkerCommand(name) || blocked.has(key)) continue
+    blocked.add(key)
+    const message = github
+      ? `${name} is blocked in this installation; use gh, which acts as ${github.login}.`
+      : `${name} is blocked in this installation.`
+    await shim(name, fail(message), { message })
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
@@ -108,8 +164,8 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
     '[user]', '\tuseConfigOnly = true',
     '[credential]', '\thelper =',
-    '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
-    '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
+    ...github ? ['[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
+      '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/'] : [],
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
   ].join('\n') + '\n')
@@ -117,7 +173,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
 export function applyEnvironment(variables: Record<string, string | undefined>, stateDir: string, path: string): () => void {
-  const values = { ...variables, PATH: [workerBin(stateDir), path].join(delimiter) }
+  const values = commandEnvironment({ ...variables, PATH: [workerBin(stateDir), path].join(delimiter) })
   const previous = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
   const apply = (env: Record<string, string | undefined>): void => { for (const [name, value] of Object.entries(env)) { if (value === undefined) delete process.env[name]; else process.env[name] = value } }
   apply(values)
@@ -139,7 +195,8 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
   const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  const expected = github ? [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0') : ''
+  if (helpers.join('\0') !== expected) throw new SetupError('gitTooOld')
 }
 
 /**

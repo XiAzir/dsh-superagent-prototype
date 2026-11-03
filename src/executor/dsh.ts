@@ -13,6 +13,7 @@ import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
+import { assertPersistentDataPath } from '../infra/persistent-path.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
@@ -120,11 +121,14 @@ const capped = (text: string, limit: number, read: string) =>
  */
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
-    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
+    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link,
+    ...trigger.attachments?.length ? { attachments: trigger.attachments } : {}, ...(note ? { routing_note: note } : {}),
+    ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
 /** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */
 export const batchLine = (trigger: Trigger) => ({ trigger_id: trigger.id, from: trigger.actor.id, at: trigger.at,
+  ...trigger.attachments?.length ? { attachments: trigger.attachments } : {},
   preview: trigger.text.replace(/\s+/g, ' ').slice(0, 160), read: `trigger/${trigger.id}` })
 /** Returns the other triggers in a ticket's origin batch (excluding the primary `origin.triggerId`), oldest first. */
 export const batchOf = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger[] => ticket.origin.triggerIds
@@ -245,18 +249,23 @@ export class DshExecutor implements Executor {
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
-    const directory = ticket.execution?.directory ?? ''
+    const directory = assertPersistentDataPath(ticket.execution?.directory ?? '')
     await mkdir(dirname(directory), { recursive: true })
     const command = this.host.store.settings().executor.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
-      .catch(async (error: unknown) => {
+    if (command) {
+      // This is an operator-authored shell program, not an argument assembled from a Trigger.
+      const argv = process.platform === 'win32'
+        ? ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command]
+        : ['sh', '-c', command]
+      await runAsWorker(this.host.context.subprocess, argv, dirname(directory), signal, env).catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
         await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
+    }
     await mkdir(directory, { recursive: true })
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
   }
@@ -312,7 +321,7 @@ export class DshExecutor implements Executor {
         try {
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            await this.host.sessions.ensure(sessionId, assertPersistentDataPath(ticket.execution?.directory ?? ''), ticket.title, 'worker')
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -411,12 +420,12 @@ export class DshExecutor implements Executor {
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
-    this.failed(ticketId, String(error))
+    this.failed(ticketId, assignmentId, String(error))
   }
   /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
-  private failed(ticketId: string, summary: string): void {
+  private failed(ticketId: string, assignmentId: string, summary: string): void {
     this.host.store.atomic(() => {
-      const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
+      const updated = this.host.engine.report(ticketId, { state: 'failed', summary }, assignmentId)
       this.relay(resultRelay(updated, 'failed', summary))
     })
   }
@@ -429,7 +438,7 @@ export class DshExecutor implements Executor {
       return !!stored && liveTicket(stored) && latestAssignment(stored)?.id === assignment.id
     }
     const source = sourceTrigger(this.host, ticket)
-    const workspace = ticket.execution?.directory ?? ''
+    const workspace = assertPersistentDataPath(ticket.execution?.directory ?? '')
     if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
     if (!await stat(workspace).then(() => true, () => false)) {
@@ -507,7 +516,7 @@ export class DshExecutor implements Executor {
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
+      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, assignment.id, String(error)) }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */
@@ -570,7 +579,7 @@ export class DshExecutor implements Executor {
       }
       const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { this.failed(ticketId, String(failure)) }))
+        .catch(failure => { this.failed(ticketId, assignmentId, String(failure)) }))
     }
     this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
   }
@@ -662,7 +671,7 @@ export class DshExecutor implements Executor {
     const said = [text, stopped].filter(Boolean).join('\n\n')
     this.host.store.atomic(() => {
       const before = latestReport(current)?.summary ?? ''
-      const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before })
+      const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before }, idle.id)
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
       if (said) this.relay(resultRelay(updated, 'waiting', said))
       else if (!before.trim()) {

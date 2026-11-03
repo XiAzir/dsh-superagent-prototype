@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { RoomActivity, RoomMessage, TaskRoomSummary, TaskRoomView } from '../../src/app/task-rooms.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -20,7 +21,8 @@ import { githubChannel } from '../../src/sources/github-trigger.ts'
 import { feishuKind } from '../../src/sources/feishu.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import type { Health } from '../../src/sources/host.ts'
-import type { SourceKind } from '../../src/sources/kind.ts'
+import type { FieldSpec, SourceKind } from '../../src/sources/kind.ts'
+import { QqConfigSchema } from '../../src/app/qq-source.ts'
 import { testDeployment } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
@@ -79,17 +81,41 @@ export const droppedReply = (id: string, hoursAgo: number, source: 'feishu' | 'g
 const dayAgo = () => new Date(Date.now() - 86_400_000).toISOString()
 export const problemOf = (code: SetupCode, values: Record<string, string> = {}) => new SetupError(code, values).problem
 // The kinds' configurations differ, and the fake reads them only as the records the views carry.
-const KINDS = [feishuKind, githubKind] as unknown as SourceKind[]
+const qqLabel = (zh: string, en: string) => ({ zh, en })
+const qqFields: FieldSpec[] = [
+  { key: 'connection', type: 'select', label: qqLabel('连接方式', 'Connection'), options: [
+    { value: 'forward', label: qqLabel('正向 WebSocket', 'Forward WebSocket') },
+    { value: 'reverse', label: qqLabel('反向 WebSocket', 'Reverse WebSocket') }] },
+  { key: 'url', type: 'text', label: qqLabel('NapCat WebSocket 地址', 'NapCat WebSocket URL') },
+  { key: 'privateMessages', type: 'switch', label: qqLabel('接收已授权账号的私聊', 'Receive authorized private messages') },
+  { key: 'groups', type: 'rows', label: qqLabel('接收的 QQ 群', 'Allowed groups'), columns: [
+    { key: 'id', type: 'text', label: qqLabel('群号', 'Group ID') }, { key: 'name', type: 'text', optional: true, label: qqLabel('名称', 'Name') }] },
+  { key: 'commandPrefix', type: 'text', label: qqLabel('交办命令前缀', 'Command prefix') },
+  { key: 'sessionMinutes', type: 'number', label: qqLabel('会话窗口 / 分钟', 'Session window / minutes'), min: 1, max: 1440 },
+  { key: 'groupFollowups', type: 'select', label: qqLabel('群聊追问关联', 'Group follow-ups'), options: [
+    { value: 'reply', label: qqLabel('引用回复原消息', 'Quoted replies') },
+    { value: 'sender-window', label: qqLabel('同一发送者的会话窗口', 'Sender session window') }] },
+  { key: 'replyChunkSize', type: 'number', label: qqLabel('每段回复字符数', 'Reply chunk characters'), min: 200, max: 4000 },
+  { key: 'maxReplyChunks', type: 'number', label: qqLabel('每条回复最多分段数', 'Maximum reply chunks'), min: 1, max: 50 },
+]
+const qqKind = { kind: 'qq', title: qqLabel('QQ · NapCat', 'QQ · NapCat'), description: qqLabel('NapCat OneBot v11', 'NapCat OneBot v11'),
+  schema: QqConfigSchema, health: ['qq'], fields: qqFields } as unknown as SourceKind
+const KINDS = [feishuKind, githubKind, qqKind] as unknown as SourceKind[]
 export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000, admissionContextMaxPages: 10,
   admissionContextTimeoutMs: 15000 }
 
 type Settings = ReturnType<typeof SettingsSchema.parse>
 export interface PanelServer {
+  models: ApiResponse<'GET models'>
   joined?: Record<string, string>; joining?: Record<string, string>
   joinError?: string
   settings: Settings; revisions: Record<string, number>
   prompts: PromptsView
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
+  ticketDelay?: Promise<void>
+  schedules: ApiResponse<'GET schedules'>
+  decisions: ApiResponse<'GET decisions'>['items']
+  decisionDelay?: Promise<void>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
@@ -108,6 +134,12 @@ export interface PanelServer {
   opened: string[]
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
+  webTasks: { items: ApiResponse<'GET web/tasks'>['items']; records: Record<string, ApiResponse<'GET web/tasks/:id'>> }
+  rooms: { items: TaskRoomSummary[]; views: Record<string, TaskRoomView>; activities: Record<string, RoomActivity> }
+  roomMessageError?: string
+  qqStatus: ApiResponse<'GET qq/status'>
+  qqToken?: string
+  qqTokenError?: string
 }
 export let server: PanelServer
 
@@ -159,7 +191,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused,
+  mode: server.setup.machine.mode ?? 'repository', masterReady: !server.setup.problem, masterId: 'master', paused: server.settings.paused,
   // The panel does not read health; the service script does.
   health: {},
 })
@@ -234,11 +266,11 @@ function threadPage(key: string, { before, around }: { before?: string; around?:
 function initial(): PanelServer {
   const settings = SettingsSchema.parse({
     policy: { sources: { feishu: { allowed: [{ id: 'ou_alice', name: 'Alice' }], syncChat: 'oc_team' },
-      github: { allowed: [{ id: 'alice' }] } },
+      github: { allowed: [{ id: 'alice' }] }, qq: { allowed: [] } },
       rules: [{ id: 'copy', name: '文案修改', enabled: true, instruction: '修正明确的文案错误' }] },
     sources: { feishu: { enabled: true, config: { cli: 'lark-bot', chats: [{ chatId: 'oc_team', listen: 'mentions' }],
       directMessages: true } },
-      github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } } },
+      github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } }, qq: { enabled: false, config: {} } },
     executor: { blockedCommands: ['gh-personal'] },
   })
   const ended = ticketSummary({ id: 't0', title: '旧工单', state: 'ended', actions: { retry: false, stop: false },
@@ -248,15 +280,47 @@ function initial(): PanelServer {
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
     health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
-    setup: { machine: MACHINE, problem: null, feishuProblem: null,
+    models: { default: { provider: 'host', model: 'default' }, routableProviders: ['worker-provider'], failures: [],
+      groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
+        reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] },
+    setup: { machine: { ...MACHINE, mode: 'repository' }, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
-    settings, revisions: { policy: 3, eval: 1, executor: 0 },
+    settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
+    rooms: (() => {
+      const key = 'web:demo'
+      const workers = [
+        { id: 'worker-alpha-1234', title: '前端 Worker', stage: 'working', summary: '正在更新页面', sessionId: 'session-a', active: true, subscribed: true },
+        { id: 'worker-beta-5678', title: '测试 Worker', stage: 'waiting', summary: '等待反馈', sessionId: 'session-b', active: true, subscribed: true },
+        { id: 'worker-stopped', title: '已停止 Worker', stage: 'ended', summary: '', sessionId: 'session-c', active: false, subscribed: true },
+        { id: 'worker-unsubscribed', title: '未订阅 Worker', stage: 'working', summary: '', sessionId: 'session-d', active: true, subscribed: false },
+      ]
+      const messages: RoomMessage[] = [
+        { id: 'room-m1', at: '2026-11-01T10:00:00Z', kind: 'user', actor: { role: 'user', name: 'Alice' }, text: '请处理任务', audience: 'router' },
+        { id: 'room-m2', at: '2026-11-01T10:01:00Z', kind: 'collaboration', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '页面结构已更新', audience: 'thread' },
+        { id: 'room-m3', at: '2026-11-01T10:02:00Z', kind: 'system', actor: { role: 'worker', name: '前端 Worker', ticketId: workers[0]!.id }, text: '运行命令：pnpm test', audience: 'record', ticketId: workers[0]!.id, details: 'PASS 3 tests' },
+        { id: 'room-m4', at: '2026-11-01T10:03:00Z', kind: 'assignment', actor: { role: 'router', name: 'Router' }, text: 'Worker 职责：修复前端显示问题', audience: 'worker', recipient: workers[0]!.id, ticketId: workers[0]!.id, details: '仅处理面板样式与交互。' },
+        { id: 'room-m5', at: '2026-11-01T10:04:00Z', kind: 'report', actor: { role: 'worker', name: '质量验证 Worker', ticketId: workers[1]!.id },
+          text: '验证报告已交付。', audience: 'router', ticketId: workers[1]!.id,
+          artifacts: [{ id: 'room-report-a', name: '任务群验收结果.zip', size: 2048 }] },
+      ]
+      const view: TaskRoomView = { key, title: '改进任务面板', source: 'web', updatedAt: messages.at(-1)!.at, workers, pending: false,
+        messages, earlier: null, writable: true, paused: false }
+      return { items: [view], views: { [key]: view }, activities: { [workers[0]!.id]: { items: [
+        { id: 'activity-1', type: 'tool', text: 'pnpm test\nPASS 3 tests' },
+      ], next_offset: null } } }
+    })(),
+    qqStatus: { enabled: false, mode: 'forward', state: 'disabled', detail: 'QQ 来源已关闭。', forwardUrl: 'ws://127.0.0.1:3001',
+      reverseUrl: 'ws://127.0.0.1:6199/onebot/v11/ws', tokenConfigured: false, allowedUsers: 0, groups: 0, received: 0 },
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
-      defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], notificationPending: false, next_offset: null },
-    tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
+      defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], failures: [], notificationPending: false, next_offset: null },
+    tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() }, decisions: [acceptDecision()],
+    schedules: { revision: 1, items: [{ id: 'schedule-1', revision: 1, config: { name: '邮箱检查', enabled: true,
+      program: 'C:\\Python\\python.exe', args: ['mail_check.py', '--quiet'], cwd: 'C:\\mail-check', intervalSeconds: 300,
+      timeoutSeconds: 120 }, nextRunAt: '2026-11-02T00:00:00.000Z', lastRun: { status: 'success', startedAt: '2026-11-01T00:00:00.000Z',
+      finishedAt: '2026-11-01T00:00:03.000Z', exitCode: 0 }, running: false }] },
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
       { stage: 'person', action: 'answer' }),
@@ -285,13 +349,117 @@ interface Request<K extends keyof Api> { params: RouteParams<K>; query: Partial<
 type Answer<K extends keyof Api> = ApiResponse<K> | Refusal
 type Route<K extends keyof Api> = { query?: readonly Query<K>[]; answer: (request: Request<K>) => Answer<K> | Promise<Answer<K>> }
   & (Api[K] extends { body: unknown } ? { body: true } : { body?: never })
-const page = <T>(items: T[]) => ({ items, total: items.length, next_offset: null })
+const page = <T>(items: T[], offset = 0, limit = 50) => ({ items: items.slice(offset, offset + limit), total: items.length,
+  next_offset: offset + limit < items.length ? offset + limit : null })
 const ticketOf = (id: string) =>
   [...server.tickets.open, ...server.person, ...server.tickets.ended].find(ticket => ticket.id === id) ?? server.ticketDetails[id]
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET rooms': { query: ['offset', 'limit'], answer: ({ query }) => {
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50), items = server.rooms.items.slice(offset, offset + limit)
+    return { items, next_offset: offset + limit < server.rooms.items.length ? offset + limit : null }
+  } },
+  'GET rooms/:key': { query: ['before', 'limit'], answer: ({ params, query }) => {
+    const room = server.rooms.views[params.key]
+    if (!room) return refuse(404, '任务群不存在。')
+    const limit = Number(query.limit ?? 50)
+    if (!query.before) return { ...room, messages: room.messages.slice(-limit), earlier: room.messages.length > limit ? room.messages.at(-limit)?.id ?? null : null }
+    const index = room.messages.findIndex(item => item.id === query.before)
+    if (index < 0) return { ...room, messages: [], earlier: null }
+    const start = Math.max(0, index - limit)
+    return { ...room, messages: room.messages.slice(start, index), earlier: start > 0 ? room.messages[start - 1]?.id ?? null : null }
+  } },
+  'POST rooms/:key/messages': { body: true, answer: ({ params, body }) => {
+    const room = server.rooms.views[params.key]
+    if (!room) return refuse(404, '任务群不存在。')
+    if (server.roomMessageError) return refuse(500, server.roomMessageError)
+    const previous = room.messages.find(item => item.id === body.requestId)
+    if (previous) return { ...room, messages: room.messages }
+    const worker = room.workers.find(item => item.id === body.recipient)
+    const message: RoomMessage = { id: body.requestId, at: new Date().toISOString(), kind: 'user', actor: { role: 'user', name: 'Alice' },
+      text: body.text, audience: body.recipient ? 'worker' : 'router', recipient: worker?.title ?? body.recipient,
+      ...(body.recipient ? { ticketId: body.recipient } : {}) }
+    room.messages.push(message); room.updatedAt = message.at
+    return { ...room }
+  } },
+  'GET rooms/:key/workers/:ticketId/activity': { query: ['offset', 'limit'], answer: ({ params, query }) => {
+    const data = server.rooms.activities[params.ticketId] ?? { items: [], next_offset: null }
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    const items = data.items.slice(offset, offset + limit)
+    return { items, next_offset: offset + limit < data.items.length ? offset + limit : null }
+  } },
+  'GET qq/status': { answer: () => ({ ...server.qqStatus, tokenConfigured: !!server.qqToken || server.qqStatus.tokenConfigured }) },
+  'PUT qq/token': { body: true, answer: ({ body }) => {
+    if (server.qqTokenError) return refuse(500, server.qqTokenError)
+    server.qqToken = body.value
+    server.qqStatus = { ...server.qqStatus, tokenConfigured: !!body.value }
+    return { configured: !!body.value }
+  } },
+  'GET web/tasks': { query: ['offset', 'limit'], answer: ({ query }) => {
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    return { items: server.webTasks.items.slice(offset, offset + limit), next_offset: offset + limit < server.webTasks.items.length ? offset + limit : null }
+  } },
+  'GET web/tasks/:id': { answer: ({ params }) => server.webTasks.records[params.id] ?? refuse(404, '任务对话不存在。') },
+  'POST web/tasks': { body: true, answer: ({ body }) => {
+    const id = `web-task-${body.requestId}`
+    const existing = server.webTasks.records[id]
+    if (existing) return existing.messages[0]?.text === body.text ? existing : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+    const at = new Date().toISOString()
+    const created = { id, title: body.text.split('\n')[0]!.slice(0, 100), createdAt: at, updatedAt: at, status: 'queued' as const,
+      tickets: [], messages: [{ id: `web-message-${body.requestId}`, role: 'user' as const, text: body.text, at }] }
+    server.webTasks.records[id] = created
+    const { messages: _messages, ...summary } = created
+    server.webTasks.items.unshift(summary)
+    return created
+  } },
+  'POST web/tasks/:id/messages': { body: true, answer: ({ params, body }) => {
+    const task = server.webTasks.records[params.id]
+    if (!task) return refuse(404, '任务对话不存在。')
+    const previous = task.messages.find(message => message.id === `web-message-${body.requestId}`)
+    if (previous) return previous.text === body.text ? task : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+    const at = new Date().toISOString()
+    task.messages.push({ id: `web-message-${body.requestId}`, role: 'user', text: body.text, at }); task.updatedAt = at
+    const summary = server.webTasks.items.find(item => item.id === task.id)
+    if (summary) summary.updatedAt = at
+    return task
+  } },
   'GET state': { answer: stateView },
+  'GET schedules': { answer: () => server.schedules },
+  'POST schedules': { body: true, answer: ({ body }) => {
+    const revision = ++server.schedules.revision
+    const item = { id: `schedule-${server.schedules.items.length + 2}`, revision: 1, config: body.config,
+      nextRunAt: body.config.enabled ? new Date(Date.now() + body.config.intervalSeconds * 1000).toISOString() : null, running: false }
+    server.schedules.items.push(item)
+    return { item }
+  } },
+  'PUT schedules/:id': { body: true, answer: ({ params, body }) => {
+    const item = server.schedules.items.find(candidate => candidate.id === params.id)
+    if (!item) return refuse(404, 'Schedule not found')
+    if (item.revision !== body.revision) return refuse(409, 'Schedule changed. Reload before saving.')
+    item.revision++; server.schedules.revision++
+    item.config = body.config
+    item.nextRunAt = body.config.enabled ? new Date(Date.now() + body.config.intervalSeconds * 1000).toISOString() : null
+    return { item }
+  } },
+  'POST schedules/:id/run': { answer: ({ params }) => {
+    const item = server.schedules.items.find(candidate => candidate.id === params.id)
+    if (!item) return refuse(404, 'Schedule not found')
+    const status = server.settings.paused ? 'queued' : 'running'
+    item.running = status === 'running'
+    item.lastRun = { status: 'running', startedAt: new Date().toISOString() }
+    return { status, item }
+  } },
+  'DELETE schedules/:id': { body: true, answer: ({ params, body }) => {
+    const index = server.schedules.items.findIndex(candidate => candidate.id === params.id)
+    if (index < 0) return refuse(404, 'Schedule not found')
+    if (server.schedules.items[index]!.revision !== body.revision) return refuse(409, 'Schedule changed. Reload before saving.')
+    server.schedules.items.splice(index, 1); server.schedules.revision++
+    return { removed: true }
+  } },
+  'GET watchdog/snapshot': { answer: () => ({ schema: 1, observedAt: new Date().toISOString(), infrastructure: { configured: true, paused: false, health: {}, setup: [] },
+    executor: { activeWorkers: 0, maxWorkers: 4 }, tickets: [], candidates: [], baseline: { status: 'healthy', findings: [], semanticReview: 'not_configured' } }) },
+  'POST watchdog/tickets/:id/request-status': { answer: () => ({ requested: false }) },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {
     const q = query.q ?? ''
@@ -320,12 +488,19 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     return { removed, thread: params.key, context_delivery: 'injected' }
   } },
   'POST triggers/:id/requeue': { answer: ({ params }) => { server.queued.add(params.id); return { queued: true } } },
-  'GET decisions': { query: ['kind', 'window', 'offset', 'limit'], answer: ({ query }) =>
-    ({ items: query.kind === 'ignore' ? [] : [acceptDecision()], next_offset: null }) },
+  'GET decisions': { query: ['kind', 'window', 'offset', 'limit'], answer: async ({ query }) => {
+    const items = query.kind === 'ignore' ? [] : server.decisions
+    const selected = page(items, Number(query.offset ?? 0), Number(query.limit ?? 50))
+    if (query.kind === 'accept,reopen') await server.decisionDelay
+    return selected
+  } },
   'POST decisions/:id/dismiss': { answer: ({ params }) => params.id === 'u1' ? { dismissed: true } : refuse(404,
     'Unavailable Eval not found') },
-  'GET tickets': { query: ['state', 'offset', 'limit'], answer: ({ query }) => page(server.tickets[query.state === 'ended' ? 'ended'
-    : 'open']) },
+  'GET tickets': { query: ['state', 'offset', 'limit'], answer: async ({ query }) => {
+    const result = page(server.tickets[query.state === 'ended' ? 'ended' : 'open'], Number(query.offset ?? 0), Number(query.limit ?? 50))
+    await server.ticketDelay
+    return result
+  } },
   'GET tickets/:id': { answer: ({ params }) => server.ticketDetails[params.id] ?? refuse(404, 'Ticket not found') },
   'POST tickets/:id/retry': { answer: ({ params }) => {
     const ticket = ticketOf(params.id)
@@ -369,9 +544,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET policy/history': { answer: () => server.history },
   'POST policy-sync/:id': { answer: ({ params }) => ({ policy: server.settings.policy.sources[params.id] }) },
   'POST setup/check': { answer: () => ({ restarting: true }) },
-  'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
-    groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
-      reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
+  'GET models': { answer: () => server.models },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

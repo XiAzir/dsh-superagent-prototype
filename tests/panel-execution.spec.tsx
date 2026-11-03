@@ -3,7 +3,7 @@
 import { act } from 'react'
 import { expect, it } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
+import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { MEMBER, server, ticketSummary, threadSummary } from './fixtures/panel-server.ts'
 
 usePanel()
@@ -38,6 +38,56 @@ it('lists Tickets under Execution by who they wait on, with the Executor state a
   await click(tab(zh['tab.settings']))
   await click(zh.save)
   expect(server.settings).toMatchObject({ paused: true, executor: { maxWorkers: 4 } })
+})
+
+it('loads Ticket pages past the 1000 row host limit without duplicating rows', async () => {
+  server.tickets.open = Array.from({ length: 1001 }, (_, index) => ticketSummary({ id: `page-${index}`, title: `Ticket ${index}` }))
+  await mount()
+  await click(zh['tab.execution'])
+  for (let page = 1; page < 51; page++) await click(zh.loadMore)
+  expect(server.requests.some(request => request.path === 'tickets?state=open&limit=20&offset=1000')).toBe(true)
+  expect(all('.dt-list > li')).toHaveLength(1001)
+  expect(all('.dt-list > li').at(-1)?.textContent).toContain('Ticket 1000')
+}, 30000)
+
+it('refreshes every loaded Ticket page, removes vanished rows, and follows the refreshed cursor', async () => {
+  server.tickets.open = Array.from({ length: 81 }, (_, index) => ticketSummary({ id: `refresh-${index}`, title: `Ticket [${index}]` }))
+  await mount()
+  await click(zh['tab.execution'])
+  await click(zh.loadMore)
+  server.tickets.open = server.tickets.open.slice(1).map(ticket => ticket.id === 'refresh-25'
+    ? ticketSummary({ ...ticket, title: 'Ticket [25] updated' }, { stage: 'person', action: 'answer' }) : ticket)
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  await settle()
+  expect(all('.dt-list > li')).toHaveLength(40)
+  expect(all('.dt-list > li').some(row => row.textContent?.includes('Ticket [0]'))).toBe(false)
+  expect(text()).toContain('Ticket [25] updated')
+  await click(zh.loadMore)
+  expect(server.requests.some(request => request.path === 'tickets?state=open&limit=20&offset=40')).toBe(true)
+  expect(all('.dt-list > li')).toHaveLength(60)
+}, 15000)
+
+it('clears queued load-more busy state when a refresh exhausts the cursor', async () => {
+  const rows = Array.from({ length: 21 }, (_, index) => ticketSummary({ id: `queued-${index}`, title: `Queued ${index}` }))
+  server.tickets.open = rows
+  await mount()
+  await click(zh['tab.execution'])
+  server.tickets.open = rows.slice(0, 20)
+  let release!: () => void
+  server.ticketDelay = new Promise<void>(resolve => { release = resolve })
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  await act(async () => { find(zh.loadMore).click() })
+  expect(find(zh.loadMore).getAttribute('aria-busy')).toBe('true')
+  release()
+  await settle()
+  server.ticketDelay = undefined
+  expect(all('button').some(button => button.textContent?.trim() === zh.loadMore)).toBe(false)
+  server.tickets.open = rows
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+  await settle()
+  expect(find(zh.loadMore).hasAttribute('disabled')).toBe(false)
+  await click(zh.loadMore)
+  expect(all('.dt-list > li')).toHaveLength(21)
 })
 
 it('stops an open Ticket from its page after confirmation', async () => {

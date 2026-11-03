@@ -56,6 +56,8 @@ it('reads each page a tab remembered with the parameters it takes, and leaves ou
     .toEqual({ page: 'trigger', id: 'github:1', query: { trigger: 'e1' } })
   expect(parseRoute({ page: 'eval', query: { filter: 'stop', window: '7d' } })).toEqual({ page: 'eval', query: { filter: 'stop' } })
   expect(parseRoute({ page: 'execution', id: 5, query: { filter: 'idle' } })).toEqual({ page: 'execution', query: { filter: 'idle' } })
+  expect(parseRoute({ page: 'rooms', id: 'web:task-1' })).toEqual({ page: 'rooms', id: 'web:task-1' })
+  expect(parseRoute({ page: 'rooms', id: 17 })).toEqual({ page: 'rooms' })
   expect(parseRoute({ page: 'settings', query: { group: 'policy', source: 'feishu' } }))
     .toEqual({ page: 'settings', query: { group: 'source', source: 'feishu' } })
   expect([parseRoute('overview'), parseRoute(null)]).toEqual([undefined, undefined])

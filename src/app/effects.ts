@@ -33,11 +33,17 @@ interface Handler<K extends EffectKind> {
   ordered: boolean
   /** When true, repeated failures do not mark the effect kind's health entry as `error` (used when failures are already surfaced on a ticket). */
   quiet: boolean
+  /** Optional FIFO lane; rows sharing a lane run one at a time, while separate lanes use the kind's normal limit. */
+  group?: (payload: EffectPayloads[K], key: string, attempts: number) => string | undefined
+  /** Optional reserved-capacity class, such as time-sensitive interactive replies. */
+  priority?: (payload: EffectPayloads[K], key: string) => boolean
+  /** Slots kept available for priority work; normal rows never consume these slots. */
+  reserve?: number
 }
-type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet'>>
+type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet' | 'group' | 'priority' | 'reserve'>>
 /** `seq` preserves the row's queue position; `generation` increments on payload updates so a running attempt does not delete a newer payload. */
 interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number }
-type Task = { kind: EffectKind; key: string; done: Promise<void> }
+type Task = { kind: EffectKind; key: string; group?: string; priority: boolean; done: Promise<void> }
 
 /**
  * Durable SQLite-backed queue that persists side effects inside command transactions and dispatches them after commit.
@@ -67,8 +73,8 @@ export class Effects {
   handle<K extends EffectKind>(kind: K, run: Handler<K>['run'], options: Options<K> = {}): void {
     if (this.handlers.has(kind)) throw new Error(`The ${kind} effects already have a handler`)
     this.health.set(kind, this.board.claim(kind))
-    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false } = options
-    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet } as unknown as Handler<never>)
+    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false, group, priority, reserve = 0 } = options
+    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet, group, priority, reserve } as unknown as Handler<never>)
     this.report(kind)
     this.kick()
   }
@@ -86,11 +92,11 @@ export class Effects {
     this.scheduled = true
     queueMicrotask(() => { this.scheduled = false; this.dispatch() })
   }
-  /** Resolves once no effect of `kind` (or of any kind) is running and none can start because none is due or `limit()` has no room. */
-  async idle(kind?: EffectKind): Promise<void> {
+  /** Wait for running attempts of `kind`, optionally one `key`; delayed or capacity-blocked rows remain durably queued. */
+  async idle(kind?: EffectKind, key?: string): Promise<void> {
     for (;;) {
       this.dispatch()
-      const running = [...this.tasks].filter(task => kind === undefined || task.kind === kind).map(task => task.done)
+      const running = [...this.tasks].filter(task => (kind === undefined || task.kind === kind) && (key === undefined || task.key === key)).map(task => task.done)
       if (!running.length) return
       await Promise.allSettled(running)
     }
@@ -105,6 +111,47 @@ export class Effects {
     for (const [kind, handler] of this.handlers) {
       try {
         const running = new Set([...this.tasks].filter(task => task.kind === kind).map(task => task.key))
+        if (handler.group) {
+          const runningGroups = new Set([...this.tasks].filter(task => task.kind === kind && task.group !== undefined).map(task => task.group!))
+          const candidates: { row: Row; group?: string; priority: boolean }[] = []
+          const seenGroups = new Set<string>()
+          const pageSize = 64
+          let offset = 0
+          // Scan sequence pages until there are enough runnable lanes. This examines the oldest row of each group even
+          // when it is delayed, and avoids a fixed LIMIT letting a long run of one blocked lane starve later lanes.
+          for (;;) {
+            const rows = this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT ? OFFSET ?')
+              .all(kind, pageSize, offset) as unknown as Row[]
+            if (!rows.length) break
+            for (const row of rows) {
+              const group = handler.group(JSON.parse(row.value) as never, row.key, row.attempts)
+              if (group !== undefined) {
+                if (seenGroups.has(group)) continue
+                seenGroups.add(group)
+                if (runningGroups.has(group)) continue
+              }
+              if (row.due > this.now() || running.has(row.key)) continue
+              candidates.push({ row, ...(group !== undefined ? { group } : {}), priority: handler.priority?.(JSON.parse(row.value) as never, row.key) ?? false })
+            }
+            if (rows.length < pageSize) break
+            offset += pageSize
+          }
+          const limit = candidates.length ? handler.limit() : 0
+          const capacity = Math.max(0, limit - running.size)
+          const runningPriority = [...this.tasks].filter(task => task.kind === kind && task.priority).length
+          const runningNormal = running.size - runningPriority
+          const priorityRows = candidates.filter(item => item.priority)
+          const normalRows = candidates.filter(item => !item.priority)
+          // Give every ready priority row the newly available slot first. Normal work always leaves `reserve`
+          // slots outside its own ceiling, so a later priority row can start even after normal workers refill.
+          const priorityRoom = Math.min(priorityRows.length, capacity)
+          const normalRoom = Math.min(normalRows.length, capacity - priorityRoom,
+            Math.max(0, limit - (handler.reserve ?? 0) - runningNormal))
+          const selected = [...priorityRows.slice(0, priorityRoom), ...normalRows.slice(0, normalRoom)]
+          for (const item of selected) this.run(kind, handler, item.row, item.group, item.priority)
+          if (this.broken.delete(kind)) this.report(kind)
+          continue
+        }
         // Ordered kinds block behind their oldest row even when it is not yet due; limit() is queried only after ready rows exist.
         const rows = (handler.ordered
           ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
@@ -120,8 +167,8 @@ export class Effects {
       } catch (error) { this.failed(kind, error) }
     }
   }
-  private run(kind: EffectKind, handler: Handler<never>, row: Row): void {
-    const task: Task = { kind, key: row.key, done: Promise.resolve() }
+  private run(kind: EffectKind, handler: Handler<never>, row: Row, group?: string, priority = false): void {
+    const task: Task = { kind, key: row.key, ...(group !== undefined ? { group } : {}), priority, done: Promise.resolve() }
     task.done = this.attempt(kind, handler, row)
       .catch((error: unknown) => { this.failed(kind, error) })
       .finally(() => { this.tasks.delete(task); this.kick() })

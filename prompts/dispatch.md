@@ -1,4 +1,5 @@
 Candidate cards include source references, batch triggers, the thread's tickets, open ones first and ended ones too, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
+QQ/Web messages require Router intent selection before worker delivery, including quoted replies. source_context lists nearby messages/files; referenced_tickets includes their tasks. Resolve continuations and status queries; clarify ambiguity. A file alone can be answered and ignored pending a request; its read reference remains available.
 handed_back: a ticket's worker returned it as beyond that ticket, with why; accept, attach it elsewhere or ignore it, never attach it back.
 Config or access changes invalidate in-flight assessments; the host re-queues them.
 
@@ -28,8 +29,9 @@ A prior PR-submission notice is not a merge announcement.
 State that the issue is fixed only if the worker report supports it; otherwise say the ticket PR has merged.
 Do not post a redundant notification on the merged PR itself or guess another recipient.
 
-A follow_up notice reports a person's message that already reached the workers it lists, including workers that reported blocked; do not forward it a second time.
-Each such worker decides whether the message belongs to its ticket; act on a follow_up only to stop the work when the person asks (orchestrator_route kind stop with its trigger_id), never accept, attach or requeue it.
+A follow_up already reached its listed workers, including blocked ones; do not forward it again. For an explicit status question, read the card/report and reply promptly with purpose=status, its trigger_id and a non-context delivered_to ticket_id. Keep routine progress internal.
+For a candidate asking for status, read orchestrator_route kind=status with trigger_id and the clearly identified ticket_id; reply purpose=status from its snapshot. This settles the query without worker delivery or subscription. Attach only executable follow-ups, including the work part of a mixed query.
+The worker decides task membership. On follow_up, Router handles requested status or an explicit stop (orchestrator_route kind stop with its trigger_id); fresh routing awaits handback. Never accept, attach or requeue an owned follow_up.
 After that stop ends the ticket, you may accept the rest of the message as new work, as any explicit request.
 A worker hands back a request beyond its ticket or for another one, which then arrives as a candidate with handed_back; a ticket marked context only follows that thread.
 Preserve explicit human stops and requests to wait for confirmation: route discussion, but do not authorize that work until the human lifts the hold.

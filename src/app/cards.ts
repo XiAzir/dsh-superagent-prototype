@@ -8,10 +8,13 @@ import { batchLine, inputResource } from '../executor/dsh.ts'
 export function preview(text: string): string { return text.replace(/\s+/g, ' ').slice(0, 160) }
 export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) {
   return { trigger_id: trigger.id, source: trigger.source, ...(trigger.url ? { source_url: trigger.url } : {}), actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), human: trigger.human, at: trigger.at,
+    ...trigger.attachments?.length ? { attachments: trigger.attachments } : {},
+    ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}`,
     ...(disposition ? { disposition: { ...(disposition.filtered ? { filtered: reasonText(disposition.filtered) } : {}),
       ...(disposition.decisionId ? { decision_id: disposition.decisionId } : {}),
-      delivered_to: disposition.fanout } } : {}) }
+      ...disposition.routing && disposition.routing !== 'worker' ? { matched_tickets: disposition.matched ?? [], routing: disposition.routing }
+        : { delivered_to: disposition.fanout } } } : {}) }
 }
 /** The states a ticket card shows: an open ticket's stage (docs/003), and an ended ticket's outcome. */
 export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',

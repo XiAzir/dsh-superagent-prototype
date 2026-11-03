@@ -1,6 +1,6 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { liveTicket, runningAssignment, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
@@ -11,20 +11,39 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
-  sendReplies(): Promise<void>
+  /** Schedules a pass to deliver the collaboration note inputs queued by the Engine. */
+  requestPass(): void
+  sendReplies(receiptId?: string): Promise<void>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
   return [
-    readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
+    readTool('Read one page of this ticket’s listed resources; follow page links.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
+    tool({
+      name: 'orchestrator_thread_publish',
+      description: 'Publish peer-relevant context on a subscribed thread; skip routine updates. Reuse IDs only for retries.',
+      schema: z.object({
+        thread: z.string().min(1),
+        text: z.string().trim().min(1).max(4000),
+        request_id: z.string().trim().min(1).max(200),
+      }).strict(),
+      execute: async args => {
+        const current = host.store.tickets.get(ticketId)
+        const currentAssignmentId = current && runningAssignment(current)?.id
+        if (!currentAssignmentId) throw new Error('No running Assignment owns this publication')
+        const receipt = host.engine.collaborate(ticketId, args.thread, args.text, args.request_id, currentAssignmentId)
+        host.requestPass()
+        return { published: true, ...receipt }
+      },
+    }),
     tool({
       name: 'orchestrator_ack',
       description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',
@@ -34,7 +53,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       }).strict(),
       execute: async args => {
         const reply = host.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: args.trigger_id, text: args.text })
-        if (reply.status !== 'sent') await host.sendReplies()
+        if (reply.status !== 'sent') await host.sendReplies(reply.id)
         return { trigger_id: args.trigger_id, acknowledgement: host.store.replyStatus(reply.id)!, reused: reply.reused }
       },
     }),
@@ -79,25 +98,43 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         summary: z.string().min(1),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
-        pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        pr_number: z.number().int().positive().nullish().describe(host.github.deployment.github
+          ? `The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`
+          : 'The ticket\'s GitHub PR number; only available when a GitHub Source is configured. Omit when the task has no PR.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+        artifacts: z.array(z.object({ path: z.string().min(1), name: z.string().optional(),
+          kind: z.enum(['file', 'image', 'video']).optional() }).strict()).max(8).optional()
+          .describe('With state=ready: output files inside this task directory. The host snapshots them and the Router delivers them through the original source; do not call QQ or handle its credentials yourself.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        // Bind this call before artifact or PR reads yield; registrations survive retries with the worker Session.
+        const assignmentId = runningAssignment(current)?.id
+        if (args.pr_number != null && (!host.github.deployment.github || !host.github.deployment.repository)) {
+          throw new Error('PR reporting requires a configured GitHub Source; omit pr_number when this task has no GitHub PR')
+        }
+        if (args.artifacts?.length && args.state !== 'ready') throw new Error('Report deliverable artifacts only with state=ready')
+        const artifacts = args.artifacts?.length ? await Promise.all(args.artifacts.map(async item => {
+          if (!host.resources.artifacts || !current.execution?.directory) throw new Error('Task artifact storage is unavailable')
+          return host.resources.artifacts.stage(ticketId, current.execution.directory, item.path, item.name, item.kind, signal)
+        })) : []
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+            ...artifacts.length ? { artifacts: artifacts.map(item => item.id) } : {},
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
-          const updated = host.engine.report(ticketId, report)
+          if (!assignmentId) throw new Error('No running Assignment owns this report')
+          const updated = host.engine.report(ticketId, report, assignmentId)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
-          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          return { reported: true, notification, ...artifacts.length ? { artifacts: artifacts.map(({ id, name, size }) => ({ id, name, size })) } : {},
+            ...(updated.attention ? { attention: updated.attention } : {}) }
         })
       },
     }),

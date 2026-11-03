@@ -20,6 +20,10 @@ A `person` stage means the Ticket cannot continue without human input. A new hum
 
 An `idle` Ticket has finished its turn without an outstanding question. A Trigger on a subscribed Thread can continue it.
 
+### Human status questions
+
+A human follow-up that asks for the Ticket's status already reaches its worker. The Router can answer from the Ticket card and latest saved Report without requesting another worker turn. The status reply names both the follow-up Trigger and a Ticket it reached on a non-context Thread; it returns the current read-only status snapshot alongside its receipt and uses the triggering Source's Channel. Identical status replies for one Trigger and Ticket share one Outbox identity. Ordinary progress reports stay internal.
+
 ## The Executor
 
 Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `<stateDir>/work`.

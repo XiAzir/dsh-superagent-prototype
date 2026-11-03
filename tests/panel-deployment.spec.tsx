@@ -9,6 +9,37 @@ import { usePanel, mount, remount, settle, all, find, tab, click, type, text, fi
 import { server, problemOf, fakeForm } from './fixtures/panel-server.ts'
 
 usePanel()
+it('shows the running mode when the DSH form exposes only volatile limits and saves only the edited limit', async () => {
+  server.setup.machine.mode = 'personal'
+  const { form, mutations } = fakeForm()
+  server.form = form
+  at({ page: 'settings', query: { group: 'deployment' } })
+  await mount()
+  expect(field<HTMLSelectElement>(zh.deploymentMode).value).toBe('personal')
+  expect(text()).toContain(zh.deploymentPersonalHint)
+  expect(document.querySelector('.dt-savebar')).toBeNull()
+  await type(field<HTMLInputElement>(zh.deploymentContextPages), '15')
+  await click(zh.save)
+  expect(mutations).toEqual([{ revision: 1, ops: [{ op: 'set', path: ['admissionContextMaxPages'], value: 15 }] }])
+  expect(field<HTMLSelectElement>(zh.deploymentMode).value).toBe('personal')
+})
+
+it('edits an exposed mode with a revision fence and keeps the running mode until the plugin restarts', async () => {
+  server.setup.machine.mode = 'personal'
+  const { form, mutations, publish } = fakeForm()
+  publish({ value: { ...form.getSnapshot().value, mode: 'personal' } })
+  server.form = form
+  at({ page: 'settings', query: { group: 'deployment' } })
+  await mount()
+  await type(field<HTMLSelectElement>(zh.deploymentMode), 'repository')
+  expect(text()).toContain(zh.deploymentRepositoryHint)
+  expect(text()).toContain(zh.personalMode)
+  await click(zh.save)
+  expect(mutations).toEqual([{ revision: 1, ops: [{ op: 'set', path: ['mode'], value: 'repository' }] }])
+  expect(form.getSnapshot().value).toMatchObject({ mode: 'repository' })
+  expect(field<HTMLSelectElement>(zh.deploymentMode).value).toBe('repository')
+})
+
 it('saves this machine\'s settings in the Deployment settings through DSH\'s configuration form, without a restart', async () => {
   const { form: editable, mutations } = fakeForm()
   server.form = editable

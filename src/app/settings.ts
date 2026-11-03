@@ -48,7 +48,10 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     parse: (value, sources, id) => sources.validate(id, z.object({ enabled: z.boolean(), config: z.unknown() }).parse(value)),
     merge: (settings, value, id) => ({ ...settings, sources: { ...settings.sources, [id]: value as SettingsValue['sources'][string] } }),
     // Only the management panel may switch source accounts.
-    guard: (current, candidate, origin) => { if (origin !== 'panel' && setupChanged(current, candidate)) throw new UserError('panelOnlyAccounts') },
+    guard: (current, candidate, origin) => {
+      if (origin !== 'panel' && (setupChanged(current, candidate)
+        || JSON.stringify(current.sources.qq) !== JSON.stringify(candidate.sources.qq))) throw new UserError('panelOnlyAccounts')
+    },
   },
 }
 

@@ -832,6 +832,26 @@ describe('worker reports', () => {
     expect(report({ answers: '4' })).toThrow(new UserError('notAnswerable'))
     expect(report({ answers: '1' })()).toMatchObject({ answers: ['1'] })
   })
+  it('rejects reports from a replaced assignment and accepts a launch failure for the pending assignment', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const oldAssignmentId = h.repo.tickets.get(ticketId)!.assignments.at(-1)!.id
+    h.engine.deliveryFailed(ticketId, oldAssignmentId, 'Session busy')
+    h.engine.retryTicket(ticketId)
+    const pending = h.repo.tickets.get(ticketId)!.assignments.at(-1)!
+    expect(pending).toMatchObject({ state: 'pending' })
+    expect(pending.id).not.toBe(oldAssignmentId)
+
+    expect(() => h.engine.report(ticketId, { state: 'ready', summary: 'late result' }, oldAssignmentId))
+      .toThrow(new UserError('assignmentEnded'))
+    const afterLateReport = h.repo.tickets.get(ticketId)!
+    expect(afterLateReport.ended).toBeUndefined()
+    expect(afterLateReport.assignments.at(-1)).toMatchObject({ id: pending.id, state: 'pending' })
+
+    h.engine.report(ticketId, { state: 'failed', summary: 'launch failed' }, pending.id)
+    expect(h.repo.tickets.get(ticketId)!.assignments.at(-1)).toMatchObject({ state: 'pending',
+      report: { state: 'failed', summary: 'launch failed' } })
+  })
   it('refuses a report on an ended ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
@@ -1008,6 +1028,30 @@ describe('automatic input', () => {
   })
 })
 describe('replies', () => {
+  it('spills long status reports behind their original report resource without changing the stored content', () => {
+    const h = harness(), ticketId = accepted(h).ticketId!
+    const summary = '可验证的进展'.repeat(300)
+    h.engine.report(ticketId, { state: 'progress', summary })
+    h.engine.receive(trigger('2', { text: '进展如何？' }))
+    const reply = h.engine.reply({ purpose: 'status', ticketId, triggerId: '2', text: '正在推进。' })
+    const stored = h.repo.tickets.get(ticketId)!.assignments.at(-1)!
+    expect(reply.snapshot?.latest_report).toMatchObject({ chars: summary.length, summary: summary.slice(0, 600),
+      read: `ticket/${ticketId}/report/${stored.id}` })
+    expect(stored.report?.summary).toBe(summary)
+  })
+  it('delivers only artifacts registered in the current ready report and preserves result retry identity', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2'))
+    expect(() => h.engine.reply({ purpose: 'answer', ticketId, triggerId: '2', text: 'x', artifacts: ['foreign'] })).toThrow('artifacts')
+    h.engine.report(ticketId, { state: 'ready', summary: 'Done', artifacts: ['artifact-a'] })
+    expect(() => h.engine.reply({ purpose: 'result', ticketId, text: 'Done', artifacts: ['foreign'] })).toThrow('artifacts')
+    const first = h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })
+    expect(h.outbox.at(-1)?.artifacts).toEqual(['artifact-a'])
+    expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toEqual({ ...first, reused: true })
+    h.engine.reply({ purpose: 'result', ticketId, text: 'Text only', artifacts: [] })
+    expect(h.outbox.at(-1)).not.toHaveProperty('artifacts')
+  })
   it('acknowledges a person\'s message that reached an open ticket once, and refuses others', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
@@ -1047,6 +1091,44 @@ describe('replies', () => {
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ status: 'pending' })
     expect(h.outbox.at(-1)!.channel).toEqual(trigger('1').channel)
+  })
+  it('answers a reached human status question from a read-only snapshot with trigger-and-ticket idempotency', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const asked = trigger('2', { actor: guest, channel: { source: 'chat', thread: 't1', address: { message: '2' } } })
+    h.engine.receive(asked)
+    h.engine.report(ticketId, { state: 'progress', summary: 'Updated the parser; checking edge cases.' })
+    const first = h.engine.reply({ purpose: 'status', ticketId, triggerId: asked.id, text: 'The parser is updated and edge cases are being checked.' })
+    expect(first).toMatchObject({ status: 'pending', reused: false, snapshot: {
+      ticket_id: ticketId, title: 'Fix', stage: { stage: 'working' },
+      assignment: { state: 'running', report: { state: 'progress', summary: 'Updated the parser; checking edge cases.' } },
+    } })
+    expect(h.outbox.at(-1)).toMatchObject({ id: key('status-reply', asked.id, ticketId), channel: asked.channel,
+      text: 'The parser is updated and edge cases are being checked.', kind: 'reply', ticketId })
+    expect(h.engine.reply({ purpose: 'status', ticketId, triggerId: asked.id, text: 'Different wording.' })).toMatchObject({
+      id: first.id, reused: true,
+    })
+    expect(h.outbox.filter(item => item.id === first.id)).toHaveLength(1)
+    const second = trigger('3', { actor: guest })
+    h.engine.receive(second)
+    expect(h.engine.reply({ purpose: 'status', ticketId, triggerId: second.id, text: 'Still working.' }).id).not.toBe(first.id)
+  })
+  it('refuses status replies without a human trigger that explicitly reached the named ticket', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2', { human: false }))
+    expect(() => h.engine.reply({ purpose: 'status', ticketId, triggerId: '2', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
+    h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    expect(() => h.engine.reply({ purpose: 'status', ticketId, triggerId: '3', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
+
+    const contextTicket = accepted(h, '4', 'other').ticketId!
+    h.engine.followForContext(contextTicket, { source: 'chat', id: 'issue' })
+    h.engine.receive(trigger('5', { actor: guest, threads: [{ source: 'chat', id: 'issue' }] }))
+    expect(h.repo.triggers.disposition('5')).toMatchObject({ fanout: [contextTicket], context: [contextTicket] })
+    expect(() => h.engine.reply({ purpose: 'status', ticketId: contextTicket, triggerId: '5', text: 'Status' }))
+      .toThrow(new UserError('notReached'))
   })
 })
 describe('ticket commands', () => {

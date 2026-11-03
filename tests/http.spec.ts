@@ -1,27 +1,82 @@
 import { expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
+import { ArtifactRegistry } from '../src/app/artifacts.ts'
+import { Store } from '../src/app/store.ts'
+import { record } from '../src/kv.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
+import { ScheduleConflict } from '../src/app/schedules.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
+
+it('protects the QQ credential endpoint with the same origin check and accepts only a bounded token value', async () => {
+  const saved: string[] = []
+  const call = serve({ qq: { status: async () => ({ tokenConfigured: true }), setToken: async (value: string) => {
+    saved.push(value); return { configured: !!value }
+  } } })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token' }, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
+  expect(saved).toEqual([])
+  expect(await call('PUT', 'qq/token', { value: 'x'.repeat(4001) })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token', actor: 'forged' })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'qq/token', { value: 'onebot-test-token' })).toEqual({ status: 200, body: { configured: true } })
+  expect(await call('GET', 'qq/status')).toEqual({ status: 200, body: { tokenConfigured: true } })
+  expect(saved).toEqual(['onebot-test-token'])
+})
+
+it('serves bounded local schedule CRUD and immediate-run responses with revision conflicts', async () => {
+  const config = { name: 'Local mail check', enabled: true, program: process.execPath, args: ['--version'],
+    cwd: tmpdir(), intervalSeconds: 300, timeoutSeconds: 120 }
+  const item = { id: 'schedule-1', revision: 2, config, nextRunAt: '2026-11-01T10:05:00.000Z', running: false }
+  const schedules = {
+    list: () => ({ revision: 3, items: [item] }),
+    create: (value: unknown) => ({ ...item, id: 'schedule-2', revision: 1, config: value }),
+    update: (id: string, revision: number) => {
+      if (id !== item.id) throw new Error('Schedule not found')
+      if (revision !== item.revision) throw new ScheduleConflict()
+      return item
+    },
+    runNow: (id: string) => ({ status: 'queued' as const, item: id === item.id ? item : (() => { throw new Error('Schedule not found') })() }),
+    remove: async (id: string, revision: number) => {
+      if (id !== item.id) throw new Error('Schedule not found')
+      if (revision !== item.revision) throw new ScheduleConflict()
+      return { removed: true as const }
+    },
+  }
+  const call = serve({ schedules })
+  expect(await call('GET', 'schedules')).toEqual({ status: 200, body: { revision: 3, items: [item] } })
+  expect(await call('POST', 'schedules', { config })).toMatchObject({ status: 200, body: { item: { id: 'schedule-2', revision: 1 } } })
+  expect(await call('POST', 'schedules', { config, surprise: true })).toMatchObject({ status: 400 })
+  expect(await call('PUT', 'schedules/schedule-1', { revision: 1, config })).toEqual({ status: 409, body: { error: 'Schedule changed. Reload before saving.' } })
+  expect(await call('PUT', 'schedules/schedule-1', { revision: 2, config })).toEqual({ status: 200, body: { item } })
+  expect(await call('POST', 'schedules/schedule-1/run')).toEqual({ status: 200, body: { status: 'queued', item } })
+  expect(await call('DELETE', 'schedules/schedule-1', { revision: 1 })).toMatchObject({ status: 409 })
+  expect(await call('DELETE', 'schedules/schedule-1', { revision: 2 })).toEqual({ status: 200, body: { removed: true } })
+  expect(await call('POST', 'schedules/schedule-1/run', undefined, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
+})
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
   registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
-    let status = 0, text = ''
+    let status = 0, data = Buffer.alloc(0)
+    let responseHeaders: Record<string, string> = {}
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
     const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
       value]) => value !== undefined))
     const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() { yield* chunks } }
-    await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
-    return { status, body: JSON.parse(text) as Record<string, unknown> }
+    await handler(req, { writeHead: (code: number, values?: Record<string, string>) => { status = code; responseHeaders = values ?? {} },
+      end: (value?: string | Buffer | Uint8Array) => { if (value !== undefined) data = Buffer.from(value) } })
+    if (responseHeaders['content-type'] === 'application/octet-stream') return { status, bytes: data, headers: responseHeaders }
+    return { status, body: JSON.parse(data.toString('utf8')) as Record<string, unknown> }
   }
 }
 
@@ -70,14 +125,156 @@ it('decodes path parameters and parses each route\'s query', async () => {
 it('answers only a same-origin request from the panel on the loopback address', async () => {
   const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)
-  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { host: '127.0.0.1:9999' },
-    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' }]) {
+  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' },
+    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' },
+    { host: '127.0.0.1:013082' }, { host: '127.0.0.1:0' }, { host: '127.0.0.1:65536' },
+    { host: '127.0.0.1:14084/' }, { host: 'user@localhost:14084' }]) {
     expect(await post(headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084' })).toMatchObject({ status: 200 })
+  expect(await post({ host: 'localhost:14084', origin: 'http://localhost:14084' })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: undefined })).toMatchObject({ status: 200 })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084', 'sec-fetch-site': 'cross-site' }))
+    .toMatchObject({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(await post({ host: '127.0.0.1:14084', origin: 'http://127.0.0.1:14084', 'sec-fetch-site': 'same-origin' }))
+    .toMatchObject({ status: 200 })
   // Management routes require a loopback Web server.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
+})
+
+it('applies same-origin checks to personal Web task posts and maps setup and lookup failures', async () => {
+  const store = { settings: () => SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
+    policy: { sources: { web: { allowed: [{ id: 'owner' }] } } } }), get: () => undefined,
+    keys: () => [], threads: { get: () => undefined }, tickets: { get: () => undefined }, decisions: { byThread: () => [] } }
+  const call = serve({ machine: { mode: 'personal', promptMaxChars: { get: () => 100_000 }, admissionContextMaxPages: { get: () => 10 },
+      admissionContextTimeoutMs: { get: () => 15_000 } }, store,
+    configured: () => false, health: {}, requestPass: () => {}, engine: { receive: () => 'stored' } })
+
+  expect(await call('POST', 'web/tasks', { text: '新任务', requestId: 'request_123456' }, { origin: 'http://evil.example' }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(await call('POST', 'web/tasks', { text: '新任务', requestId: 'request_123456' }))
+    .toMatchObject({ status: 503 })
+  expect(await call('GET', 'web/tasks/missing')).toEqual({ status: 404, body: { error: '任务对话不存在。' } })
+})
+
+it('serves only immutable delivered Web artifact bytes to the authorized owner over a same-origin request', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'http-web-artifact-'))
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  try {
+    store.saveSettings(SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
+      policy: { sources: { web: { allowed: [{ id: 'owner', name: 'Owner' }] } } } }))
+    const artifacts = new ArtifactRegistry(store, directory)
+    const work = join(directory, 'work', 'ticket-delivered')
+    mkdirSync(work, { recursive: true })
+    const source = join(work, 'report.txt')
+    writeFileSync(source, 'immutable snapshot bytes')
+    const artifact = await artifacts.stage('ticket-delivered', work, source, '交付报告.txt', 'file')
+    writeFileSync(source, 'changed after snapshot')
+    const delivered = { id: artifact.id, ticketId: 'ticket-delivered', name: artifact.name, size: artifact.size, kind: artifact.kind }
+    store.set(record('web-task:conversation-delivered'), { id: 'conversation-delivered', title: '交付', createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z', messages: [{ id: 'assistant-1', role: 'assistant', text: '完成', at: '2026-01-01T00:00:00.000Z', artifacts: [delivered] }] } as never)
+    store.set(record('web-task:conversation-other'), { id: 'conversation-other', title: '其他', createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z', messages: [] } as never)
+    const call = serve({ store, artifacts, machine: { mode: 'personal', promptMaxChars: { get: () => 100_000 },
+      admissionContextMaxPages: { get: () => 10 }, admissionContextTimeoutMs: { get: () => 15_000 } }, configured: () => true, health: {},
+      engine: { receive: () => 'stored' }, requestPass: () => {} })
+    const path = (conversation: string, id: string) => `web/tasks/${conversation}/artifacts/${id}`
+
+    const response = await call('GET', path('conversation-delivered', artifact.id))
+    expect(response).toMatchObject({ status: 200, bytes: Buffer.from('immutable snapshot bytes'), headers: {
+      'content-type': 'application/octet-stream', 'content-length': String(artifact.size), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'content-disposition': `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent('交付报告.txt')}`,
+    } })
+    expect(await call('GET', path('conversation-other', artifact.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', path('conversation-delivered', 'artifact_not-delivered'))).toMatchObject({ status: 404 })
+    expect(await call('GET', path('conversation-delivered', artifact.id), undefined, { 'x-orchestrator-request': undefined }))
+      .toMatchObject({ status: 403, body: { error: 'Same-origin management request required' } })
+
+    const originalSettings = store.settings.bind(store)
+    let settingReads = 0
+    store.settings = () => {
+      settingReads++
+      const current = originalSettings()
+      return settingReads > 1 ? SettingsSchema.parse({ ...current,
+        sources: { ...current.sources, web: { enabled: false, config: {} } } }) : current
+    }
+    try {
+      expect(await call('GET', path('conversation-delivered', artifact.id))).toMatchObject({ status: 409 })
+      expect(settingReads).toBe(2)
+    } finally { store.settings = originalSettings }
+
+    store.saveSettings(SettingsSchema.parse({ ...store.settings(), sources: { ...store.settings().sources, web: { enabled: false, config: {} } } }))
+    expect(await call('GET', path('conversation-delivered', artifact.id))).toMatchObject({ status: 409 })
+    store.saveSettings(SettingsSchema.parse({ ...store.settings(), sources: { ...store.settings().sources, web: { enabled: true, config: {} } },
+      policy: { ...store.settings().policy, sources: { web: { allowed: [] } } } }))
+    expect(await call('GET', path('conversation-delivered', artifact.id))).toMatchObject({ status: 409 })
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
+})
+
+it('serves only sent, same-room task-room artifact bytes linked to their owning Worker', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'http-room-artifact-'))
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  try {
+    store.saveSettings(SettingsSchema.parse({ sources: { web: { enabled: true, config: {} } },
+      policy: { sources: { web: { allowed: [{ id: 'owner', name: 'Owner' }] } } } }))
+    const artifacts = new ArtifactRegistry(store, directory)
+    const room = 'qq:room-artifact'
+    const otherRoom = 'qq:room-other'
+    const origin = { source: 'qq', id: 'room-artifact' }
+    const mandate = { strength: 'explicit' as const, policyVersion: 'v1', basis: { via: 'listed' as const },
+      actor: { source: 'qq', id: 'owner' }, scope: 'room' }
+    store.threads.save({ key: room, ref: origin, createdAt: '2026-01-01T00:00:00.000Z', subscriptions: ['room-worker'], correlated: [], pending: [], meta: {} })
+    store.threads.save({ key: otherRoom, ref: { source: 'qq', id: 'room-other' }, createdAt: '2026-01-01T00:00:00.000Z',
+      subscriptions: [], correlated: [], pending: [], meta: {} })
+    store.triggers.save({ id: 'room-origin', source: 'qq', threads: [origin], actor: mandate.actor, human: true,
+      at: '2026-01-01T00:00:00.000Z', text: 'origin', meta: {} })
+    store.tickets.save({ id: 'room-worker', title: 'Room worker', decisionId: 'room-decision', mandate,
+      channels: [{ source: 'web', thread: room, address: { room } }], assignments: [], inputs: [], undelivered: [],
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', origin: { triggerId: 'room-origin', triggerIds: ['room-origin'] } } as never)
+
+    const work = join(directory, 'work', 'room-worker')
+    mkdirSync(work, { recursive: true })
+    const validSource = join(work, 'summary.txt'), pendingSource = join(work, 'pending.txt')
+    writeFileSync(validSource, 'room artifact immutable bytes')
+    writeFileSync(pendingSource, 'not sent')
+    const valid = await artifacts.stage('room-worker', work, validSource, 'room-summary.txt')
+    const pending = await artifacts.stage('room-worker', work, pendingSource, 'pending.txt')
+    const wrongWork = join(directory, 'work', 'other-worker')
+    mkdirSync(wrongWork, { recursive: true })
+    const wrongSource = join(wrongWork, 'wrong.txt')
+    writeFileSync(wrongSource, 'different worker artifact')
+    const wrongTicket = await artifacts.stage('other-worker', wrongWork, wrongSource, 'wrong.txt')
+    const message = (id: string, artifactId: string) => ({ id, channel: { source: 'web', thread: room, address: { room } },
+      text: id, kind: 'reply' as const, ticketId: 'room-worker', artifacts: [artifactId] })
+    const delivered = message('room-valid-receipt', valid.id)
+    store.receipts.add(delivered); store.receipts.settle(delivered, 'sent')
+    const queued = message('room-pending-receipt', pending.id)
+    store.receipts.add(queued)
+    // Model a corrupt or legacy sent receipt that links one Worker to another Worker's artifact.
+    const mismatched = message('room-wrong-ticket-receipt', wrongTicket.id)
+    store.receipts.add(mismatched); store.receipts.settle(mismatched, 'sent')
+
+    const call = serve({ store, artifacts, machine: { mode: 'personal', promptMaxChars: { get: () => 100_000 },
+      admissionContextMaxPages: { get: () => 10 }, admissionContextTimeoutMs: { get: () => 15_000 } }, configured: () => true, health: {},
+      engine: { receive: () => 'stored', direct: () => ({}) }, requestPass: () => {} })
+    const artifactPath = (thread: string, id: string) => `rooms/${encodeURIComponent(thread)}/artifacts/${id}`
+    const response = await call('GET', artifactPath(room, valid.id))
+    expect(response).toMatchObject({ status: 200, bytes: Buffer.from('room artifact immutable bytes'), headers: {
+      'content-type': 'application/octet-stream', 'content-length': String(valid.size), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'content-disposition': `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(valid.name)}`,
+    } })
+    expect(await call('GET', artifactPath(room, pending.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(otherRoom, valid.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(room, wrongTicket.id))).toMatchObject({ status: 404 })
+    expect(await call('GET', artifactPath(room, valid.id), undefined, { 'x-orchestrator-request': undefined })).toMatchObject({ status: 403 })
+
+    const original = store.settings.bind(store)
+    store.settings = () => SettingsSchema.parse({ ...original(), policy: { ...original().policy, sources: { web: { allowed: [] } } } })
+    try { expect(await call('GET', artifactPath(room, valid.id))).toMatchObject({ status: 409 }) }
+    finally { store.settings = original }
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {

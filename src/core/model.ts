@@ -7,6 +7,10 @@ export interface ActorRef { source: string; id: string }
 export interface ThreadRef { source: string; id: string }
 /** Write-only address on a thread; the address format belongs to the source. */
 export interface ChannelRef { source: string; thread: string; address: Record<string, string> }
+/** Bounded media handles linked to their original event; bytes stay behind an authorized source read. */
+export interface AttachmentReference {
+  id: string; type: 'file' | 'image' | 'video' | 'record'; name?: string; size?: number; status: string; read: string
+}
 
 /** Stable key of a thread across the whole domain. */
 export const threadKey = (ref: ThreadRef): string => `${ref.source}:${ref.id}`
@@ -28,10 +32,17 @@ export interface Trigger {
   actor: ActorRef
   /** Source-declared: the event was written by a person rather than a bot, CI, or this agent. */
   human: boolean
+  /** Conversational sources ask the Router to distinguish a read-only query from executable work before delivery. */
+  routing?: 'router'
   /** Source-declared: the sender addressed the agent, by mentioning it or in a direct message to it. */
   addressed?: 'mention' | 'direct'
+  /** Internal worker-to-worker context message; Sources must not set this field. */
+  collaboration?: { ticketId: string; requestId: string; assignmentId: string }
   at: string
   text: string
+  attachments?: AttachmentReference[]
+  /** Source-selected nearby event IDs for bounded, read-only context; these create no subscription or mandate. */
+  context?: string[]
   channel?: ChannelRef
   url?: string
   /** Source-native details for adapters; the core never interprets them. */
@@ -40,6 +51,12 @@ export interface Trigger {
 
 /** Where a trigger went after intake; it grants nothing, but decides who decides a person's follow-up (see `followupOwners`). */
 export interface TriggerDisposition {
+  /** Router-first conversations stay pending until explicitly attached as work or answered without worker delivery. */
+  routing?: 'pending' | 'worker' | 'handled'
+  /** An explicitly addressed human trigger delivered only to this ticket. */
+  directTicketId?: string
+  /** Related subscriptions found before Router intent selection; matching creates no worker Input. */
+  matched?: string[]
   /** Rejected by the source scope filter before entering the domain, for the Source's reason. */
   filtered?: Reason
   evalId?: string
@@ -75,7 +92,7 @@ export interface FollowupRecords {
 export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'>, records: FollowupRecords): string[] {
   if (!trigger.human) return []
   const disposition = records.triggers.disposition(trigger.id)
-  if (!disposition || disposition.requeued) return []
+  if (!disposition || disposition.requeued || (disposition.routing && disposition.routing !== 'worker')) return []
   // The disposition alone rules most messages out, so a Thread or a ticket is read only for one that may have an owner.
   const returned = new Set(disposition.handbacks?.map(item => item.ticketId))
   const reached = disposition.fanout.filter(id => !returned.has(id) && !disposition.context?.includes(id))
@@ -174,6 +191,8 @@ export interface Thread {
   evaluating?: Evaluation
   /** How many Evals of its queued Triggers expired in a row, each of which queued them again; a Decision clears it. */
   expired?: number
+  /** Fixed-window budget shared by every Worker collaborating on this Thread. */
+  collaborationWindow?: { at: string; count: number }
   /**
    * Source-native attributes needed by channels or readers (for example a Feishu thread id). Its Source may also describe
    * the thread for people: `label`, a display name, and `facts`, a {@link ThreadFacts} map.
@@ -222,7 +241,7 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string }
+  report?: { state: ReportState; summary: string; at: string; artifacts?: string[] }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -254,7 +273,7 @@ export type TicketInput =
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
   | { id: string; kind: 'text'; text: string; at: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
-  | { id: string; kind: 'note'; text: string; at: string }
+  | { id: string; kind: 'note'; text: string; at: string; collaborationTriggerId?: string }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -305,6 +324,10 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /** Parent and idempotency key for a Router-created sibling assignment. */
+  delegation?: { parentTicketId: string; requestId: string }
+  /** Idempotent child ids created by this ticket's Router delegation calls. */
+  delegations?: { requestId: string; ticketId: string; threadKey: string }[]
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it

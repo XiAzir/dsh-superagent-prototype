@@ -1,12 +1,25 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { basename } from 'node:path'
-import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
+import { commandEnvironment, commandInvocation } from './platform.ts'
 
-const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
+const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+function stopTree(pid: number | undefined, signal: NodeJS.Signals = 'SIGTERM'): Promise<void> {
+  if (!pid) return Promise.resolve()
+  if (process.platform !== 'win32') {
+    try { process.kill(-pid, signal) } catch { try { process.kill(pid, signal) } catch { /* The process already exited. */ } }
+    return Promise.resolve()
+  }
+  return new Promise(resolve => {
+    const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    killer.once('error', resolve)
+    killer.once('close', () => resolve())
+    killer.unref()
+  })
+}
 /**
  * Error thrown by Commands when a CLI invocation fails, capturing stderr diagnostics, API error codes, and exit status without echoing command arguments.
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
@@ -63,17 +76,85 @@ export class Commands {
    */
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
+  private github(): NonNullable<Deployment['github']> {
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is unavailable: configure a repository and agent CLI before using GitHub commands.')
+    return github
+  }
+  get repository(): string {
+    const repository = this.deployment.repository
+    if (!repository) throw new Error('The GitHub Source is unavailable: configure a repository before using GitHub commands.')
+    return repository
+  }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
-  async run(program: string, args: string[], cwd?: string): Promise<string> {
+  async run(program: string, args: string[], cwd?: string, timeoutMs = TIMEOUT_MS): Promise<string> {
+    if (this.signal.aborted) throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
+    const invocation = commandInvocation(program, args)
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
-      return stdout
+      return await new Promise<string>((resolve, reject) => {
+        let timeout: ReturnType<typeof setTimeout>
+        let escalation: ReturnType<typeof setTimeout> | undefined
+        let termination: Promise<void> | undefined
+        let aborted = false; let timedOut = false
+        const windows = process.platform === 'win32'
+        let stdoutBytes = 0, stderrBytes = 0
+        const stdout: Buffer[] = [], stderr: Buffer[] = []
+        let outputLimitExceeded = false
+        let spawnError: Error | undefined
+        const child = spawn(invocation.file, invocation.args, { cwd, windowsHide: true, detached: !windows, shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: commandEnvironment({ ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }) })
+        const terminate = () => {
+          termination ??= (async () => {
+            await stopTree(pid)
+            child.kill('SIGTERM')
+            if (!windows) await new Promise<void>(resolve => {
+              escalation = setTimeout(() => { void stopTree(pid, 'SIGKILL').finally(resolve) }, 1500)
+            })
+          })()
+        }
+        const collect = (stream: 'stdout' | 'stderr', chunk: Buffer | string) => {
+          if (outputLimitExceeded) return
+          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          const chunks = stream === 'stdout' ? stdout : stderr
+          const used = stream === 'stdout' ? stdoutBytes : stderrBytes
+          const remaining = Math.max(0, MAX_OUTPUT_BYTES - used)
+          if (remaining) chunks.push(data.subarray(0, remaining))
+          if (stream === 'stdout') stdoutBytes += data.length
+          else stderrBytes += data.length
+          if (data.length > remaining) { outputLimitExceeded = true; terminate() }
+        }
+        child.stdout.on('data', (chunk: Buffer | string) => collect('stdout', chunk))
+        child.stderr.on('data', (chunk: Buffer | string) => collect('stderr', chunk))
+        child.once('error', error => { spawnError = error })
+        const abortTree = () => {
+          aborted = true
+          terminate()
+        }
+        child.once('close', async (code, signal) => {
+          clearTimeout(timeout)
+          this.signal.removeEventListener('abort', abortTree)
+          if (aborted || timedOut || outputLimitExceeded) await termination
+          if (escalation) clearTimeout(escalation)
+          if (aborted) reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' }))
+          else if (timedOut) reject(Object.assign(new Error('Command timed out'), { killed: true, signal: 'SIGTERM', code: null, stderr: Buffer.concat(stderr).toString('utf8') }))
+          else if (outputLimitExceeded) reject(Object.assign(new Error('Command output exceeded its limit'), { killed: true, signal: 'SIGTERM', code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', stderr: '' }))
+          else if (spawnError) reject(spawnError)
+          else if (code !== 0 || signal) reject(Object.assign(new Error('Command failed'), { code: signal ? null : code, signal, killed: !!signal, stderr: Buffer.concat(stderr).toString('utf8') }))
+          else resolve(Buffer.concat(stdout).toString('utf8'))
+        })
+        const pid = child.pid
+        this.signal.addEventListener('abort', abortTree, { once: true })
+        timeout = setTimeout(() => {
+          timedOut = true
+          terminate()
+        }, timeoutMs)
+        if (this.signal.aborted) abortTree()
+      })
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.github().cli, args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,12 +163,13 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.github().cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
   /** Fetches all pages of a GitHub API list within the configured repository, skipping items that fail schema validation. */
   async pages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    this.github()
     const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.path(path), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
   }

@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { threadKey, type Thread, type Trigger } from '../core/index.ts'
+import { commandEnvironment, commandInvocation } from '../infra/platform.ts'
 import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { validItems, type Tally } from '../infra/commands.ts'
@@ -33,6 +34,10 @@ async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
 }
 const chatLink = (ctx: SourceContext, chatId: string): string => feishuChatLink(ctx.deployment.feishu?.brand ?? 'feishu', chatId)
 function available(ctx: SourceContext): boolean {
+  if (ctx.configured() && (ctx.deployment.mode ?? 'repository') === 'personal') {
+    ctx.report('feishu', { state: 'paused', detail: 'Disabled in personal mode' })
+    return false
+  }
   if (ctx.configured() && ctx.deployment.feishu) return true
   const waiting = health('paused', ctx.configured() ? 'feishuCliUnset' : 'setupPending')
   ctx.report('feishu', ctx.problem ? { state: 'paused', detail: ctx.problem.detail } : waiting)
@@ -55,6 +60,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     const check = setInterval(() => { if (!enabled(ctx)) running.abort() }, 5000)
     const stop = () => running.abort()
     signal.addEventListener('abort', stop, { once: true })
+    if (signal.aborted) stop()
     const began = Date.now()
     try { await consume(ctx, running.signal) }
     catch (error) { if (!running.signal.aborted) ctx.report('feishu', { state: 'error', detail: String(error) }) }
@@ -68,13 +74,27 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 export const consumerRetry = (previous: number | undefined, ranMs: number): number =>
   previous === undefined || ranMs >= 60_000 ? 1000 : Math.min(previous * 2, 60_000)
 async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
-  const child = spawn(bot(ctx).cli, ['event', 'consume', 'im.message.receive_v1', '--as', 'bot'],
-    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
-      LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+  const invocation = commandInvocation(bot(ctx).cli, ['event', 'consume', 'im.message.receive_v1', '--as', 'bot'])
+  const child = spawn(invocation.file, invocation.args,
+    { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: commandEnvironment({ ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
+      LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }) })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
   let chain = Promise.resolve(); let diagnostic = ''; let ready = false
-  const stop = (): void => { child.stdin.end(); child.kill('SIGTERM') }
+  let stopping: Promise<void> | undefined
+  const stop = (): void => {
+    child.stdin.end()
+    if (process.platform === 'win32' && child.pid) {
+      // Wait for taskkill to enumerate and stop descendants before killing a wrapper parent.
+      stopping ??= new Promise(resolve => {
+        const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        killer.once('error', () => { child.kill('SIGTERM'); resolve() })
+        killer.once('close', () => { child.kill('SIGTERM'); resolve() })
+        killer.unref()
+      })
+    } else child.kill('SIGTERM')
+  }
   signal.addEventListener('abort', stop, { once: true })
+  if (signal.aborted) stop()
   const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
   stderr.on('line', (line: string) => {
     diagnostic = line.slice(0, 4000)
@@ -101,7 +121,7 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       const exited = (code: number | null) => new Error(`Feishu event consumer exited (${code}, ready=${ready}): ${diagnostic}`)
       child.once('close', (code) => signal.aborted ? resolve() : reject(exited(code)))
     })
-  } finally { clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain }
+  } finally { clearTimeout(timeout); signal.removeEventListener('abort', stop); await stopping; stdout.close(); stderr.close(); await chain }
 }
 
 /** Refreshes the map of joined chats (`chat_id -> name`); throws on failure so the previously stored list remains intact. */

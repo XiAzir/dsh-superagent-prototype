@@ -133,6 +133,40 @@ it('answers every routing tool in one shape: the decision it recorded, why, and 
   expect(TICKET_STATES).toContain(stopped.ticket.state)
 })
 
+it('rejects an old report after artifact staging when delivery failure retries into a pending assignment', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('41', '@bot 修一下回归'))
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: '处理中', human_action: '需要确认一个问题？' })
+  await h.runtime.idle()
+  const beforeRelayCount = h.relays(h.runtime.masterId).length
+  let release!: () => void
+  const staged = new Promise<void>(resolve => { release = resolve })
+  vi.spyOn(h.runtime.artifacts, 'stage').mockImplementation(async () => {
+    await staged
+    return { id: 'artifact-old-assignment', name: 'result.txt', size: 12 } as never
+  })
+  const oldReport = h.runTool(sessionId, 'orchestrator_report', {
+    state: 'ready', summary: '旧轮完成', human_action: null, artifacts: [{ path: 'C:\\task\\result.txt' }],
+  })
+  await vi.waitFor(() => expect(h.runtime.artifacts.stage).toHaveBeenCalled())
+  const oldAssignmentId = ticket.assignments.at(-1)!.id
+  h.runtime.engine.deliveryFailed(ticket.id, oldAssignmentId, 'Session busy')
+  await h.runtime.settings.pause(true, 'panel')
+  h.runtime.engine.retryTicket(ticket.id)
+  const retried = h.runtime.store.tickets.get(ticket.id)!
+  expect(retried.assignments.at(-1)).toMatchObject({ state: 'pending' })
+  expect(retried.assignments.at(-1)!.id).not.toBe(oldAssignmentId)
+
+  release()
+  await expect(oldReport).rejects.toMatchObject({ code: 'assignmentEnded' })
+  const after = h.runtime.store.tickets.get(ticket.id)!
+  expect(after.ended).toBeUndefined()
+  expect(after.assignments.at(-1)).toMatchObject({ state: 'pending' })
+  expect(after.assignments.at(-1)!.report).toBeUndefined()
+  expect(after.attention).toEqual(retried.attention)
+  await h.runtime.idle()
+  expect(h.relays(h.runtime.masterId)).toHaveLength(beforeRelayCount)
+})
+
 it('routes several triggers in one call, in order, and answers a refused or failed item without undoing the others', async () => {
   const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   const thanks = feishu('2', '@bot 谢谢'), request = feishu('3', '@bot 另一个问题'), other = feishu('4', '@bot 顺便看看这个'), more = feishu('6', '@bot 还有这个')
@@ -246,13 +280,23 @@ it('ignores a proactive candidate from its card beside other decisions, marked s
   ])
 })
 
-it('returns where a reply stands: sent, or dropped when its conversation can no longer receive it', async () => {
+it('returns a pending receipt immediately and lets the main Session query its final send status', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
   const reply = (text: string) => h.runTool(h.runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text })
-  expect(await reply('修好了。')).toEqual({ status: 'sent' })
+  const first = await reply('修好了。') as { receipt_id: string; status: string }
+  expect(first).toMatchObject({ receipt_id: expect.any(String), status: 'pending' })
+  await h.runtime.idle()
+  expect(h.runtime.store.replyStatus(first.receipt_id)).toBe('sent')
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: `receipt/${first.receipt_id}` }))
+    .toEqual({ receipt_id: first.receipt_id, status: 'sent' })
   vi.mocked(Commands.prototype.lark).mockRejectedValue(new CliError('the message was withdrawn', 230011))
-  expect(await reply('修好了，请看 PR。')).toEqual({ status: 'dropped' })
+  const gone = await reply('修好了，请看 PR。') as { receipt_id: string; status: string }
+  expect(gone).toMatchObject({ receipt_id: expect.any(String), status: 'pending' })
+  await h.runtime.idle()
+  expect(h.runtime.store.replyStatus(gone.receipt_id)).toBe('dropped')
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: `receipt/${gone.receipt_id}` }))
+    .toEqual({ receipt_id: gone.receipt_id, status: 'dropped' })
 })
 
 it('checks an acknowledgement against the IM word limit, not a character count', async () => {

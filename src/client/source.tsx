@@ -5,6 +5,7 @@ import { usePoll, type DroppedReply, type SourceStatusRow, type SourceView } fro
 import { DisclosureRow, Dot, Icon, InfoTip, Switch, Tag } from './controls.tsx'
 import { SaveBar } from './draft.tsx'
 import { sourceMark } from './marks.ts'
+import { QqSourcePanel } from './qq.tsx'
 import { usePanel, usePanelData } from './provider.tsx'
 import { setupPage, settingsRoute, type Route } from './route.ts'
 import { ConfigHistory, Fields, SourceField, useBlockDraft, useSettings } from './settings-kit.tsx'
@@ -47,6 +48,7 @@ function SourceCard({ source }: { source: SourceView }) {
         <p className="dt-error" role="status"><SetupMessage problem={problem} lead /></p><CheckSetupButton />
       </div>}
       {!source.installed && <Hint>{t('sourceNotInstalledHint')}</Hint>}
+      {source.installed && source.id === 'qq' && <QqSourcePanel config={value.config} />}
       {source.installed && source.fields.filter(spec => !spec.advanced).map(field)}
       {source.installed && advanced.length > 0 && <DisclosureRow icon={<Icon name="settings" />} title={t('advanced')} open={advancedOpen}
         onToggle={() => setAdvancedOpen(!advancedOpen)}>

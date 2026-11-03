@@ -22,7 +22,7 @@ it('delivers a follow-up to the worker and tells the main Session with a card, w
   expect(notices(h)).toEqual([{ kind: 'follow_up', trigger_id: message.id, from: 'ou_alice', thread: THREAD, at: message.at,
     text: '顺便把标题也改了',
     replies_to: { trigger_id: ticket.origin.triggerId, preview: '@bot 修一下回归' },
-    delivered_to: [{ ticket_id: ticket.id, title: ticket.title, state: 'working' }],
+    delivered_to: [{ ticket_id: ticket.id, title: ticket.title, state: 'working', read: `ticket/${ticket.id}` }],
       note: expect.stringContaining('worker has it and decides') }])
   // No candidate, no Eval, no Decision: nothing waits on the main Session, and the Thread's queue stays free.
   expect(h.candidates()).toEqual([])
@@ -30,6 +30,29 @@ it('delivers a follow-up to the worker and tells the main Session with a card, w
   expect(h.runtime.store.threads.get(THREAD)).not.toHaveProperty('evaluating')
   expect(h.runtime.store.decisions.byThread(THREAD)).toHaveLength(1)
   expect(h.runtime.store.triggers.disposition(message.id)).toEqual({ fanout: [ticket.id], at: expect.any(String) })
+})
+
+it('answers an explicit human status question from its ticket snapshot without asking the worker', async () => {
+  h = await startRuntime()
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: '已更新解析器，正在检查边界情况。' })
+  const message = followup('2', '现在做得怎么样了？')
+  h.deliveries.mockClear()
+  h.runtime.receive(message)
+  await h.runtime.idle()
+  expect(notices(h)).toEqual([expect.objectContaining({ trigger_id: message.id,
+    delivered_to: [expect.objectContaining({ ticket_id: ticket.id, read: `ticket/${ticket.id}` })] })])
+  h.deliveries.mockClear()
+
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_reply', { purpose: 'status', ticket_id: ticket.id,
+    text: '状态更新。' })).rejects.toThrow(/trigger_id/)
+  const receipt = await h.runTool(h.runtime.masterId, 'orchestrator_reply', { purpose: 'status', trigger_id: message.id,
+    ticket_id: ticket.id, text: '解析器已更新，目前正在检查边界情况。' })
+  expect(receipt).toMatchObject({ receipt_id: expect.any(String), status: 'pending', snapshot: { ticket_id: ticket.id, stage: { stage: 'working' },
+    assignment: { report: { state: 'progress', summary: '已更新解析器，正在检查边界情况。' } } } })
+  expect(h.deliveries).not.toHaveBeenCalled()
+  await h.runtime.idle()
+  expect(h.runtime.store.replyStatus(String(receipt.receipt_id))).toBe('sent')
 })
 
 it('sends a person\'s message that reaches no ticket, such as only one a person stopped, to Eval as before', async () => {

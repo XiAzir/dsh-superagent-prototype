@@ -21,7 +21,17 @@ export interface OutboxHost {
  */
 export class Outbox implements OutboxPort {
   constructor(private readonly host: OutboxHost) {
-    host.effects.handle('reply', (_payload, id) => this.deliver(id), { limit: () => host.paused() ? 0 : 1, retry: [5000, 300_000] })
+    host.effects.handle('reply', (_payload, id) => this.deliver(id), {
+      limit: () => host.paused() ? 0 : 4,
+      retry: [5000, 300_000],
+      reserve: 1,
+      priority: (_payload, id) => host.store.receipts.get(id)?.delivery === 'interactive',
+      group: (_payload, id, attempts) => {
+        const receipt = host.store.receipts.get(id)
+        if (!receipt?.ticketId || attempts >= FAILURES_BEFORE_ERROR) return undefined
+        return JSON.stringify([receipt.channel.source, receipt.channel.thread, receipt.ticketId, receipt.delivery ?? 'normal'])
+      },
+    })
   }
   /** Record a message receipt and enqueue its delivery effect atomically; duplicate message IDs are ignored. */
   send(message: OutboundMessage): void {
@@ -35,14 +45,14 @@ export class Outbox implements OutboxPort {
     const { store, effects } = this.host
     store.atomic(() => { if (store.receipts.withdraw(id)) effects.cancel('reply', id) })
   }
-  sent(): Promise<void> { return this.host.effects.idle('reply') }
+  sent(id?: string): Promise<void> { return this.host.effects.idle('reply', id) }
   private async deliver(id: string): Promise<void> {
     const { store, sources, commands } = this.host
     const receipt = store.receipts.get(id)
     if (receipt?.status !== 'pending') return
     if (!sources.instance(receipt.channel.source)?.enabled) throw new Later('The Source is off or not installed')
     // Hold later messages for the same ticket and conversation behind an earlier pending message until it exceeds the failure threshold.
-    if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation waits')
+    if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation lane waits')
     if (!sources.channelAllowed(receipt.channel)) { store.receipts.settle(receipt, 'channelIgnored'); return }
     // A permanently unreachable target (such as a recalled message or deleted Issue) settles as `channelGone` so its receipt prevents retries.
     const result = await sources.send(receipt, commands)

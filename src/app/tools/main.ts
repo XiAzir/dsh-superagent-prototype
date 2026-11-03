@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople, type TicketStatusSnapshot }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -19,7 +19,7 @@ const RoutingNoteSchema = z.string().trim()
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -28,7 +28,7 @@ export interface MainToolsHost {
   readonly resources: ResourceHost
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
-  sendReplies(): Promise<void>
+  sendReplies(receiptId?: string): Promise<void>
   /** Runs an Engine command initiated by the main Session without emitting self-notifications. */
   quietly<T>(run: () => T): T
 }
@@ -45,7 +45,7 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
  * runs (`FIELDS`), so an item that lacks one, or whose value breaks a limit, is refused alone.
  */
 const RouteItemSchema = z.object({
-  kind: z.enum(['accept', 'attach', 'ignore', 'stop']),
+  kind: z.enum(['accept', 'attach', 'status', 'ignore', 'stop']),
   trigger_id: z.string().describe('The candidate card\'s trigger_id; deciding it decides its batch.'),
   ticket_id: z.string().nullish().describe('attach and stop: the ticket.'),
   title: z.string().nullish().describe('accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice.'),
@@ -59,7 +59,7 @@ type Kind = RouteItem['kind']
 type Field = Exclude<keyof RouteItem, 'kind' | 'trigger_id'>
 /** Each field's check, the kinds whose items read it and those that need it; an item of another kind leaves it unread. */
 const FIELDS: Record<Field, { check: z.ZodType; reads: readonly Kind[]; needs: readonly Kind[] }> = {
-  ticket_id: { check: z.string(), reads: ['attach', 'stop'], needs: ['attach', 'stop'] },
+  ticket_id: { check: z.string(), reads: ['attach', 'status', 'stop'], needs: ['attach', 'status', 'stop'] },
   title: { check: z.string().max(200), reads: ['accept'], needs: ['accept'] },
   worktree_name: { check: WorktreeNameSchema, reads: ['accept'], needs: ['accept'] },
   acknowledgement: { check: AcknowledgementSchema, reads: ['accept'], needs: ['accept'] },
@@ -80,7 +80,7 @@ function invalid(item: RouteItem): string | undefined {
   }
   return undefined
 }
-type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; triggerIds?: readonly string[] }
+type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; triggerIds?: readonly string[]; snapshot?: TicketStatusSnapshot }
 /**
  * Carry out one routing decision as its Engine command, in a transaction of its own. `decided` holds the Triggers that this
  * call's earlier items decided, with their batches.
@@ -92,6 +92,8 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   const earlier = decided.get(item.trigger_id)
   if (earlier && item.kind === 'ignore') return { refused: `Decided in this call with ${earlier}, whose Decision took its batch` }
   switch (item.kind) {
+    case 'status': return { reason: 'Read saved status; no work was delivered', ticketId: item.ticket_id!,
+      snapshot: host.engine.status(item.ticket_id!, item.trigger_id) }
     case 'accept': {
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
       const decision = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
@@ -125,7 +127,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route trigger IDs: accept explicit work, attach follow-ups, read status snapshots, stop on a human request, or ignore. Use snapshots for status replies. Items run independently; use orchestrator_eval_decide for proactive candidates.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }) => {
       const decided = new Map<string, string>()
@@ -139,6 +141,7 @@ function routeTool(host: MainToolsHost): Tool {
           for (const id of result.triggerIds ?? []) if (!decided.has(id)) decided.set(id, item.trigger_id)
           const ticket = result.ticketId ? host.store.tickets.get(result.ticketId) : undefined
           return { ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
+            ...result.snapshot ? { snapshot: result.snapshot } : {},
             ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
         } catch (error) {
           if (error instanceof UserError) return { ...head, refused: error.message }
@@ -155,18 +158,35 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
   return [
-    readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
+    readTool('Read listed resource pages; follow page links.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
     tool({
+      name: 'orchestrator_delegate',
+      description: 'Assign a bounded peer task on a subscribed thread under its parent mandate. Reuse request_id on retries.',
+      schema: z.object({
+        ticket_id: z.string().min(1),
+        thread: z.string().min(1),
+        title: z.string().trim().min(1).max(200),
+        request_id: z.string().trim().min(1).max(200),
+      }).strict(),
+      execute: async args => {
+        const parent = host.store.tickets.get(args.ticket_id)
+        if (!parent) throw new UserError('unknownTicket')
+        const child = host.quietly(() => host.engine.delegate(args.ticket_id, args.request_id, args.title, args.thread,
+          parent.assignments.at(-1)?.id ?? ''))
+        return routed(host, { reason: 'Delegated a bounded part under the parent ticket mandate', ticketId: child.id })
+      },
+    }),
+    tool({
       name: 'orchestrator_ticket_retry',
-      description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',
+      description: 'Retry a worker-stalled ticket on explicit human request; its stalled assignment ends.',
       schema: z.object({ ticket_id: z.string() }).strict(),
       execute: async args => routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id }),
     }),
     tool({
       name: 'orchestrator_ticket_request_status',
-      description: 'Ask the worker of an idle ticket, one whose turn ended without a report, for a status report; for other tickets it sends nothing and returns the card.',
+      description: 'Ask an idle worker for a status report; otherwise return its ticket card.',
       schema: z.object({ ticket_id: z.string() }).strict(),
       execute: async args => {
         const reason = host.engine.requestStatus(args.ticket_id) ? 'Asked the worker for a status report' : 'The worker is not waiting; nothing was sent'
@@ -175,7 +195,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_ticket_note',
-      description: 'Tell a ticket\'s worker a fact from other work, such as what another ticket found; it grants no authority.',
+      description: 'Send a context fact to a ticket; it grants no authority.',
       schema: z.object({
         ticket_id: z.string(),
         text: z.string().trim().min(1).refine(text => wordCount(text) <= IM_WORDS, `At most ${IM_WORDS} words`),
@@ -187,7 +207,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_trigger_requeue',
-      description: 'Queue a trigger for a fresh assessment, such as after its Source\'s access changed; a follow-up that reached a ticket comes back only from its worker.',
+      description: 'Queue a trigger for fresh assessment after source access changes. Worker-owned follow-ups stay with their worker.',
       schema: z.object({ trigger_id: z.string() }).strict(),
       execute: async args => {
         // A follow-up that reached a ticket is its worker's to judge, which hands back what is not its own; a person may still requeue it.
@@ -201,19 +221,19 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_eval',
-      description: 'Load a proactive candidate\'s window and its thread\'s tickets; repeated calls reuse them.',
+      description: 'Load a candidate\'s bounded source window and thread tickets.',
       schema: z.object({ trigger_id: z.string() }).strict(),
       execute: async (args, signal) => host.assessor.context(args.trigger_id, signal),
     }),
     tool({
       name: 'orchestrator_eval_read',
-      description: 'Read more of a candidate\'s context, always with its trigger_id: a message or stub whole by message_id, an image by image_id, the root, the parent, a thread page by cursor, or a file or directory by path.',
+      description: 'Read candidate context: a message or stub, image, root, parent, thread page, file or directory.',
       schema: EvalReadSchema,
       execute: async (read, signal) => host.assessor.read(agent, read, signal),
     }),
     tool({
       name: 'orchestrator_eval_decide',
-      description: 'Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.',
+      description: 'Record an assessment after orchestrator_eval for the same trigger.',
       schema: z.object({ trigger_id: z.string().min(1), ...AssessmentSchema.shape }).strict(),
       execute: async ({ trigger_id, ...result }, signal) => {
         const decided = await host.assessor.decide(trigger_id, AssessmentSchema.parse(result), signal)
@@ -222,24 +242,32 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
+      description: `Reply by purpose: answer, status from a saved snapshot, result when ready, or attention with a question. Receipts persist; delivery is asynchronous. Web/QQ: 20000 characters; Feishu: ${IM_WORDS} words.`,
       schema: z.object({
-        trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
-        ticket_id: z.string().optional(),
-        purpose: z.enum(['answer', 'result', 'attention']),
+        trigger_id: z.string().min(1).optional().describe('Original human question for answer; current human follow-up for status.'),
+        ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention.'),
+        purpose: z.enum(['answer', 'status', 'result', 'attention']),
         human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
         text: z.string().min(1).max(20000),
-      }).strict(),
+        artifacts: z.array(z.string().min(1)).max(8).optional().describe('With purpose=result: IDs from this ticket\'s ready report. Omit to deliver all reported artifacts through the source channel.'),
+      }).strict().superRefine((args, context) => {
+        if (args.purpose === 'status') {
+          if (!args.trigger_id) context.addIssue({ code: 'custom', path: ['trigger_id'], message: 'Status requires the human follow-up trigger_id' })
+          if (!args.ticket_id) context.addIssue({ code: 'custom', path: ['ticket_id'], message: 'Status requires an explicit ticket_id' })
+        }
+      }),
       execute: async args => {
-        const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
-          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
-        await host.sendReplies()
-        return { status: host.store.replyStatus(reply.id) ?? reply.status }
+        const reply = args.purpose === 'status'
+          ? host.engine.reply({ purpose: 'status', text: args.text, triggerId: args.trigger_id!, ticketId: args.ticket_id! })
+          : host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
+            ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
+            ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
+        return { receipt_id: reply.id, status: host.store.replyStatus(reply.id) ?? reply.status, ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
       },
     }),
     tool({
       name: 'orchestrator_thread_unsubscribe',
-      description: 'Drop every ticket subscription on a thread. Later messages there no longer reach those tickets as context; a new positive decision can subscribe it again.',
+      description: 'Remove every ticket subscription on a thread; later messages no longer reach those tickets.',
       schema: z.object({ thread: z.string().describe('Thread key, for example github:123 or feishu:<chat>:<root message>') }).strict(),
       execute: async args => {
         return { removed: host.quietly(() => host.engine.unsubscribe(args.thread)), thread: args.thread }

@@ -1,0 +1,2 @@
+Complete the requested work and verify the result with relevant checks when available. Give the orchestrator a clear report of the outcome, changes, verification and material limitations so it can answer the person.
+When no GitHub repository and account are configured, deliver the local result through the orchestrator's reply. Apply repository-specific pull request, review and merge workflows only when a GitHub repository and account are configured.

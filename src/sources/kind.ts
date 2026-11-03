@@ -1,7 +1,7 @@
 /** SourceKind plugin contract: configuration schema, UI form fields, policy integration, channel adapter, and thread context reader. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { z } from 'zod'
-import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
+import type { AttachmentReference, OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { SourceContext, SourceHost } from './host.ts'
@@ -44,6 +44,8 @@ export interface ChannelLink { url: string; label: Localized; triggerId?: string
 export type ChannelLinks = Partial<Pick<Deployment, 'repository' | 'feishu'>>
 /** Outbound messaging adapter for a source kind's threads. */
 export interface SourceChannel<C> {
+  /** The adapter explicitly supports task artifacts in the durable Outbox. */
+  artifacts?: true
   /** Whether a reply may still go to `address`; without it, every address may receive replies. */
   allowed?(address: Record<string, string>, config: C): boolean
   /**
@@ -57,10 +59,13 @@ export interface SourceChannel<C> {
 /** Normalized message returned by thread context readers; `bot` marks a non-human sender whose message can never authorize work on its own (at most an inferred candidate). */
 export interface ContextMessage {
   id: string; from: string; at: string; text: string
+  attachments?: AttachmentReference[]
   bot?: true; deleted?: true; reply_to?: string; url?: string; path?: string; line?: number
 }
 export type ContextPartName = 'thread' | 'root' | 'parent'
 export interface ContextPart { messages: ContextMessage[]; next?: string | undefined; body: Record<string, unknown>; status?: string }
+/** Compact source media references; full metadata and bytes are read through the authorized source adapter. */
+export type SourceAttachmentRef = AttachmentReference
 /** Bounded thread context reader used by assessments to inspect messages and images around a trigger. */
 export interface ThreadContext<C> {
   /** The ID of the Trigger's own message among the messages of its Thread. */
@@ -100,6 +105,11 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   channel?: SourceChannel<C>
   /** Bounded context reader for assessments; assessments of a kind without `threadContext` read none. */
   threadContext?: ThreadContext<C>
+  /** Durable media belonging to one original message; the resource layer enforces ticket access before calling read. */
+  attachments?: {
+    references(trigger: Trigger): SourceAttachmentRef[]
+    read(trigger: Trigger, id: string, agent: Agent | undefined, signal: AbortSignal): Promise<unknown>
+  }
   /** Maps a search query to candidate Thread keys (such as `github:12`) and Trigger search terms (such as a Feishu `om_` ID). */
   find?(query: string): { threads: string[]; terms: string[] }
   /** Returns the ID of the Trigger whose message this Trigger replies to, when derivable without a network read. */

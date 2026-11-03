@@ -1,5 +1,27 @@
 node_modules/
+.pnpm-store/
 lib/
 .artifacts/
 .env
+.env.*
+!.env.example
+.dsh/
+local/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite-*
+*.log
+# Private deployment journals belong in an operator-controlled location.
+docs/cnb-*-record.md
 coverage/
+.superagent-runtime/
+__pycache__/
+*.pyc
+tmp/
+# Old local sandbox test artifacts are deliberately outside source control.
+deploy/cnb/tmp*/
+deploy/cnb/_test-*/

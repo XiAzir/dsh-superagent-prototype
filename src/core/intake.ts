@@ -1,5 +1,6 @@
 /** Trigger ingestion, thread correlation, subscription fan-out, and evaluation queuing. */
 import { key } from './ids.ts'
+import { UserError } from './errors.ts'
 import { isoTime, liveTicket, threadKey } from './model.ts'
 import type { Ticket, Trigger } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -17,6 +18,7 @@ export class Intake extends EnginePart {
   constructor(options: EngineOptions, private readonly tickets: Tickets) { super(options) }
 
   receive(received: Trigger): ReceiveResult {
+    if (received.collaboration) throw new UserError('notAdmissible', { reason: 'internal collaboration messages must use Engine.collaborate' })
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
     const trigger = { ...received, at: isoTime(received.at) }
     if (!trigger.threads.length) throw new Error('A trigger must belong to at least one thread')
@@ -28,6 +30,7 @@ export class Intake extends EnginePart {
       return 'filtered'
     }
     this.repo.triggers.save(trigger)
+    const routerFirst = trigger.human && trigger.routing === 'router'
     const keys = trigger.threads.map(threadKey)
     // Track reached tickets and whether they were reached only via context threads (a ticket's own thread makes `context` false).
     const reached = new Map<string, { ticket: Ticket; context: boolean }>()
@@ -41,22 +44,24 @@ export class Intake extends EnginePart {
         // threads when it resumes), and a human-stopped ticket receives nothing because its Mandate was withdrawn.
         const followed = !!thread.context?.includes(ticketId)
         const resumes = trigger.human && ticket?.ended?.by !== 'human' && !followed
-        if (!ticket || (!liveTicket(ticket) && !resumes)) continue
+        if (!ticket || (!routerFirst && !liveTicket(ticket) && !resumes)) continue
         reached.set(ticketId, { ticket, context: followed && (reached.get(ticketId)?.context ?? true) })
       }
       this.repo.threads.save(thread)
     }
-    for (const [ticketId, { ticket, context: followed }] of reached) {
+    for (const [ticketId, { ticket, context: followed }] of routerFirst ? [] : reached) {
       this.tickets.addInput(ticket, { id: key('input', ticketId, 'trigger', trigger.id), kind: 'trigger', triggerId: trigger.id, at,
         ...trigger.human ? { human: true } : {}, ...followed ? { context: true } : {} })
     }
-    const fanout = [...reached.keys()], context = fanout.filter(id => reached.get(id)!.context)
-    const disposition = { fanout, ...context.length ? { context } : {}, at }
+    const matched = [...reached.keys()], fanout = routerFirst ? [] : matched
+    const context = matched.filter(id => reached.get(id)!.context)
+    const disposition = { fanout, ...context.length ? { context } : {},
+      ...routerFirst ? { routing: 'pending' as const, matched } : {}, at }
     this.repo.triggers.saveDisposition(trigger.id, disposition)
     // A person's message that no ticket decides, such as one that reached only tickets a person stopped or that follow the
     // Thread for context, and every bot's, goes to Eval.
     if (!this.owners(trigger).length) this.queueForEval(trigger)
-    for (const ticketId of fanout) this.tickets.wake(ticketId)
+    if (!routerFirst) for (const ticketId of fanout) this.tickets.wake(ticketId)
     this.emit('trigger.received', { triggerId: trigger.id, threads: trigger.threads.map(threadKey) })
     return 'stored'
   }

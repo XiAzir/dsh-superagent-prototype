@@ -222,7 +222,10 @@ Setup verifies the GitHub repository and the agent's push access, writes the wor
 The process environment that setup writes:
 
 - **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- These shims also block credential-export and account/configuration commands by default, including `gh auth token`, `gh auth status --show-token`/`-t`, GitHub account changes and Lark CLI `auth`/`config` commands. Redacted `gh auth status` and ordinary `gh`/`lark-cli` business commands remain available. The host's Git credential helper invokes the configured GitHub CLI directly for Git, outside the worker-facing `gh` shim.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+
+The worker CLI checks are default-`PATH` guardrails. Workers run as the operator's OS user and can still read that user's files or invoke programs by absolute path, so these checks do not provide complete credential isolation or guarantee zero disclosure. Stronger isolation requires a credential-operation broker or a separate OS account/permissions that do not expose the operator's credential files.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
@@ -243,7 +246,7 @@ A database migrated by a newer version cannot be opened by an older one. Rollbac
 
 ### Agent presets
 
-The worker and router presets move shell commands to the background after 5 seconds. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+The worker preset moves shell commands to the background after 5 seconds. The router preset has no shell, filesystem or job tools; it routes work through the application tools while Executor Sessions handle implementation. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
 
 ## Troubleshooting
 

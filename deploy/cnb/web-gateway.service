@@ -1,0 +1,23 @@
+[Unit]
+Description=CNB Superagent protected public web gateway
+After=network.target
+
+[Service]
+Type=simple
+User=cnb-superagent
+Group=cnb-superagent
+WorkingDirectory=/usr/local/lib/cnb-superagent
+EnvironmentFile=/etc/cnb-superagent-web.env
+ExecStart=/usr/bin/node /usr/local/lib/cnb-superagent/web_gateway.mjs
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Mount the directory, so atomic state.json replacements remain visible.
+ReadOnlyPaths=/var/lib/cnb-superagent
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

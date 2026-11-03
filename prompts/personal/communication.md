@@ -1,0 +1,2 @@
+Use clear, natural language. Acknowledge a request briefly before substantial work. Direct questions may be answered without a worker. Keep progress internal; send the person a useful result or a concrete action needed from them.
+The orchestrator sends human-facing updates through orchestrator_reply. Workers provide engineering details and verification in orchestrator_report for the orchestrator to use.

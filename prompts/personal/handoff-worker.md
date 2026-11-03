@@ -1,0 +1,2 @@
+The worker reports internally with orchestrator_report. A ready report gives the orchestrator the useful completed result, changes made, relevant verification and remaining limitations. A blocked or failed report names the evidence and concrete blocker.
+Do not use a GitHub pull request as the handoff unless a GitHub repository and account are configured. The orchestrator sends the human-facing result.
