@@ -1,6 +1,6 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -14,7 +14,7 @@ import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { SessionFailures } from './session-failures.ts'
-import { initializeRoleModel } from './role-models.ts'
+import { bindRoleModel, resolveRoleModel, type RoleModelBinding } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
@@ -43,7 +43,7 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; roleModel?: RoleModelBinding; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -125,6 +125,7 @@ export class Sessions {
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
+    let created = false
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
@@ -132,14 +133,34 @@ export class Sessions {
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
+      created = true
     }
     if ('error' in result) throw result.error
-    const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
     await this.decorate(result.agent)
+    const configuredModel = () => {
+      const settings = this.host.store.settings()
+      return role === 'orchestrator' ? settings.eval.model : settings.executor.model
+    }
+    for (;;) {
+      const model = configuredModel()
+      if (!model && created) break
+      const selected = await resolveRoleModel(ctx, model ?? (await ctx.sessionController.modelCatalog()).default)
+      if (JSON.stringify(configuredModel()) !== JSON.stringify(model)) continue
+      this.bindings.get(result.agent)?.roleModel?.select(selected)
+      await ctx.sessionPersistence.flush()
+      break
+    }
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /** Apply a saved role model to loaded Sessions; busy Sessions take it after their current turn. */
+  selectRoleModel(role: 'orchestrator' | 'worker', selection: ModelSelection): void {
+    for (const [agent, binding] of this.bindings) {
+      const ticket = role === 'worker' ? this.ticketOf(agent) : undefined
+      if (role === 'orchestrator' ? agent.id !== this.host.masterId : !ticket || !liveTicket(ticket)) continue
+      binding.roleModel?.select(selection)
+    }
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -226,6 +247,8 @@ export class Sessions {
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
+    binding.roleModel = bindRoleModel(this.ctx, agent)
+    binding.disposers.push(() => binding.roleModel?.dispose())
     const events = agent.session.snapshotEvents()
     this.retryHealth.restore(agent.id, events)
     this.failures.restore(agent.id, events)
