@@ -20,6 +20,7 @@ import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+import { readLatestTurnEvents } from '../infra/session-history.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -249,7 +250,7 @@ export class Sessions {
     this.bindings.set(agent, binding)
     binding.roleModel = bindRoleModel(this.ctx, agent)
     binding.disposers.push(() => binding.roleModel?.dispose())
-    const events = agent.session.snapshotEvents()
+    const events = await readLatestTurnEvents(this.ctx, agent.id, this.host.lifetime)
     this.retryHealth.restore(agent.id, events)
     this.failures.restore(agent.id, events)
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)

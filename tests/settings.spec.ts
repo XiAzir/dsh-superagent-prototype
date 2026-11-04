@@ -26,9 +26,11 @@ it('applies a saved Router model to its existing Session and restores the defaul
   const selected = { provider: 'router-provider', model: 'router-model', reasoningEffort: 'high' }
   await settings.save('eval', { ...evalConfig, model: selected }, store.blockRevision('eval'), 'panel')
   expect(store.settings().eval.model).toEqual(selected)
+  expect(agent.model.current()).toEqual(selected)
   expect(append.mock.calls.slice(initialEvents)).toContainEqual(['model/selection', selected])
 
   await settings.save('eval', { ...store.settings().eval, model: null }, store.blockRevision('eval'), 'panel')
+  expect(agent.model.current()).toEqual({ provider: 'host', model: 'default' })
   expect(append.mock.calls.at(-1)).toEqual(['model/selection', { provider: 'host', model: 'default' }])
   await h.runtime.sessions.ensure(masterId, h.directory, 'dsh-superagent orchestrator', 'orchestrator')
   expect(append.mock.calls.at(-1)).toEqual(['model/selection', { provider: 'host', model: 'default' }])
@@ -53,6 +55,7 @@ it('does not let a slow Session restore overwrite a newer saved Router model', a
   delayed.resolve(old)
   await restoring
   expect(store.settings().eval.model).toEqual(next)
+  expect(agent.model.current()).toEqual(next)
   expect(append.mock.calls.at(-1)).toEqual(['model/selection', next])
 })
 
@@ -63,7 +66,13 @@ it('updates an existing open Worker Session when its execution model changes', a
   const append = vi.mocked(agent.session.append)
   const before = append.mock.calls.length
   const { settings, store } = h.runtime
+  expect(agent.status).toBe('running')
   await settings.save('executor', { ...store.settings().executor, model }, store.blockRevision('executor'), 'panel')
+  expect(agent.model.current()).toEqual({ provider: 'host', model: 'default' })
+  expect(append.mock.calls.slice(before)).not.toContainEqual(['model/selection', model])
+  ;(agent as unknown as { status: 'idle' | 'running' }).status = 'idle'
+  h.ctx.emit('agent/status', { agent, status: 'idle' } as never)
+  expect(agent.model.current()).toEqual(model)
   expect(append.mock.calls.slice(before)).toContainEqual(['model/selection', model])
   expect(h.controller.selectModel).not.toHaveBeenCalled()
 })

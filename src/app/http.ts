@@ -49,7 +49,7 @@ export interface HttpHost {
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct'>
-  inspectWorker?(ticketId: string): Promise<readonly SessionEvent[]>
+  inspectWorker?(ticketId: string, signal?: AbortSignal): Promise<readonly SessionEvent[]>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -85,9 +85,9 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
 }
-export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
+export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number | undefined): boolean {
   const host = req.headers.host
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || typeof host !== 'string') return false
+  if (port === undefined || !Number.isInteger(port) || port < 1 || port > 65535 || typeof host !== 'string') return false
   const authority = /^(127\.0\.0\.1|localhost):([1-9]\d{0,4})$/.exec(host)
   if (!authority || Number(authority[2]) > 65535) return false
   if (req.headers['x-orchestrator-request'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') return false
@@ -177,7 +177,7 @@ function routes(runtime: HttpHost): Routes {
   const rooms = () => new TaskRooms({ store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
     configured: () => runtime.configured(), requestPass: () => runtime.requestPass(),
     artifacts: runtime.artifacts,
-    ...runtime.inspectWorker ? { inspectWorker: (id: string) => runtime.inspectWorker!(id) } : {} })
+    ...runtime.inspectWorker ? { inspectWorker: (id: string, signal?: AbortSignal) => runtime.inspectWorker!(id, signal) } : {} })
   const web = () => {
     const failures = runtime.sessions?.status?.().failures ?? []
     return new WebTasks({ store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),

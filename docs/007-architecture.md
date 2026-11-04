@@ -373,6 +373,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/private-directory.ts` | Protect the state directory with Unix modes or a Windows owner-only inheritable DACL |
 | `src/infra/http-compat.ts` | Opt-in CNB SSH transport adapter: one HTTP request per socket while preserving WebSocket upgrades |
 | `src/infra/persistent-path.ts` | Opt-in CNB storage coverage checks for state, worker and schedule directories, including cache exclusions and symlink ancestors |
+| `src/infra/session-history.ts` | Paged read-only Session history from persistence, with fixed event cuts, latest-turn restoration and tail lookup |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
@@ -460,6 +461,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/session-failures.spec.ts` | Durable Session failure restoration, clearing on a later turn, live updates, credential redaction and message length limits |
+| `tests/session-history.spec.ts` | Read-only durable Session history, pagination cuts, cancellation, latest-turn restoration and last assistant lookup |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
@@ -494,7 +496,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `session.ts`, the model and paged durable persistence fixtures; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
 
 ## Persistence
 

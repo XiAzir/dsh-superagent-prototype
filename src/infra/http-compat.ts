@@ -2,7 +2,7 @@
 export function configureHttpNoReuse(webServer: unknown, enabled: boolean): () => void {
   if (!enabled) return () => {}
 
-  // Private adapter verified against DSH 0.2.1-rc.5 / dsh-host-webserver 0.2.1-alpha.2.
+  // Private adapter verified against DSH / dsh-host-webserver 0.2.2-rc.1.
   // Recheck this shape and the real-socket test on every DSH host-webserver upgrade.
   const service = webServer as { server?: unknown } | null
   const candidate = service?.server
