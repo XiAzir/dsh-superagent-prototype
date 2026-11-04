@@ -90,8 +90,14 @@ export class Replies extends EnginePart {
   private answer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' | 'status' }>): Reply {
     const trigger = request.triggerId ? this.repo.triggers.get(request.triggerId) : undefined
     if (request.triggerId && !trigger) throw new UserError('unknownTrigger')
+    const assigned = trigger ? this.owners(trigger) : []
+    const candidates = trigger && !request.ticketId ? this.repo.tickets.list() : []
+    // Router-first messages may share a subscribed thread before any worker receives them.
     const ticket = request.ticketId ? this.require(request.ticketId)
-      : trigger ? this.repo.tickets.list().find(item => this.reaches(item, trigger)) : undefined
+      : trigger && request.purpose === 'answer'
+        ? candidates.find(item => item.answers?.includes(trigger.id))
+          ?? candidates.find(item => item.origin.triggerId === trigger.id || assigned.includes(item.id))
+        : trigger ? candidates.find(item => this.reaches(item, trigger)) : undefined
     if (request.purpose === 'result') {
       const outcome = ticket && ticketOutcome(ticket)
       const reported = !!ticket && liveTicket(ticket) && latestAssignment(ticket)?.report?.state === 'ready'

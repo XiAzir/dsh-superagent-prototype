@@ -245,7 +245,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: `Reply by purpose: answer, status from a saved snapshot, result when ready, or attention with a question. Receipts persist; delivery is asynchronous. Web/QQ: 20000 characters; Feishu: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().min(1).optional().describe('Original human question for answer; current human follow-up for status.'),
-        ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention.'),
+        ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention; ignored for answer.'),
         purpose: z.enum(['answer', 'status', 'result', 'attention']),
         human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
         text: z.string().min(1).max(20000),
@@ -259,6 +259,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       execute: async args => {
         const reply = args.purpose === 'status'
           ? host.engine.reply({ purpose: 'status', text: args.text, triggerId: args.trigger_id!, ticketId: args.ticket_id! })
+          : args.purpose === 'answer'
+            ? host.engine.reply({ purpose: 'answer', text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
+              ...(args.trigger_id ? { triggerId: args.trigger_id } : {}) })
           : host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
             ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
             ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
