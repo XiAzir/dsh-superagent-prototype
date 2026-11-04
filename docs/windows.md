@@ -6,10 +6,10 @@ is a locally maintained build of the research prototype.
 
 ## Requirements
 
-- Windows 10/11, PowerShell 7 (`pwsh`), Node.js 24+, Git for Windows and pnpm.
+- Windows 10/11, PowerShell 7 (`pwsh`), Node.js >=24.9.0, Git for Windows and pnpm.
 - Python 3.8+ (`python`) for the optional service manager.
 - GitHub CLI 2.48+ and a dedicated agent account before connecting a repository.
-- DeepSeek Harness compatible with `engines.dsh`; the local installation uses 0.2.1-rc.5.
+- DeepSeek Harness compatible with `engines.dsh`; the local installation uses 0.2.2-rc.1.
 
 Use a separate `superagent` DSH profile. Keep the existing interactive `web` profile
 unchanged. Account configuration stays pending until the operator selects the

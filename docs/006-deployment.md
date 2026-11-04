@@ -73,7 +73,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 Run this block once, on a machine that has no `superagent` profile yet:
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.1-rc.3
+npm install -g @deepseek-ai/dsh@0.2.2-rc.1
 git clone <this repository> dsh-superagent && cd dsh-superagent
 pnpm install && pnpm build
 dsh superagent --from-default-profile web --dump-config > /dev/null

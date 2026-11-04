@@ -5,8 +5,8 @@
 ## 前置条件
 
 - Linux 环境
-- Node.js 24 LTS、pnpm 11、Git
-- DeepSeek Harness CLI `dsh` 0.2.1-rc.5
+- Node.js 24 LTS（24.9.0 或更高版本）、pnpm 11、Git
+- DeepSeek Harness CLI `dsh` 0.2.2-rc.1
 - Python 3、tmux；视频帧提取使用 ffmpeg
 
 公开版 `main` 分支同时包含 Windows 和 Linux 支持。将此仓库推送到自己的 CNB 仓库后，按以下步骤配置独立的运行环境。
