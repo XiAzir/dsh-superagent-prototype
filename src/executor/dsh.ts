@@ -19,6 +19,7 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { lastAssistantMessage } from '../infra/session-history.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -665,12 +666,17 @@ export class DshExecutor implements Executor {
     }
     // The worker may have reported while its turn ended; a blocked or failed report a person's message has lifted is stale.
     if (handedOff(current)) return
-    const last = agent.session.snapshotEvents().filter(event => event.type === 'assistant/message').at(-1)
+    const last = await lastAssistantMessage(this.host.context, agent.id, look.signal)
+    const afterRead = live()
+    if (this.host.closing() || look.signal.aborted || this.resuming.has(idle.id) || agent.status !== 'idle'
+      || !afterRead || handedOff(afterRead)) return
     const text = last?.type === 'assistant/message'
       ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : ''
     const said = [text, stopped].filter(Boolean).join('\n\n')
     this.host.store.atomic(() => {
-      const before = latestReport(current)?.summary ?? ''
+      const finalTicket = live()
+      if (!finalTicket || handedOff(finalTicket)) return
+      const before = latestReport(finalTicket)?.summary ?? ''
       const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before }, idle.id)
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
       if (said) this.relay(resultRelay(updated, 'waiting', said))

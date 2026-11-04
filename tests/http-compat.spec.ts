@@ -1,6 +1,8 @@
 import { Agent, createServer, get, type Server } from 'node:http'
 import WebSocket, { WebSocketServer } from 'ws'
 import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import WebServer from '@deepseek-ai/dsh-host-webserver'
 import { configureHttpNoReuse } from '../src/infra/http-compat.ts'
 
 function service(server: unknown) {
@@ -20,6 +22,25 @@ function request(server: Server, agent: import('node:http').Agent) {
 }
 
 describe('configureHttpNoReuse', () => {
+  it('supports the current DSH WebServer with an OS-assigned port', async () => {
+    const ctx = new Context()
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 })
+    let dispose = () => {}
+    try {
+      await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
+      expect(ctx.webServer.port).toBeGreaterThan(0)
+      ctx.webServer.register({ kind: 'exact', path: '/', handler: (_req, res) => { res.end('ok') } })
+      dispose = configureHttpNoReuse(ctx.webServer, true)
+      const server = { address: () => ({ port: ctx.webServer.port! }) } as Server
+      expect(await request(server, agent)).toMatchObject({ status: 200, connection: 'close', reusedSocket: false })
+      expect(await request(server, agent)).toMatchObject({ status: 200, connection: 'close', reusedSocket: false })
+    } finally {
+      agent.destroy()
+      dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('does not read the server when disabled', () => {
     const webServer = Object.defineProperty({}, 'server', { get() { throw new Error('must not read disabled adapter') } })
     expect(() => configureHttpNoReuse(webServer, false)).not.toThrow()

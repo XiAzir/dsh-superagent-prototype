@@ -1,10 +1,11 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import { agentEvents, installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { agentEvents, installModelSelection, type Agent, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { bindRoleModel, resolveRoleModel } from '../src/app/role-models.ts'
+import { fixtureModel } from './fixtures/session.ts'
 
 const contexts: Context[] = []
 afterEach(async () => { await Promise.all(contexts.splice(0).map(ctx => ctx.fiber.dispose())); vi.restoreAllMocks() })
@@ -15,74 +16,78 @@ async function fixture() {
   ctx.reflect.provide('llm', { resolveCallConfig: resolve })
   const session = Session.create(SessionId('role-model'))
   let status: 'idle' | 'running' = 'idle'
-  const agent = { ctx, session, get status() { return status } } as Agent
-  const host: ModelSelectionRef = { get current() { return session.requestHeader()?.config ?? { provider: 'host', model: 'default', reasoningEffort: ReasoningEffortId('high') } }, assembled: undefined }
-  installModelSelection(ctx, host)
-  const request = () => agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ provider: 'seed', model: 'seed' }))
+  const options = { provider: 'host', model: 'default', reasoningEffort: ReasoningEffortId('high') }
+  const model = fixtureModel(session)
+  const agent = { ctx, session, model, options, get status() { return status } } as unknown as Agent
+  // The Session Controller installs DSH's switch notice during Agent setup.
+  installModelSelection(ctx)
   const record = (selection: ModelSelection) => session.append('request/header', { header: { config: selection }, reason: 'initial' })
-  return { ctx, agent, session, host, resolve, request, record,
+  return { ctx, agent, session, resolve, record,
     setStatus: (next: 'idle' | 'running') => { status = next; ctx.emit('agent/status', { agent, status: next } as never) } }
 }
 
 it('uses a role model on a new Session without changing the host default', async () => {
-  const { ctx, agent, session, host, request, record } = await fixture()
+  const { ctx, agent, session, record } = await fixture()
   const binding = bindRoleModel(ctx, agent)
   binding.select(await resolveRoleModel(ctx, { provider: 'worker-provider', model: 'worker-model' }))
+  expect(agent.model.current()).toEqual({ provider: 'worker-provider', model: 'worker-model' })
   expect((await ctx.systemPrompt.assemble()).variables).toMatchObject({ provider: 'worker-provider', model: 'worker-model' })
-  const selected = await request()
-  expect(selected).toEqual({ provider: 'worker-provider', model: 'worker-model' })
+  expect(agent.options).toMatchObject({ provider: 'host', model: 'default' })
   expect(session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(true)
-  expect(host.current).toMatchObject({ provider: 'host', model: 'default' })
-  record(selected)
+  record({ provider: 'worker-provider', model: 'worker-model' })
   await ctx.systemPrompt.assemble()
-  expect(await request()).toEqual(selected)
+  expect(agent.model.current()).toEqual({ provider: 'worker-provider', model: 'worker-model' })
+  binding.dispose()
+})
+
+it('keeps prompt model variables aligned with the model captured for the step', async () => {
+  const { ctx, agent } = await fixture()
+  const binding = bindRoleModel(ctx, agent)
+  binding.select({ provider: 'live-provider', model: 'live-model' })
+  const assembly = await ctx.systemPrompt.assemble({ modelSelection: { provider: 'step-provider', model: 'step-model' } })
+  expect(agent.model.current()).toEqual({ provider: 'live-provider', model: 'live-model' })
+  expect(assembly.variables).toMatchObject({ provider: 'step-provider', model: 'step-model' })
   binding.dispose()
 })
 
 it('applies a saved Router model to the next turn while the current turn finishes on its prior model', async () => {
-  const { ctx, agent, session, request, setStatus } = await fixture()
+  const { ctx, agent, session, setStatus } = await fixture()
   const binding = bindRoleModel(ctx, agent)
   binding.select({ provider: 'old', model: 'old-model' })
   setStatus('running')
-  await ctx.systemPrompt.assemble()
   binding.select({ provider: 'new', model: 'new-model', reasoningEffort: ReasoningEffortId('max') })
-  expect(await request()).toMatchObject({ provider: 'old', model: 'old-model' })
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toMatchObject({ provider: 'old', model: 'old-model' })
-  ctx.emit('session/event', session, { type: 'turn/end' } as never)
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toEqual({ provider: 'new', model: 'new-model', reasoningEffort: ReasoningEffortId('max') })
+  expect(agent.model.current()).toEqual({ provider: 'old', model: 'old-model' })
+  expect(session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
+  setStatus('idle')
+  expect(agent.model.current()).toEqual({ provider: 'new', model: 'new-model', reasoningEffort: ReasoningEffortId('max') })
+  expect(session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(2)
   binding.dispose()
 })
 
 it('reconciles a resumed Session with the saved role model and avoids duplicate selections', async () => {
-  const { ctx, agent, session, request, record, setStatus } = await fixture()
+  const { ctx, agent, session, record, setStatus } = await fixture()
   record({ provider: 'old', model: 'old-model' })
   const binding = bindRoleModel(ctx, agent)
   binding.select({ provider: 'new', model: 'new-model' })
   expect(session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
   binding.select({ provider: 'new', model: 'new-model' })
   expect(session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toMatchObject({ provider: 'new', model: 'new-model' })
+  expect(agent.model.current()).toEqual({ provider: 'new', model: 'new-model' })
   setStatus('running')
   binding.select({ provider: 'later', model: 'later-model' })
   setStatus('idle')
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toMatchObject({ provider: 'later', model: 'later-model' })
+  expect(agent.model.current()).toEqual({ provider: 'later', model: 'later-model' })
   binding.dispose()
 })
 
 it('keeps model-switch notices aligned with the managed route', async () => {
-  const { ctx, agent, host, record } = await fixture()
+  const { ctx, agent, record } = await fixture()
   record({ provider: 'old', model: 'first' })
   const binding = bindRoleModel(ctx, agent)
   binding.select({ provider: 'managed', model: 'second' })
-  Object.defineProperty(host, 'current', { value: { provider: 'manual', model: 'third' }, configurable: true })
-  await ctx.systemPrompt.assemble()
   const input = { source: { kind: 'test' } } as never
   const result = await agentEvents(ctx, agent).waterfall('agent/pre-step',
-    { messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    { messages: [], turn: 1, step: 1, signal: new AbortController().signal, modelSelection: agent.model.current()! },
     async () => ({ kind: 'enter' as const, messages: [input] }))
   expect(result.kind).toBe('enter')
   if (result.kind === 'enter') {
@@ -94,10 +99,10 @@ it('keeps model-switch notices aligned with the managed route', async () => {
 })
 
 it('inherits the host when unset and rejects unavailable models before recording a selection', async () => {
-  const { ctx, agent, session, resolve, request } = await fixture()
+  const { ctx, agent, session, resolve } = await fixture()
   const binding = bindRoleModel(ctx, agent)
   await ctx.systemPrompt.assemble()
-  expect(await request()).toMatchObject({ provider: 'host', model: 'default' })
+  expect(agent.model.current()).toMatchObject({ provider: 'host', model: 'default' })
   resolve.mockRejectedValueOnce(new Error('unknown provider'))
   await expect(resolveRoleModel(ctx, { provider: 'unknown', model: 'x' })).rejects.toThrow('unknown provider')
   expect(session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
