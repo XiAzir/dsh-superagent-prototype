@@ -1,10 +1,11 @@
 /** Concurrency, retry, and validation tests for settings saves, pause toggling, and policy synchronization. */
 import { afterEach, expect, it, vi } from 'vitest'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { UserError } from '../src/core/index.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { Setup } from '../src/app/setup.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
-import { startRuntime, type Host } from './fixtures/host.ts'
+import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })
@@ -14,6 +15,58 @@ function deferred<T>() {
   return { promise, resolve }
 }
 const model = { provider: 'worker-provider', model: 'worker-model' }
+
+it('applies a saved Router model to its existing Session and restores the default when cleared', async () => {
+  h = await startRuntime()
+  const { settings, store, masterId } = h.runtime
+  const agent = h.ctx.agents.get(masterId as Agent['id'])!
+  const append = vi.mocked(agent.session.append)
+  const initialEvents = append.mock.calls.length
+  const evalConfig = store.settings().eval
+  const selected = { provider: 'router-provider', model: 'router-model', reasoningEffort: 'high' }
+  await settings.save('eval', { ...evalConfig, model: selected }, store.blockRevision('eval'), 'panel')
+  expect(store.settings().eval.model).toEqual(selected)
+  expect(append.mock.calls.slice(initialEvents)).toContainEqual(['model/selection', selected])
+
+  await settings.save('eval', { ...store.settings().eval, model: null }, store.blockRevision('eval'), 'panel')
+  expect(append.mock.calls.at(-1)).toEqual(['model/selection', { provider: 'host', model: 'default' }])
+  await h.runtime.sessions.ensure(masterId, h.directory, 'dsh-superagent orchestrator', 'orchestrator')
+  expect(append.mock.calls.at(-1)).toEqual(['model/selection', { provider: 'host', model: 'default' }])
+  expect(h.controller.modelCatalog).toHaveBeenCalled()
+  expect(h.controller.selectModel).not.toHaveBeenCalled()
+})
+
+it('does not let a slow Session restore overwrite a newer saved Router model', async () => {
+  h = await startRuntime()
+  const { settings, store, masterId, sessions } = h.runtime
+  const agent = h.ctx.agents.get(masterId as Agent['id'])!
+  const append = vi.mocked(agent.session.append)
+  const old = { provider: 'old-provider', model: 'old-model' }
+  const next = { provider: 'new-provider', model: 'new-model' }
+  await settings.save('eval', { ...store.settings().eval, model: old }, store.blockRevision('eval'), 'panel')
+  const llm = (h.ctx as unknown as { llm: { resolveCallConfig: ReturnType<typeof vi.fn> } }).llm
+  const delayed = deferred<unknown>()
+  llm.resolveCallConfig.mockImplementationOnce(() => delayed.promise)
+  const restoring = sessions.ensure(masterId, h.directory, 'dsh-superagent orchestrator', 'orchestrator')
+  await vi.waitFor(() => expect(llm.resolveCallConfig).toHaveBeenCalledTimes(2))
+  await settings.save('eval', { ...store.settings().eval, model: next }, store.blockRevision('eval'), 'panel')
+  delayed.resolve(old)
+  await restoring
+  expect(store.settings().eval.model).toEqual(next)
+  expect(append.mock.calls.at(-1)).toEqual(['model/selection', next])
+})
+
+it('updates an existing open Worker Session when its execution model changes', async () => {
+  h = await startRuntime()
+  const { sessionId } = await h.acceptedTicket(feishu('210', 'Fix the document'))
+  const agent = h.ctx.agents.get(sessionId as Agent['id'])!
+  const append = vi.mocked(agent.session.append)
+  const before = append.mock.calls.length
+  const { settings, store } = h.runtime
+  await settings.save('executor', { ...store.settings().executor, model }, store.blockRevision('executor'), 'panel')
+  expect(append.mock.calls.slice(before)).toContainEqual(['model/selection', model])
+  expect(h.controller.selectModel).not.toHaveBeenCalled()
+})
 
 it('refuses a save of a block that another save changed during its model or account check, and saves nothing of it', async () => {
   h = await startRuntime()

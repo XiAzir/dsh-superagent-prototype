@@ -234,7 +234,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 ### Sessions
 
-`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` creates a Session with its role's model. `install` follows agent events and registers prompts, skills and tools for managed Sessions.
+`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` reconciles a new or resumed Session with its role's saved model. Saving a role model selects it on loaded Sessions after their current turn, without changing DSH's global default. `install` follows agent events and registers prompts, skills and tools for managed Sessions.
 
 `prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
@@ -335,7 +335,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/session-failures.ts` | Projects durable `turn/start` and `turn/end` events into one recoverable latest failure per managed Session; sanitizes exposed messages |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
-| `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
+| `src/app/role-models.ts` | Resolves role models and binds durable model selection to new and resumed Sessions |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |

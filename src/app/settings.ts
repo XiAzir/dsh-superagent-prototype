@@ -1,5 +1,6 @@
 /** Block-scoped settings validation, optimistic concurrency saves, processing pause control, and source policy synchronization. */
 import type { Context } from '@deepseek-ai/cordis'
+import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
@@ -67,7 +68,7 @@ export interface SettingsHost {
   readonly context: Context
   readonly lifetime: AbortSignal
   /** Session manager through which the main Session is notified of saved settings. */
-  readonly sessions: Pick<Sessions, 'notify' | 'delivery'>
+  readonly sessions: Pick<Sessions, 'notify' | 'delivery' | 'selectRoleModel'>
   /** Source host passed to source kinds' policy syncs and label refreshes. */
   readonly sourceHost: SourceHost
   /** Setup state, account/command checks, and restart trigger when setup-read fields change. */
@@ -162,8 +163,12 @@ export class Settings {
     const candidate = rules.merge(current, parsed, id)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
-    if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
+    let selection: ModelSelection | undefined
+    if ((block === 'eval' || block === 'executor') && JSON.stringify(model) !== JSON.stringify(previous)) {
+      try {
+        const target = model ?? (await this.host.context.sessionController.modelCatalog()).default
+        selection = await resolveRoleModel(this.host.context, target)
+      }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)
@@ -187,6 +192,7 @@ export class Settings {
       if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
       if (before !== after) engine.policyChanged(before, after, effects)
     })
+    if (selection) await sessions.selectRoleModel(block === 'eval' ? 'orchestrator' : 'worker', selection)
     // Rewrite worker command shims immediately when `blockedCommands` changes.
     const blocked = settings.executor.blockedCommands
     const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')

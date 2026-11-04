@@ -38,7 +38,7 @@ let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
 let directory: string
-let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
+let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; modelCatalog: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
 type RegisteredTool = { name: string; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
 let tools: Map<string, Map<string, RegisteredTool>>
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
@@ -200,7 +200,8 @@ beforeEach(async () => {
       agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver('queue'), steer: deliver('steer'), status: 'idle', inject: vi.fn(), session: { id: sessionId, header: { agentPreset }, snapshotEvents: () => modelEvents, requestHeader: () => undefined, append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) }, cancel: vi.fn(), whenIdle: async () => {} } as never)
       bindScopeParent(agents.get(sessionId)!, preset)
     }),
-    selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }), rename: vi.fn(async () => {}),
+    selectModel: vi.fn(async () => {}), modelCatalog: vi.fn(async () => ({ default: { provider: 'host', model: 'default' }, groups: [], routableProviders: [], failures: [] })),
+    resolveAgent: vi.fn(async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
