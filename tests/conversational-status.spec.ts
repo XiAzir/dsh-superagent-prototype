@@ -8,6 +8,38 @@ const query = (id: string, text = '任务现在什么状态？', root = 'om_1') 
   ...feishu(id, text, { root_id: root }), routing: 'router' as const,
 })
 
+it('answers a Router-owned question on a subscribed thread without treating its matched ticket as assigned', async () => {
+  h = await startRuntime()
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const message = query('2', '你好')
+  h.runtime.receive(message)
+  await h.runtime.pump(); await h.runtime.idle()
+  expect(h.runtime.store.triggers.disposition(message.id)).toMatchObject({ matched: [ticket.id], fanout: [], routing: 'pending' })
+
+  const reply = await h.runTool(h.runtime.masterId, 'orchestrator_reply', {
+    purpose: 'answer', trigger_id: message.id, ticket_id: 'none', text: '你好！',
+  })
+  expect(h.runtime.store.receipts.get(String(reply.receipt_id))).toMatchObject({ channel: message.channel, text: '你好！' })
+  expect(h.runtime.store.receipts.get(String(reply.receipt_id))).not.toHaveProperty('ticketId')
+  expect(h.runtime.store.tickets.get(ticket.id)?.inputs.some(input => input.kind === 'trigger' && input.triggerId === message.id)).toBe(false)
+})
+
+it('requires a worker report before answering an assigned follow-up with a placeholder ticket', async () => {
+  h = await startRuntime()
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const message = feishu('2', '这个配置在哪里读取？', { root_id: 'om_1' })
+  h.runtime.receive(message)
+  await h.runtime.pump(); await h.runtime.idle()
+  expect(h.runtime.store.triggers.disposition(message.id)?.fanout).toEqual([ticket.id])
+  const answer = { purpose: 'answer', trigger_id: message.id, ticket_id: 'N/A', text: '在配置文件中读取。' }
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_reply', answer)).rejects.toThrow('No worker answer is ready')
+
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: '在配置文件中读取。', reply_to_trigger_id: message.id })
+  const reply = await h.runTool(h.runtime.masterId, 'orchestrator_reply', answer)
+  expect(h.runtime.store.receipts.get(String(reply.receipt_id))).toMatchObject({ channel: message.channel, ticketId: ticket.id, text: answer.text })
+  expect(h.runtime.store.tickets.get(ticket.id)?.answers).toEqual([])
+})
+
 it.each(['running', 'completed', 'stopped'] as const)('reads %s task status without adding inputs, resuming, or starting work', async state => {
   h = await startRuntime()
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))

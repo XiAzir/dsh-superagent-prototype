@@ -116,6 +116,22 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('delivers a direct answer even when the Router supplies a placeholder ticket', async () => {
+    const { runtime, store } = await startQq()
+    await push(event(90, 'private', owner, [{ type: 'text', data: { text: '你好' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const question = qqTriggers(runtime)[0]!
+    await host!.route({ kind: 'ignore', trigger_id: question.id, reason: 'Greeting.' })
+
+    const reply = await host!.runTool(runtime.masterId, 'orchestrator_reply', {
+      purpose: 'answer', trigger_id: question.id, ticket_id: 'N/A', text: '你好！',
+    })
+    await waitFor(() => confirmed.some(item => item.text === '你好！'))
+    expect(store.replyStatus(String(reply.receipt_id))).toBe('sent')
+    expect(store.receipts.get(String(reply.receipt_id))).not.toHaveProperty('ticketId')
+    expect(store.tickets.list()).toEqual([])
+  })
+
   it('retries a failed login lookup on the same connection and recovers on that connection', async () => {
     let attempts = 0
     rpcHandlers.get_login_info = () => { if (++attempts === 1) throw new Error('temporary login lookup failure'); return { user_id: Number(selfId) } }
