@@ -14,7 +14,7 @@ export function usage() {
   return `Usage: node scripts/setup-linux.mjs [options]
 
 Prepare the Linux personal-mode DSH profile and install this checkout.
-Requires Linux, Node.js 24 LTS, pnpm 11, and DSH 0.2.1-rc.5.
+Requires Linux, Node.js 24 LTS (24.9.0 or later), pnpm 11, and DSH 0.2.2-rc.1.
 
 Options:
   --profile <name>       DSH profile name (default: superagent)
@@ -100,20 +100,26 @@ function run(command, args, options = {}) {
   return result.stdout?.trim() ?? ''
 }
 
+export function supportsNodeVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version)
+  if (!match) return false
+  return Number(match[1]) === 24 && Number(match[2]) >= 9
+}
+
 function checkPrerequisites() {
   if (process.platform !== 'linux') {
     throw new Error(`This setup command requires Linux; detected ${process.platform}. Use docs/windows.md on Windows.`)
   }
-  if (process.versions.node.split('.')[0] !== '24') {
-    throw new Error(`Node.js 24 LTS is required; detected ${process.versions.node}.`)
+  if (!supportsNodeVersion(process.versions.node)) {
+    throw new Error(`Node.js 24 LTS >=24.9.0 is required; detected ${process.versions.node}.`)
   }
   const pnpmVersion = run('pnpm', ['--version'], { quiet: true })
   if (Number(pnpmVersion.split('.')[0]) !== 11) {
     throw new Error(`pnpm 11 is required by this repository; detected ${pnpmVersion}.`)
   }
   const dshVersion = run('dsh', ['--version'], { quiet: true })
-  if (dshVersion !== '0.2.1-rc.5') {
-    throw new Error(`DSH 0.2.1-rc.5 is required; detected ${dshVersion}.`)
+  if (dshVersion !== '0.2.2-rc.1') {
+    throw new Error(`DSH 0.2.2-rc.1 is required; detected ${dshVersion}.`)
   }
 }
 

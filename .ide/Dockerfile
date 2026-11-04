@@ -13,6 +13,6 @@ RUN apt-get update \
 
 RUN npm install --global \
     --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
-    pnpm@11.7.0 @deepseek-ai/dsh@0.2.1-rc.5
+    pnpm@11.7.0 @deepseek-ai/dsh@0.2.2-rc.1
 
 WORKDIR /workspace

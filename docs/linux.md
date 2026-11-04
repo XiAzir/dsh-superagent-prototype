@@ -5,8 +5,8 @@
 ## 前置条件
 
 - Linux 环境
-- Node.js 24 LTS、pnpm 11、Git
-- DeepSeek Harness CLI `dsh` 0.2.1-rc.5
+- Node.js 24 LTS（24.9.0 或更高版本）、pnpm 11、Git
+- DeepSeek Harness CLI `dsh` 0.2.2-rc.1
 - Python 3、tmux；视频帧提取使用 ffmpeg
 
 CNB 仓库：[XiAzir/dsh-superagent](https://cnb.cool/XiAzir/dsh-superagent)。默认 `linux` 分支从 Windows 功能分支 `personal-web` 的 `92f0694` 继续开发，保留原分支及完整历史。
