@@ -10,6 +10,9 @@ import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.
 import { Versions } from './versions.ts'
 import { storeReads } from './store-read.ts'
 import { RoomJournal } from './room-journal.ts'
+import { PersonalStore } from './personal-store.ts'
+
+export { SCHEMA_VERSION }
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
@@ -45,7 +48,6 @@ const SETS: Record<string, Record<string, string>> = {
   outbox: { dropped: "TEXT AS (value ->> '$.dropped.at')", pending: `TEXT AS (CASE WHEN value ->> '$.status' = 'pending'
     AND value ->> '$.ticketId' IS NOT NULL THEN (value ->> '$.ticketId') || ' ' || (value ->> '$.channel.thread') END)` },
 }
-export { SCHEMA_VERSION }
 /**
  * SQLite backing store implementing domain `Repositories`, view read queries, versioned settings, outbox receipts, and key-value state.
  * The Runtime opens it after locking the state directory and automatically migrates supported older schemas on startup.
@@ -54,16 +56,18 @@ export { SCHEMA_VERSION }
 export class Store implements Repositories {
   readonly db: DatabaseSync
   readonly rooms: RoomJournal
+  readonly personal: PersonalStore
   /**
-   * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
+   * Opens or creates the SQLite database at `path`, migrating supported older schemas in a single transaction.
    * @param report - Receives errors thrown by `afterCommit` callbacks without failing the committed transaction.
-   * @throws When the database schema is older than `OLDEST_SCHEMA` (10), newer than `SCHEMA_VERSION` (11), or when migration fails; in every case the database file is left unchanged and the SQLite handle is closed so a later attempt in the same process can open it.
+   * @throws When the database schema is older than `OLDEST_SCHEMA` (10), newer than `SCHEMA_VERSION`, or when migration fails; in every case the database file is left unchanged and the SQLite handle is closed so a later attempt in the same process can open it.
    */
   constructor(path: string, private readonly report: (error: unknown) => void = () => {}) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(path)
     this.read = storeReads(this.db)
     this.rooms = new RoomJournal(this.db)
+    this.personal = new PersonalStore(this.db, work => this.atomic(work))
     try {
       chmodSync(path, 0o600)
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
@@ -89,17 +93,31 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
               since TEXT NOT NULL, PRIMARY KEY (kind, key));
+            CREATE TABLE IF NOT EXISTS personal_record (kind TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, revision INTEGER NOT NULL,
+              updated_at TEXT NOT NULL, PRIMARY KEY (kind,id));
+            CREATE TABLE IF NOT EXISTS personal_history (kind TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL,
+              changed_at TEXT NOT NULL, operation TEXT NOT NULL, value TEXT, redacted INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (kind,record_id,revision));
+            CREATE TABLE IF NOT EXISTS personal_settings (id INTEGER PRIMARY KEY CHECK (id=1), value TEXT NOT NULL, revision INTEGER NOT NULL,
+              updated_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
             CREATE INDEX IF NOT EXISTS web_task_summary_updated ON web_task_summary(updated_at DESC, id ASC);
             CREATE INDEX IF NOT EXISTS web_task_ticket_ticket ON web_task_ticket(ticket_id, web_task_id);
+            CREATE INDEX IF NOT EXISTS personal_record_status ON personal_record(kind, json_extract(value, '$.status'));
+            CREATE INDEX IF NOT EXISTS personal_record_ticket ON personal_record(kind, json_extract(value, '$.ticketId'));
+            CREATE INDEX IF NOT EXISTS personal_record_due ON personal_record(kind, json_extract(value, '$.dueAt'));
+            CREATE INDEX IF NOT EXISTS personal_record_check ON personal_record(kind, json_extract(value, '$.nextCheckAt'));
+            CREATE INDEX IF NOT EXISTS personal_record_expiry ON personal_record(kind, json_extract(value, '$.expiresAt'));
+            CREATE INDEX IF NOT EXISTS personal_history_lookup ON personal_history(kind,record_id,revision DESC);
           `)
           this.rooms.setup()
           this.addColumns()
           this.backfillWebTaskIndex()
-          if (migrating) migrateTo11(this)
+          // The schema 11 transformation only applies to databases that predate schema 11.
+          if (version !== undefined && version < 11) migrateTo11(this)
           this.rooms.backfill()
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
         })
