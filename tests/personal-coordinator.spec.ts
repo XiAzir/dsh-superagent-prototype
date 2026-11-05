@@ -91,6 +91,29 @@ it('supersedes only a fact with matching subject, predicate, and scope', () => {
     value: 'Europe/Paris', supersedes: old.id } })).toThrow(/替代记录须属于同一主体/)
 })
 
+it('rejects a second active fact that tries to supersede an already superseded fact', () => {
+  const original = service.write('fact', { id: 'fact-original', revision: 0, value: { subject: 'owner', predicate: 'timezone', scope: 'global', value: 'UTC' } })
+  const first = service.write('fact', { id: 'fact-first-replacement', revision: 0, value: { subject: original.subject, predicate: original.predicate,
+    scope: original.scope, value: 'Asia/Tokyo', supersedes: original.id } })
+
+  expect(store.personal.get('fact', original.id)?.status).toBe('superseded')
+  expect(() => service.write('fact', { id: 'fact-second-replacement', revision: 0, value: { subject: original.subject,
+    predicate: original.predicate, scope: original.scope, value: 'Europe/Paris', supersedes: original.id } })).toThrow()
+  expect(store.personal.get('fact', first.id)?.status).toBe('active')
+  expect(store.personal.get('fact', 'fact-second-replacement')).toBeUndefined()
+})
+
+it('omits future-start constraints from the current worker context', () => {
+  configureOwner()
+  const ticket = addOwnerTicket('future-constraint-ticket')
+  service.write('constraint', { id: 'starts-tomorrow', revision: 0, value: { title: 'Future quiet period', kind: 'time', severity: 'hard',
+    status: 'active', scope: 'global', startAt: '2026-11-06T00:00:00Z', endAt: '2026-11-07T00:00:00Z' } })
+  service.write('constraint', { id: 'active-now', revision: 0, value: { title: 'Current restriction', kind: 'time', severity: 'soft',
+    status: 'active', scope: `ticket:${ticket.id}`, startAt: '2026-11-05T08:00:00Z', endAt: '2026-11-05T10:00:00Z' } })
+
+  expect(service.context(ticket.id).constraints.map(item => item.id)).toEqual(['active-now'])
+})
+
 it('validates commitment goal links and required deadlines, and rolls back queued reminders with the transaction', () => {
   const goal = service.write('goal', { id: 'goal-for-link', revision: 0, value: { title: 'Goal' } })
   expect(() => service.write('commitment', { id: 'no-deadline', revision: 0, value: { title: 'Open commitment' } }))

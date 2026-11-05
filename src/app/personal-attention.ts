@@ -65,6 +65,7 @@ export class PersonalAttentionService {
     if (!criteria.ticketId && !criteria.commitmentId) throw new TypeError('ticketId or commitmentId is required')
     const now = iso(this.now()); let changed = 0
     for (const row of this.listAll('queued')) {
+      if (criteria.ticketId && !criteria.commitmentId && row.commitmentId) continue
       if ((criteria.ticketId && row.ticketId !== criteria.ticketId) || (criteria.commitmentId && row.commitmentId !== criteria.commitmentId)) continue
       this.deps.store.personal.save('attention', { ...row, status: 'resolved', updatedAt: now }, row.revision); changed++
     }
@@ -132,7 +133,10 @@ export class PersonalAttentionService {
   }
 
   private isDeliverable(item: Attention, at: Date, settings: PersonalSettings, quiet: boolean): boolean {
-    if (item.ticketId && (!this.deps.store.tickets || !this.deps.store.tickets.get(item.ticketId) || this.deps.store.tickets.get(item.ticketId)?.ended)) return false
+    if (item.commitmentId) {
+      const commitment = this.deps.store.personal.get('commitment', item.commitmentId)
+      if (!commitment || ['fulfilled', 'cancelled'].includes(commitment.status)) return false
+    } else if (item.ticketId && (!this.deps.store.tickets || !this.deps.store.tickets.get(item.ticketId) || this.deps.store.tickets.get(item.ticketId)?.ended)) return false
     const notBefore = item.notBefore ? new Date(item.notBefore) : undefined
     if (item.priority === 'P0') return true
     if (notBefore && notBefore > at) return false

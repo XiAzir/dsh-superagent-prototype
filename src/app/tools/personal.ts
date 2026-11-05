@@ -42,7 +42,12 @@ export function personalTools(service: PersonalCoordinator, ticketId?: string, r
     name: 'orchestrator_personal_record',
     description: 'Record an explicitly requested goal, commitment or soft constraint with original owner evidence. Facts are proposals for owner confirmation. Use stable id and read revision; inspect conflicts before scheduling. JSON value uses camelCase fields.',
     schema: z.object({ trigger_id: z.string().min(1), kind: z.enum(EditablePersonalKinds), id: z.string().min(1).max(200),
-      revision: z.number().int().nonnegative(), value: z.record(z.string(), z.unknown()) }).strict(),
+      revision: z.number().int().nonnegative(), value: z.record(z.string(), z.unknown()).describe(
+        'Patch fields only. goal: title, description?, priority 0..100, successCriteria[], status active/paused/completed/cancelled. '
+        + 'commitment: title, owner user/assistant/external, counterparty?, dueAt?/expectedAt?/nextCheckAt? (ISO with timezone; at least one), goalIds[], ticketIds[], status open/waiting/overdue/fulfilled/cancelled. '
+        + 'fact: subject, predicate, value, scope global or ticket:<id>, validFrom?, validUntil?, supersedes?; proposals await owner confirmation. '
+        + 'constraint: title, kind time/budget/privacy/channel/risk, severity soft, startAt?, endAt?, amount?, currency?, scope?. '
+        + 'Never include id/revision/timestamps/sourceRefs inside value.') }).strict(),
     execute: async args => service.write(args.kind, { id: args.id, revision: args.revision, value: args.value }, { triggerId: args.trigger_id }),
   }), tool({
     name: 'orchestrator_personal_conflicts',

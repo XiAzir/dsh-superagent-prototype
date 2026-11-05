@@ -1,6 +1,6 @@
 /** Connect personal reminders and exact-request actions to the existing durable Outbox. */
 import { z } from 'zod'
-import { key, type ChannelRef } from '../core/index.ts'
+import { key, type ChannelRef, type OutboundMessage } from '../core/index.ts'
 import type { Store } from './store.ts'
 import type { Outbox } from './outbox.ts'
 import type { PersonalCoordinator } from './personal-coordinator.ts'
@@ -34,12 +34,33 @@ export class PersonalRuntime {
     }
     this.actions = new PersonalActionsService({ store: host.store, adapters: { ticket_reply: adapter } })
   }
-  private ownerChannel(ticketId: string): ChannelRef | undefined {
+  private ownerChannel(ticketId: string, allowEnded = false): ChannelRef | undefined {
     try {
       const ticket = this.host.store.tickets.get(ticketId)
-      if (!ticket || ticket.ended) return
+      if (!ticket || (ticket.ended && !allowEnded)) return
       return this.host.coordinator.ownerTrigger(ticket.origin.triggerId).channel
     } catch { return }
+  }
+  /** Runs immediately before sending, so a pending receipt never relies on an earlier pass's grant. */
+  maySend(message: OutboundMessage): boolean {
+    if (message.id.startsWith('personal-action:')) {
+      if (!this.host.coordinator.enabled() || !message.ticketId) return false
+      try {
+        this.host.coordinator.ownerTicket(message.ticketId)
+        const result = this.actions.check(message.id.slice('personal-action:'.length))
+        const payload = result.action.payload as { text?: unknown }
+        return result.allowed && result.action.target === `${message.channel.source}:${message.channel.thread}` && payload.text === message.text
+      } catch { return false }
+    }
+    if (message.id.startsWith('personal-attention:')) {
+      if (!this.host.coordinator.enabled()) return false
+      return this.attention.collectDue().some(delivery => delivery.items.some(item => {
+        if (!item.ticketId) return false
+        const channel = this.ownerChannel(item.ticketId, !!item.commitmentId)
+        return channel && message.id === `personal-attention:${key(delivery.deliveryId, JSON.stringify(channel))}`
+      }))
+    }
+    return true
   }
   /** Synchronous state transitions share the Engine pass; effects send only after commit. */
   tick(): void {
@@ -74,7 +95,7 @@ export class PersonalRuntime {
       const channels = new Map<string, { channel: ChannelRef; ticketId: string }>()
       for (const item of delivery.items) {
         if (!item.ticketId) continue
-        const channel = this.ownerChannel(item.ticketId)
+        const channel = this.ownerChannel(item.ticketId, !!item.commitmentId)
         if (channel) channels.set(JSON.stringify(channel), { channel, ticketId: item.ticketId })
       }
       if (!channels.size) continue // Available in the authenticated attention inbox until acknowledged.

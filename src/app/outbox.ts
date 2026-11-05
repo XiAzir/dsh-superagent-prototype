@@ -12,6 +12,8 @@ export interface OutboxHost {
   readonly sources: Pick<SourceRegistry, 'instance' | 'channelAllowed' | 'send'>
   readonly commands: Commands
   paused(): boolean
+  /** Final synchronous authorization check, including replayed receipts after a host restart. */
+  allowMessage?(message: OutboundMessage): boolean
 }
 
 /**
@@ -54,6 +56,7 @@ export class Outbox implements OutboxPort {
     // Hold later messages for the same ticket and conversation behind an earlier pending message until it exceeds the failure threshold.
     if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation lane waits')
     if (!sources.channelAllowed(receipt.channel)) { store.receipts.settle(receipt, 'channelIgnored'); return }
+    if (this.host.allowMessage?.(receipt) === false) { store.receipts.settle(receipt, 'deliveryRevoked'); return }
     // A permanently unreachable target (such as a recalled message or deleted Issue) settles as `channelGone` so its receipt prevents retries.
     const result = await sources.send(receipt, commands)
     if (result === 'waiting') throw new Later('The Source is not installed')

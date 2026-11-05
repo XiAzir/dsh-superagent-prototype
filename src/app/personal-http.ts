@@ -13,6 +13,7 @@ export interface PersonalDashboard {
   followups: { ticketId: string; title: string; checks: Followup[] }[]
 }
 export interface PersonalApi {
+  'GET personal/authorizations/:id/request': { response: { authorization: PersonalRecordMap['authorization']; action: PersonalRecordMap['action'] } }
   'POST personal/attention/:id/acknowledge': { response: { item: PersonalRecordMap['attention'] } }
   'POST personal/authorizations/:id/grant': { body: { revision: number; requestHash: string; expiresAt?: string }; response: { item: PersonalRecordMap['authorization'] } }
   'POST personal/authorizations/:id/revoke': { body: { revision: number; requestHash: string }; response: { item: PersonalRecordMap['authorization'] } }
@@ -43,6 +44,13 @@ export function personalRoutes(host: PersonalHttpHost) {
     return host.personal
   }
   return {
+    'GET personal/authorizations/:id/request': ({ params }: { params: { id: string } }) => {
+      const service = coordinator()
+      const authorization = host.store.personal.get('authorization', params.id)
+      const action = service.all('action').find(item => item.authorizationId === params.id)
+      if (!authorization || !action || authorization.requestHash !== action.requestHash) throw new PersonalError(404, '完整行动请求暂不可用。')
+      return { authorization, action }
+    },
     'POST personal/attention/:id/acknowledge': ({ params }: { params: { id: string } }) => {
       coordinator().requireEnabled(); return { item: host.personalRuntime!.attention.acknowledge(params.id) }
     },

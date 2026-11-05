@@ -80,6 +80,42 @@ it('prepares an exact worker reply, grants only through the owner HTTP route, an
   expect(host.runtime.store.personal.get('action', action.id)).toMatchObject({ status: 'verified', result: { receiptId } })
 })
 
+it('rejects an expired queued action at Outbox send time before the next personal runtime tick', async () => {
+  const { host, ticket } = await setup('expired-action')
+  const action = host.runtime.personalRuntime.actions.prepare(ticket.id, { idempotencyKey: 'expires-during-outage', action: 'ticket_reply',
+    target: `feishu:${ticket.channels[0]!.thread}`, payload: { text: 'This expired reply must not go out.' }, scope: ['ticket:reply'], risk: 'L3' })
+  const requested = host.runtime.store.personal.get('authorization', action.authorizationId!)!
+  const granted = host.runtime.personalRuntime.actions.grant(requested.id, { expectedRevision: requested.revision,
+    requestHash: action.requestHash, grantedBy: 'owner' })
+  const expired = host.runtime.store.personal.save('authorization', { ...granted, expiresAt: '2026-11-04T00:00:00.000Z', updatedAt: at }, granted.revision)
+
+  const request = await host.api('GET', `personal/authorizations/${expired.id}/request`)
+  expect(request.status).toBe(200)
+  expect(request.body.action).toMatchObject({ id: action.id, payload: { text: 'This expired reply must not go out.' }, requestHash: action.requestHash })
+
+  const receiptId = `personal-action:${action.id}`
+  host.runtime.outbox.send({ id: receiptId, ticketId: ticket.id, kind: 'reply', channel: ticket.channels[0]!, text: 'This expired reply must not go out.' })
+  await host.runtime.outbox.sent(receiptId)
+  expect(host.runtime.store.receipts.get(receiptId)?.status).not.toBe('sent')
+  expect(host.runtime.store.personal.get('authorization', expired.id)?.status).toBe('granted')
+})
+
+it('keeps an open commitment reminder linked to an ended ticket and sends it to the original private owner channel', async () => {
+  const { host, ticket } = await setup('ended-ticket-reminder', true)
+  const commitment = host.runtime.personal.write('commitment', { id: 'still-open-after-stop', revision: 0,
+    value: { title: 'Confirm the pending quote', dueAt: '2026-11-04T00:00:00Z', nextCheckAt: '2026-11-04T00:00:00Z', ticketIds: [ticket.id] } })
+  host.runtime.store.tickets.save({ ...ticket, ended: { at, by: 'human', outcome: 'stopped' } })
+
+  host.runtime.personalRuntime.tick()
+  const attention = host.runtime.store.personal.list('attention').find(item => item.commitmentId === commitment.id)
+  expect(attention).toBeDefined()
+  expect(attention?.status).not.toBe('resolved')
+  const receipt = host.runtime.store.receipts.waiting().find(item => item.id.startsWith('personal-attention:'))
+  expect(receipt).toBeDefined()
+  expect(receipt?.channel.address.chatId).toBe('oc_owner')
+  expect(receipt?.channel.address.direct).toBe('true')
+})
+
 it('withdraws pending attention and action messages when a ticket stops, authorization is revoked, or the feature is disabled', async () => {
   const { host, ticket } = await setup('cancel-owner')
   const action = host.runtime.personalRuntime.actions.prepare(ticket.id, { idempotencyKey: 'cancel-action', action: 'ticket_reply',
@@ -115,7 +151,8 @@ it('keeps request side effects in durable state when a response is lost and mark
   const one = service.queue({ title: 'Older', summary: 'one', priority: 'P1', digestKey: 'batch' }, 'snapshot-one')
   now = new Date('2026-11-05T10:00:00.000Z')
   const two = service.queue({ title: 'Newer', summary: 'two', priority: 'P1', digestKey: 'batch' }, 'snapshot-two')
-  const [first, second] = [one, two].sort((a, b) => a.id.localeCompare(b.id))
+  const sorted = [one, two].sort((a, b) => a.id.localeCompare(b.id))
+  const first = sorted[0]!, second = sorted[1]!
   host.runtime.store.personal.save('attention', { ...first, createdAt: '2026-11-05T11:00:00.000Z' }, first.revision)
   host.runtime.store.personal.save('attention', { ...second, createdAt: '2026-11-05T08:00:00.000Z' }, second.revision)
   const delivery = service.collectDue()[0]!

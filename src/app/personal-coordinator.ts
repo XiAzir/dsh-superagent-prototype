@@ -58,7 +58,7 @@ export class PersonalCoordinator {
     return { items: items.slice(0, limit), next_offset: items.length > limit ? offset + limit : null }
   }
   /** Owner-only panel updates may confirm facts; model writes always retain facts as proposals. */
-  write(kind: EditablePersonalKind, request: PersonalWrite, origin: { triggerId?: string } = {}): PersonalRecord {
+  write<K extends EditablePersonalKind>(kind: K, request: PersonalWrite, origin: { triggerId?: string } = {}): PersonalRecordMap[K] {
     this.requireEnabled()
     editable.parse(kind); PersonalWriteSchema.parse(request)
     if (origin.triggerId) this.ownerTrigger(origin.triggerId)
@@ -76,12 +76,12 @@ export class PersonalCoordinator {
       const item = PersonalSchemas[kind].parse(fields)
       if (kind === 'commitment') this.validateCommitment(item as PersonalRecordMap['commitment'])
       if (kind === 'fact') this.validateFact(item as PersonalRecordMap['fact'])
-      const saved = store.personal.save(kind, item, request.revision)
+      const saved = store.personal.save(kind, item as PersonalRecordMap[K], request.revision)
       if (kind === 'fact') {
         const fact = saved as PersonalRecordMap['fact']
         if (fact.status === 'active' && fact.supersedes) {
           const old = store.personal.get('fact', fact.supersedes)!
-          store.personal.save('fact', { ...old, status: 'superseded', updatedAt: at }, old.revision)
+          if (old.status === 'active') store.personal.save('fact', { ...old, status: 'superseded', updatedAt: at }, old.revision)
         }
       }
       if (kind === 'commitment' && ['fulfilled', 'cancelled'].includes(saved.status)) {
@@ -108,7 +108,9 @@ export class PersonalCoordinator {
     if (item.validFrom && item.validUntil && item.validFrom >= item.validUntil) throw new PersonalError(400, '失效时间应晚于生效时间。')
     if (item.supersedes) {
       const previous = this.host.store.personal.get('fact', item.supersedes)
-      if (!previous || previous.id === item.id || previous.subject !== item.subject || previous.predicate !== item.predicate || previous.scope !== item.scope) {
+      const current = this.host.store.personal.get('fact', item.id)
+      const retainedReplacement = current?.status === 'active' && current.supersedes === item.supersedes && previous?.status === 'superseded'
+      if (!previous || (previous.status !== 'active' && !retainedReplacement) || previous.id === item.id || previous.subject !== item.subject || previous.predicate !== item.predicate || previous.scope !== item.scope) {
         throw new PersonalError(400, '替代记录须属于同一主体、属性和场景。')
       }
     }
@@ -142,7 +144,8 @@ export class PersonalCoordinator {
       && (!item.validFrom || item.validFrom <= now) && (!item.validUntil || item.validUntil > now)
       && (!ticketId || item.scope === `ticket:${ticketId}` || item.scope === 'global'))
     const constraints = this.all('constraint').filter(item => item.status === 'active'
-      && (!item.endAt || item.endAt > now) && (!ticketId || item.scope === `ticket:${ticketId}` || item.scope === 'global'))
+      && (!item.startAt || item.startAt <= now) && (!item.endAt || item.endAt > now)
+      && (!ticketId || item.scope === `ticket:${ticketId}` || item.scope === 'global'))
     return { goals: goals.slice(0, 30), commitments: commitments.slice(0, 50), facts: facts.slice(0, 50), constraints: constraints.slice(0, 50),
       truncated: goals.length > 30 || commitments.length > 50 || facts.length > 50 || constraints.length > 50,
       timezone: store.personal.settings().timezone, observedAt: now }
