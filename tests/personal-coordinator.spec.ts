@@ -49,6 +49,13 @@ it('stores an owner goal and turns a due commitment into a repeat-safe reminder'
   expect(store.personal.get('commitment', 'quote')).toMatchObject({ status: 'overdue', nextCheckAt: '2026-11-06T09:00:00.000Z' })
 })
 
+it('keeps a confirmed replacement editable after the owner forgets the original memory', () => {
+  const original = service.write('fact', { id: 'original', revision: 0, value: { subject: 'owner', predicate: 'hotel', value: 'budget', scope: 'global' } })
+  const replacement = service.write('fact', { id: 'replacement', revision: 0, value: { subject: 'owner', predicate: 'hotel', value: 'quiet', scope: 'global', supersedes: original.id } })
+  service.remove('fact', original.id, store.personal.get('fact', original.id)!.revision)
+  expect(service.write('fact', { id: replacement.id, revision: replacement.revision, value: { value: 'quiet room' } }).value).toBe('quiet room')
+})
+
 it('allows only a listed owner direct message as the model-tool source', () => {
   configureOwner()
   const direct = ownerTrigger('direct')

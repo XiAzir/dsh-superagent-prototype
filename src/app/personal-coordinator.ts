@@ -6,6 +6,7 @@ import type { Store } from './store.ts'
 
 export const EditablePersonalKinds = ['goal', 'commitment', 'fact', 'constraint'] as const
 export type EditablePersonalKind = typeof EditablePersonalKinds[number]
+/** A personal assistant request refused with an HTTP-safe status and message. */
 export class PersonalError extends Error {
   constructor(readonly status: 400 | 403 | 404 | 409, message: string) { super(message) }
 }
@@ -27,6 +28,7 @@ export interface PersonalCoordinatorHost {
   now?(): Date
 }
 
+/** Validates owner-scoped records and builds bounded context and reminders from durable personal data. */
 export class PersonalCoordinator {
   constructor(readonly host: PersonalCoordinatorHost) {}
   private now(): string { return (this.host.now?.() ?? new Date()).toISOString() }
@@ -80,8 +82,8 @@ export class PersonalCoordinator {
       if (kind === 'fact') {
         const fact = saved as PersonalRecordMap['fact']
         if (fact.status === 'active' && fact.supersedes) {
-          const old = store.personal.get('fact', fact.supersedes)!
-          if (old.status === 'active') store.personal.save('fact', { ...old, status: 'superseded', updatedAt: at }, old.revision)
+          const old = store.personal.get('fact', fact.supersedes)
+          if (old?.status === 'active') store.personal.save('fact', { ...old, status: 'superseded', updatedAt: at }, old.revision)
         }
       }
       if (kind === 'commitment' && ['fulfilled', 'cancelled'].includes(saved.status)) {
@@ -109,6 +111,7 @@ export class PersonalCoordinator {
     if (item.supersedes) {
       const previous = this.host.store.personal.get('fact', item.supersedes)
       const current = this.host.store.personal.get('fact', item.id)
+      if (!previous && current?.status === 'active' && current.supersedes === item.supersedes) return
       const retainedReplacement = current?.status === 'active' && current.supersedes === item.supersedes && previous?.status === 'superseded'
       if (!previous || (previous.status !== 'active' && !retainedReplacement) || previous.id === item.id || previous.subject !== item.subject || previous.predicate !== item.predicate || previous.scope !== item.scope) {
         throw new PersonalError(400, '替代记录须属于同一主体、属性和场景。')
