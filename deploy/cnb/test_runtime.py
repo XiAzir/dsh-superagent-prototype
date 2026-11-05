@@ -206,12 +206,12 @@ class RuntimeTests(unittest.TestCase):
         stop_dsh.assert_called_once()
         self.assertFalse(supervisor.dsh_started)
 
-    def test_napcat_disabled_is_noop_and_does_not_need_docker(self):
+    def test_qq_disabled_is_noop_and_does_not_need_docker(self):
         with patch.object(runtime.NapCat, "_run", side_effect=AssertionError("Docker must not run")) as docker:
             supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
             with patch.object(supervisor, "is_paused", return_value=False):
-                self.assertFalse(supervisor.ensure_napcat())
-        self.assertFalse(supervisor.napcat_enabled)
+                self.assertFalse(supervisor.ensure_qq())
+        self.assertFalse(supervisor.qq_enabled)
         docker.assert_not_called()
 
         deployment = self.data / "napcat" / "deployment.json"
@@ -219,50 +219,92 @@ class RuntimeTests(unittest.TestCase):
         deployment.write_text('{"enabled":false}', encoding="utf-8")
         with patch.object(runtime.NapCat, "_run", side_effect=AssertionError("disabled config must not use Docker")) as docker:
             with patch.object(supervisor, "is_paused", return_value=False):
-                self.assertFalse(supervisor.ensure_napcat())
+                self.assertFalse(supervisor.ensure_qq())
         docker.assert_not_called()
 
-    def test_napcat_waiting_for_qq_login_is_healthy_when_webui_is_ready(self):
+    def test_qq_waiting_for_qq_login_is_healthy_when_webui_is_ready(self):
         class Manager:
             def __init__(self, *_args): pass
             def ensure_started(self):
                 return {"enabled": True, "running": True, "webui_ready": True, "login": "pending"}
             def healthy(self): return True
             def stop(self, **_kwargs): return True
-        with patch.object(runtime, "NapCat", Manager):
+        with patch.object(runtime, "QQBackend", Manager):
             supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.dsh_started = True
         with patch.object(supervisor, "_local_ready", return_value=True), \
              patch.object(supervisor, "is_paused", return_value=False):
-            self.assertTrue(supervisor.ensure_napcat())
+            self.assertTrue(supervisor.ensure_qq())
             self.assertTrue(supervisor.is_healthy())
-        self.assertTrue(supervisor.napcat_enabled)
+        self.assertTrue(supervisor.qq_enabled)
 
-    def test_napcat_start_failure_retries_after_30_seconds_and_logs_only_type(self):
+    def test_snowluma_selection_participates_in_health_and_lease_fencing(self):
+        deployment = self.data / "snowluma" / "deployment.json"
+        deployment.parent.mkdir(parents=True)
+        deployment.write_text('{"enabled":true}', encoding="utf-8")
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        snow = supervisor.qq.managers['snowluma']
+        napcat = supervisor.qq.managers['napcat']
+        self.assertTrue(supervisor._qq_config_enabled())
+        with patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(supervisor, "_local_ready", return_value=True), \
+             patch.object(napcat, "stop") as old_stop, \
+             patch.object(snow, "ensure_started", return_value={
+                 "enabled": True, "running": True, "webui_ready": True}), \
+             patch.object(snow, "healthy", return_value=True), \
+             patch.object(snow, "stop") as stop:
+            supervisor.dsh_started = True
+            self.assertTrue(supervisor.ensure_qq())
+            self.assertEqual(supervisor.qq.active, 'snowluma')
+            old_stop.assert_called_once()
+            self.assertTrue(supervisor.is_healthy())
+            with patch.object(supervisor, "stop_dsh"):
+                supervisor._lose_lease()
+            stop.assert_called_once_with(timeout=30)
+            self.assertFalse(supervisor.qq_enabled)
+
+    def test_two_qq_backends_enabled_fail_before_docker_and_remain_unhealthy(self):
+        for name in ('napcat', 'snowluma'):
+            deployment = self.data / name / 'deployment.json'
+            deployment.parent.mkdir(parents=True)
+            deployment.write_text('{"enabled":true}', encoding='utf-8')
+        supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
+        supervisor.dsh_started = True
+        with patch.object(supervisor, "is_paused", return_value=False), \
+             patch.object(supervisor, "_local_ready", return_value=True), \
+             patch.object(runtime.NapCat, "_run") as nap, \
+             patch.object(runtime.SnowLuma, "_run") as snow:
+            self.assertFalse(supervisor.ensure_qq())
+            self.assertFalse(supervisor.is_healthy())
+        self.assertTrue(supervisor.qq_retry_pending)
+        nap.assert_not_called()
+        snow.assert_not_called()
+
+    def test_qq_start_failure_retries_after_30_seconds_and_logs_only_type(self):
         class Manager:
             def __init__(self, *_args): pass
             def ensure_started(self): raise ValueError("private container detail")
-        with patch.object(runtime, "NapCat", Manager), patch.object(runtime, "log") as log, \
+        with patch.object(runtime, "QQBackend", Manager), patch.object(runtime, "log") as log, \
              patch.object(runtime.time, "monotonic", return_value=100):
             supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
             with patch.object(supervisor, "is_paused", return_value=False):
-                self.assertFalse(supervisor.ensure_napcat())
-        self.assertEqual(supervisor.napcat_retry_at, 100 + runtime.NAPCAT_RETRY_SECONDS)
-        self.assertTrue(supervisor.napcat_retry_pending)
-        log.assert_called_once_with("napcat_start_error", reason="ValueError")
+                self.assertFalse(supervisor.ensure_qq())
+        self.assertEqual(supervisor.qq_retry_at, 100 + runtime.QQ_RETRY_SECONDS)
+        self.assertTrue(supervisor.qq_retry_pending)
+        log.assert_called_once_with("qq_start_error", reason="ValueError")
 
-    def test_lease_fencing_stops_dsh_then_owned_napcat(self):
+    def test_lease_fencing_stops_dsh_then_owned_qq(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.dsh_started = True
-        supervisor.napcat_enabled = True
+        supervisor.qq_enabled = True
         order = []
         with patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("dsh")), \
-             patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("napcat")):
+             patch.object(supervisor, "stop_qq", side_effect=lambda **_kwargs: order.append("qq")):
             supervisor._lose_lease()
         self.assertTrue(supervisor.lease_lost.is_set())
-        self.assertEqual(order, ["dsh", "napcat"])
+        self.assertEqual(order, ["dsh", "qq"])
 
-    def test_firstboot_restore_and_bootstrap_precede_napcat_then_dsh(self):
+    def test_firstboot_restore_and_bootstrap_precede_qq_then_dsh(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
         supervisor.lease_acquired.set()
         order = []
@@ -275,25 +317,25 @@ class RuntimeTests(unittest.TestCase):
             order.append("dsh")
             supervisor.dsh_started = True
             supervisor.stop_event.set()
-        def ensure_napcat():
-            order.append("napcat")
-            supervisor.napcat_enabled = True
+        def ensure_qq():
+            order.append("qq")
+            supervisor.qq_enabled = True
             return True
         with patch.object(runtime.threading, "Thread", Thread), \
              patch.object(supervisor, "_wait_for_resume", return_value=True), \
              patch.object(supervisor, "restore_firstboot", side_effect=lambda: order.append("restore")), \
              patch.object(supervisor, "bootstrap", side_effect=lambda: order.append("bootstrap") or False), \
              patch.object(supervisor, "initial_backup_best_effort"), \
-             patch.object(supervisor, "ensure_napcat", side_effect=ensure_napcat), \
+             patch.object(supervisor, "ensure_qq", side_effect=ensure_qq), \
              patch.object(supervisor, "start_dsh", side_effect=start_dsh), \
              patch.object(supervisor, "stop_web_tunnel"), \
              patch.object(supervisor, "stop_dsh", side_effect=lambda **_kwargs: order.append("stop-dsh")), \
-             patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("stop-napcat")), \
+             patch.object(supervisor, "stop_qq", side_effect=lambda **_kwargs: order.append("stop-qq")), \
              patch.object(supervisor, "backup", side_effect=lambda **_kwargs: order.append("backup")), \
              patch.object(runtime, "set_status"), patch.object(runtime, "json_request", return_value=(200, {})), \
              patch.object(runtime, "log"):
             self.assertEqual(supervisor.run(), 0)
-        self.assertEqual(order, ["restore", "bootstrap", "napcat", "dsh", "stop-dsh", "stop-napcat", "backup"])
+        self.assertEqual(order, ["restore", "bootstrap", "qq", "dsh", "stop-dsh", "stop-qq", "backup"])
 
     def test_cnb_dsh_launch_opts_into_http_no_reuse(self):
         supervisor = runtime.Supervisor({"url": "https://archive.example", "token": "x"}, "build-1")
@@ -381,13 +423,13 @@ class RuntimeTests(unittest.TestCase):
                      patch.object(supervisor, "_wait_for_resume", return_value=False), \
                      patch.object(supervisor, "stop_web_tunnel"), \
                      patch.object(supervisor, "stop_dsh", side_effect=stop_dsh), \
-                     patch.object(supervisor, "stop_napcat", side_effect=lambda **_kwargs: order.append("stop-napcat")), \
+                     patch.object(supervisor, "stop_qq", side_effect=lambda **_kwargs: order.append("stop-qq")), \
                      patch.object(supervisor, "backup", side_effect=backup), \
                      patch.object(runtime.web_tunnel, "load_config", return_value=None), \
                      patch.object(runtime, "json_request", return_value=(200, {})) as release, \
                      patch.object(runtime, "set_status"), patch.object(runtime, "log"):
                     self.assertEqual(supervisor.run(), 0)
-                self.assertEqual(order, ["stop", "stop-napcat", ("backup", {"allow_paused": True})])
+                self.assertEqual(order, ["stop", "stop-qq", ("backup", {"allow_paused": True})])
                 self.assertEqual(release.call_args.args[1], "/release")
 
     def test_web_tunnel_hook_posts_cookie_contract_and_stops_with_dsh(self):

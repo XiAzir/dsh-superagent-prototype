@@ -23,10 +23,14 @@ from typing import Any
 try:
     from deploy.cnb import web_tunnel
     from deploy.cnb.napcat import NapCat
+    from deploy.cnb.snowluma import SnowLuma
+    from deploy.cnb.qq_backend import QQBackend
     from deploy.cnb.archive import MAX_ARCHIVE_BYTES as MAX_ARCHIVE_SIZE
 except ModuleNotFoundError:  # Running runtime.py as a standalone script.
     import web_tunnel
     from napcat import NapCat
+    from snowluma import SnowLuma
+    from qq_backend import QQBackend
     from archive import MAX_ARCHIVE_BYTES as MAX_ARCHIVE_SIZE
 
 HERE = Path(__file__).resolve().parent
@@ -43,7 +47,7 @@ READY_TIMEOUT = 180
 BOOTSTRAP_TIMEOUT = 300
 ARCHIVE_OPERATION_TIMEOUT = 600
 TRANSFER_TIMEOUT = 600
-NAPCAT_RETRY_SECONDS = 30
+QQ_RETRY_SECONDS = 30
 MAX_RESPONSE = 2 * 1024 * 1024
 OPERATOR_STOP = CONTROL / 'operator-stop'
 
@@ -227,10 +231,10 @@ class Supervisor:
         self.backup_failures = 0
         self.dsh_started = False
         self.dsh_starting = False
-        self.napcat = NapCat(DATA, CONTROL)
-        self.napcat_enabled = False
-        self.napcat_retry_pending = False
-        self.napcat_retry_at = 0.0
+        self.qq = QQBackend(NapCat(DATA, CONTROL), SnowLuma(DATA, CONTROL))
+        self.qq_enabled = False
+        self.qq_retry_pending = False
+        self.qq_retry_at = 0.0
         self.shutting_down = False
         self.service_control_lock = threading.Lock()
         self.intentional = False
@@ -273,69 +277,72 @@ class Supervisor:
     def is_healthy(self) -> bool:
         if self.is_paused() or self.shutting_down:
             return True
-        napcat_ready = not (self.napcat_enabled or self.napcat_retry_pending) or self._napcat_healthy()
-        return bool(self.dsh_started and self._local_ready() and napcat_ready)
+        qq_ready = not (self.qq_enabled or self.qq_retry_pending) or self._qq_healthy()
+        return bool(self.dsh_started and self._local_ready() and qq_ready)
 
-    def _napcat_healthy(self) -> bool:
+    def _qq_healthy(self) -> bool:
         try:
-            return self.napcat.healthy()
+            return self.qq.healthy()
         except Exception as exc:
-            log('napcat_health_error', reason=type(exc).__name__)
+            log('qq_health_error', reason=type(exc).__name__)
             return False
 
-    def _napcat_config_enabled(self) -> bool:
+    def _qq_config_enabled(self) -> bool:
         """Read only the enable bit so fencing during startup knows whether Docker was eligible."""
-        path = DATA / 'napcat' / 'deployment.json'
-        try:
-            if path.is_symlink() or not path.is_file():
-                return False
-            value = json.loads(path.read_text(encoding='utf-8'))
-            return isinstance(value, dict) and value.get('enabled') is True
-        except (OSError, UnicodeError, ValueError):
-            return False
+        for backend in ('napcat', 'snowluma'):
+            path = DATA / backend / 'deployment.json'
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                value = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(value, dict) and value.get('enabled') is True:
+                    return True
+            except (OSError, UnicodeError, ValueError):
+                continue
+        return False
 
-    def ensure_napcat(self) -> bool:
-        """Reconcile the optional owned NapCat container without exposing its output."""
+    def ensure_qq(self) -> bool:
+        """Reconcile the optional owned QQ bridge without exposing its output."""
         if self.lease_lost.is_set() or self.is_paused():
             return False
-        self.napcat_retry_pending = self._napcat_config_enabled()
+        self.qq_retry_pending = self._qq_config_enabled()
         try:
-            result = self.napcat.ensure_started()
+            result = self.qq.ensure_started()
         except Exception as exc:
-            self.napcat_retry_pending = True
-            self.napcat_retry_at = time.monotonic() + NAPCAT_RETRY_SECONDS
-            log('napcat_start_error', reason=type(exc).__name__)
+            self.qq_retry_pending = True
+            self.qq_retry_at = time.monotonic() + QQ_RETRY_SECONDS
+            log('qq_start_error', reason=type(exc).__name__)
             return False
-        was_enabled = self.napcat_enabled
-        self.napcat_enabled = result.get('enabled') is True
-        if not self.napcat_enabled:
+        was_enabled = self.qq_enabled
+        self.qq_enabled = result.get('enabled') is True
+        if not self.qq_enabled:
             if was_enabled:
-                self.napcat_retry_pending = True
-                self.stop_napcat()
+                self.qq_retry_pending = True
+                self.stop_qq()
                 return False
-            self.napcat_retry_pending = False
-            self.napcat_retry_at = 0.0
+            self.qq_retry_pending = False
+            self.qq_retry_at = 0.0
             return False
-        self.napcat_retry_pending = True
+        self.qq_retry_pending = True
         if self.lease_lost.is_set():
-            self.stop_napcat(fenced=True)
+            self.stop_qq(fenced=True)
             return False
-        ready = result.get('running') is True and result.get('webui_ready') is True and self._napcat_healthy()
-        self.napcat_retry_pending = not ready
-        self.napcat_retry_at = 0.0 if ready else time.monotonic() + NAPCAT_RETRY_SECONDS
+        ready = result.get('running') is True and result.get('webui_ready') is True and self._qq_healthy()
+        self.qq_retry_pending = not ready
+        self.qq_retry_at = 0.0 if ready else time.monotonic() + QQ_RETRY_SECONDS
         if not ready:
-            log('napcat_not_ready', retry_seconds=NAPCAT_RETRY_SECONDS)
+            log('qq_not_ready', retry_seconds=QQ_RETRY_SECONDS)
         return ready
 
-    def stop_napcat(self, *, fenced: bool = False) -> None:
-        if not self.napcat_enabled and not self.napcat_retry_pending:
+    def stop_qq(self, *, fenced: bool = False) -> None:
+        if not self.qq_enabled and not self.qq_retry_pending:
             return
         try:
-            self.napcat.stop(timeout=30)
-            self.napcat_enabled = False
-            self.napcat_retry_pending = False
+            self.qq.stop(timeout=30)
+            self.qq_enabled = False
+            self.qq_retry_pending = False
         except Exception as exc:
-            log('napcat_stop_error', reason=type(exc).__name__, fenced=fenced)
+            log('qq_stop_error', reason=type(exc).__name__, fenced=fenced)
 
     def _lose_lease(self) -> None:
         self.lease_lost.set()
@@ -351,7 +358,7 @@ class Supervisor:
                 self.stop_dsh(fenced=fenced)
             except Exception as exc:
                 log('fenced_dsh_stop_error' if fenced else 'dsh_stop_error', reason=type(exc).__name__)
-        self.stop_napcat(fenced=fenced)
+        self.stop_qq(fenced=fenced)
 
     def is_paused(self) -> bool:
         marker = ROOT / '.artifacts' / 'control' / 'profiles' / PROFILE / 'manually-stopped'
@@ -772,10 +779,10 @@ class Supervisor:
                 return 1 if self.lease_lost.is_set() else 0
             if self.lease_lost.is_set():
                 raise RuntimeErrorSafe('Archive lease was lost during bootstrap.')
-            self.ensure_napcat()
+            self.ensure_qq()
             if self.lease_lost.is_set():
                 self._stop_services(fenced=True)
-                raise RuntimeErrorSafe('Archive lease was lost during NapCat startup.')
+                raise RuntimeErrorSafe('Archive lease was lost during QQ bridge startup.')
             self.start_dsh()
             if fresh:
                 self.set_fresh_worker_limit()
@@ -790,12 +797,12 @@ class Supervisor:
                 if not self._wait_for_resume():
                     return 1 if self.lease_lost.is_set() else 0
                 if was_intentional and not self.dsh_started:
-                    self.ensure_napcat()
+                    self.ensure_qq()
                     self.start_dsh()
-                napcat_unhealthy = self.napcat_enabled and not self._napcat_healthy()
-                if ((napcat_unhealthy or self.napcat_retry_pending)
-                        and time.monotonic() >= self.napcat_retry_at):
-                    self.ensure_napcat()
+                qq_unhealthy = self.qq_enabled and not self._qq_healthy()
+                if ((qq_unhealthy or self.qq_retry_pending)
+                        and time.monotonic() >= self.qq_retry_at):
+                    self.ensure_qq()
                 if self.lease_lost.is_set():
                     self._stop_services(fenced=True)
                     return 1

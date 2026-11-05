@@ -123,6 +123,11 @@ class NapCat:
                 raise NapCatError('NapCat deployment configuration permissions could not be secured.') from None
         return config
 
+    def configured(self) -> bool:
+        """Validate the persisted deployment and return its enable state."""
+        config = self._load_config()
+        return bool(config and config['enabled'])
+
     def _prepare_paths(self) -> None:
         self._assert_managed_path(self.root)
         if self.control.is_symlink():
