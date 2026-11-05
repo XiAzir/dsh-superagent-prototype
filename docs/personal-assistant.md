@@ -62,3 +62,16 @@ P0 立即提醒，P1 遵守免打扰时间，P2 延至摘要窗口，P3 保存�
 启用后的首轮真实验收建议选三个低风险任务：一个带明确期限的承诺、一个等待外部事件的工单、一个需要确认的短回复。核对时间线、下一次检查、停止和最终证据。工作台的分类计数、承诺状态、提醒和行动历史可以用于记录每周漏跟进、重复提醒、事实纠正和主动结果采纳情况；模型费用继续在 DSH 现有用量界面查看。
 
 完整实施与测试记录见 [实施计划](personal-assistant-plan.md)。
+
+## 本机启用记录（2026-11-05）
+
+本机 Windows 的 `superagent` profile 已使用 `8f67013` 构建启用个人助理，地址为 `http://127.0.0.1:3082`。进入左侧 **Superagent → 个人助理** 查看设置，通过 **新建任务** 交办。
+
+- 所有者：`web:owner`；时区：`Asia/Shanghai`。
+- 免打扰：22:00–08:00；摘要间隔：180 分钟；个人设置 revision：1。
+- 启用前已离线备份完整状态目录及 profile 的 package、lockfile 和配置补丁，保存于工作区 `output/personal-assistant-local-20261105/backup-before-enable`。备份包含私有运行数据，按本机凭据资料保管。
+- 数据库由 schema 11 升至 12，原有 5 个工单保留；备份和当前数据库的 `PRAGMA quick_check` 均返回 `ok`。
+- 已完成一次只读 Web 交办，返回初始个人上下文计数；平滑重启后，启用设置、对话和回复均可读取，Runtime 为 ready。
+- QQ 来源仍指向本机 `ws://127.0.0.1:3001`，当前等待 NapCat 重新连接；个人助理所有者目前使用 Web 身份。
+
+启用后的页面截图位于工作区 `output/personal-assistant-local-20261105/enabled-after-restart.png`。后台进程沿用 [Windows 服务管理命令](windows.md#background-lifecycle) 启停。
