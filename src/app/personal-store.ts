@@ -2,6 +2,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { PersonalSchemas, PersonalSettingsSchema, type PersonalKind, type PersonalRecordMap, type PersonalSettings } from '../core/personal/model.ts'
 
+/** A personal record or settings compare-and-swap used a stale revision. */
 export class PersonalConflict extends Error {
   constructor(message = 'Personal record revision conflict') { super(message); this.name = 'PersonalConflict' }
 }
@@ -21,6 +22,7 @@ const page = (options: PersonalListOptions) => {
   return { limit, offset }
 }
 
+/** Persists validated personal records, revision history, forget tombstones, and owner settings in Store's SQLite database. */
 export class PersonalStore {
   constructor(private readonly db: DatabaseSync, private readonly atomic: <T>(work: () => T) => T) {}
 

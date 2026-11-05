@@ -14,6 +14,7 @@ export type AttentionInput = {
 }
 export type AttentionDelivery = { deliveryId: string; digestKey: string; priority: Attention['priority']; items: Attention[]; text: string }
 export type AttentionSink = (delivery: AttentionDelivery) => Promise<'sent' | 'pending'> | 'sent' | 'pending'
+/** An attention item or delivery snapshot is missing, stale, or no longer eligible for its transition. */
 export class AttentionConflict extends Error { constructor(message: string) { super(message); this.name = 'AttentionConflict' } }
 
 const iso = (date: Date) => date.toISOString()

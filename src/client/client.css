@@ -449,4 +449,7 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-assistant-details pre { max-height: 240px; overflow: auto; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .dt-assistant-editor { gap: 14px !important; }
 .dt-assistant-page .dt-field { min-width: 0; }
-@container (max-width: 640px) { .dt-assistant-grid { grid-template-columns: 1fr; } .dt-assistant-row { flex-direction: column; } }
+@container (max-width: 640px) {
+.dt-assistant-grid { grid-template-columns: 1fr; }
+.dt-assistant-row { flex-direction: column; }
+}

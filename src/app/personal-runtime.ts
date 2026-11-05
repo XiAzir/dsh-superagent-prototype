@@ -7,6 +7,7 @@ import type { PersonalCoordinator } from './personal-coordinator.ts'
 import { PersonalAttentionService } from './personal-attention.ts'
 import { PersonalActionsService, type ActionAdapter } from './personal-actions.ts'
 
+/** Coordinates personal reminders and authorized actions with Engine passes and durable Outbox receipts. */
 export class PersonalRuntime {
   private readonly running = new Map<string, Promise<unknown>>()
   readonly attention: PersonalAttentionService

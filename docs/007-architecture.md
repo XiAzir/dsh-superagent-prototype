@@ -301,6 +301,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, and the `Key` and `Family` types the Store and `SourceContext.state` take |
 | `src/navigation.ts` | Opens a DeepSeek Harness Session from the panel once the host's catalog lists it |
 | `src/core/model.ts` | The domain types, among them the typed Ticket and `MandateBasis`, with `threadKey`, `ticketOutcome`, `reached`, `followupOwners`, `settled`, `waitsForPerson`, `liveTicket`, `runningAssignment`, `latestAssignment` and `latestReport` |
+| `src/core/personal/model.ts` | Strict structured records and settings schemas for goals, commitments, facts, constraints, attention, authorizations and actions |
 | `src/core/ports.ts` | The ports: `Repositories`, `Policy`, `SourceScope`, `Assessor`, `Executor`, `Outbox`, and the domain events |
 | `src/core/engine.ts` | The Engine, the core's entry point, and the role interfaces `EngineForSources`, `EngineForMainSession`, `EngineForPeople`, `EngineForSettings` and `EngineForExecutor` |
 | `src/core/part.ts` | `EnginePart`, the base of the Engine's parts, and `EngineOptions` |
@@ -321,8 +322,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
 | `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
+| `src/app/personal-store.ts` | Personal records and settings in SQLite, with compare-and-swap revisions and redacted fact tombstones |
+| `src/app/personal-coordinator.ts` | Owner-trigger validation, record rules, bounded worker context, conflicts and commitment reminders |
+| `src/app/personal-actions.ts` | Exact-request action records, authorization checks, idempotency and result verification |
+| `src/app/personal-attention.ts` | Quiet-hour-aware attention items and revision-bound delivery batches |
+| `src/app/personal-runtime.ts` | Personal action and reminder lifecycle on Runtime passes and the durable Outbox |
+| `src/app/personal-http.ts` | Same-origin owner routes for personal settings, records, authorization and action operations |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
-| `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
+| `src/app/migration.ts` | The schema 11 migration step from schema 10 and the current schema version |
 | `src/app/effects.ts` | Effects |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
@@ -345,6 +352,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/personal.ts` | Owner-scoped personal context, record, conflict and action tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/qq-source.ts` | QQ Source connection lifecycle and credential-backed status |
 | `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
@@ -400,6 +408,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/personal.tsx` | Personal-mode Web task creation, conversation history, follow-ups and related Ticket results |
+| `src/client/assistant.tsx` | The personal assistant page for owner settings, goals, commitments, facts, constraints, attention and action approval |
 | `src/client/rooms.tsx` | Group-style task supervision, recipients, live message pagination and lazy execution details |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
@@ -425,6 +434,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
+
+The personal assistant stores structured records in the same transactional SQLite database as Tickets. `PersonalCoordinator` validates owner Triggers, keeps inferred facts pending confirmation, and supplies workers with effective context linked to their owner Ticket. Authorizations bind an exact action request hash; `PersonalRuntime` rechecks grants and Tickets at Outbox delivery and reconciles replies and reminders from durable receipts. Owner settings and record changes use revision compare-and-swap. Forgetting a fact removes its content from history while retaining a minimal tombstone.
 
 ## Tests
 
@@ -476,8 +487,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
-| `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
+| `tests/migration.spec.ts` | The schema 10-to-current migration: every stored record in its current shape, and the refusal of older schemas |
 | `tests/store.spec.ts` | Repositories and their working sets, in SQLite as in memory, the kv area, with every key of `KV` spelled only in `src/kv.ts` and the migration, settings history and queries |
+| `tests/personal-store.spec.ts` | Personal record round trips, CAS, history, migrations, rollback, settings and forget semantics |
+| `tests/personal-coordinator.spec.ts` | Owner Trigger checks, linked worker context, record invariants, conflicts and commitment reminders |
+| `tests/personal-actions.spec.ts` | Exact-request authorization, idempotency, verification and safe retries |
+| `tests/personal-attention.spec.ts` | Quiet hours, digests, snapshot revisions, idempotent reminders and delivery state |
+| `tests/personal-runtime.spec.ts` | Runtime action and reminder delivery, Outbox cancellation, restart gates and owner-channel routing |
+| `tests/personal-http.spec.ts` | Same-origin owner routes, CAS conflicts, authorization and action boundaries |
+| `tests/personal-followups.spec.ts` | Durable ticket follow-up checks, owner notices, cancellation and resume behavior |
+| `tests/personal-crash.spec.ts` | SQLite personal record durability across committed and rolled-back process crashes |
 | `tests/prompts.spec.ts` | Prompt validation, assembly and versions |
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
@@ -491,6 +510,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx`, `panel-qq.spec.tsx` | The settings groups, drafts and history, the prompts, Deployment, search, glossary, route memory, and QQ status and token controls |
+| `tests/panel-assistant.spec.tsx` | Personal assistant settings, records, reminder inbox and exact-request approval flows |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
@@ -512,6 +532,9 @@ One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
 | `decision` | Decisions, by Thread | Engine |
 | `effect` | The effect queue: per kind and key, the payload, its order, failed attempts with the last error, and when it is due | Effects; the schema 11 migration queues what earlier versions kept for the main Session |
 | `outbox` | The receipt of each message for a Channel, by id, with the Ticket it is for and its `status`, `pending`, `sent` or `dropped`, kept so an id is never queued twice; for a dropped message, when and why, as the generated column `dropped`, its time, and a reason code. A message that waits has a `reply` effect, which holds its attempts | The Outbox |
+| `personal_record` | Current structured personal records by kind and id, with the JSON value, revision and update time | PersonalStore |
+| `personal_history` | Revisioned personal record and settings changes; fact contents are removed on forget while a minimal tombstone remains | PersonalStore |
+| `personal_settings` | Owner feature state, timezone, quiet hours, digest interval and owner actor list | PersonalStore |
 | `kv` | Every other record, by key | The part that names it |
 
 A generated column is computed from its row's JSON and is empty outside its set, and each has an index over its set, so a pass reads only active work. A database that predates a column gets it when the Store opens it.
@@ -534,7 +557,7 @@ Read caches use bounded in-memory `TextCache` instances and are lost on restart.
 
 Nothing deletes old records yet, so these grow without bound: the `trigger`, `disposition` and `decision` rows; ended Tickets and their Threads; the outbox's receipts; and in `kv`, every saved settings revision and prompt version, the prompt revisions each Session worked under, and the Sources' records per Thread and per Issue or pull request.
 
-`SCHEMA_VERSION` only increases. A database of a newer version refuses to start; `src/app/migration.ts` upgrades a database of the pre-release schema 10 once, at start, and refuses an older one.
+`SCHEMA_VERSION` only increases. A database of a newer version refuses to start. The Store creates current personal tables transactionally and keeps the schema 10 migration step limited to databases that predate schema 11.
 
 ## Model-facing interfaces
 

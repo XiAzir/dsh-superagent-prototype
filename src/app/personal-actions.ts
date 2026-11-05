@@ -17,7 +17,9 @@ export interface ActionAdapter {
   /** Must inspect the target state and report whether this exact request took effect. */
   verify(action: Readonly<Action>): Promise<ActionVerification> | ActionVerification
 }
+/** An action request conflicts with a prior idempotency key, current state, or verified result. */
 export class ActionConflict extends Error { constructor(message: string) { super(message); this.name = 'ActionConflict' } }
+/** The exact action request lacks a current matching owner authorization. */
 export class ActionAuthorizationError extends Error { constructor(message: string) { super(message); this.name = 'ActionAuthorizationError' } }
 
 const iso = (date: Date) => date.toISOString()
