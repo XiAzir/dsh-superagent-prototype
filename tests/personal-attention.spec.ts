@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
-import { PersonalAttentionService } from '../src/app/personal-attention.ts'
+import { AttentionConflict, PersonalAttentionService } from '../src/app/personal-attention.ts'
 import { Store } from '../src/app/store.ts'
 
 let directory: string
@@ -52,4 +52,27 @@ it('treats dueAt as a deadline, lets P0 bypass notBefore, and filters stopped or
   service.queue({ title: 'Urgent', summary: 'send now', priority: 'P0', digestKey: 'urgent', notBefore: '2026-11-06T00:00:00Z' }, 'urgent')
   service.queue({ title: 'Stopped task', summary: 'ignore', priority: 'P0', digestKey: 'stopped', ticketId: 'gone' }, 'stopped')
   expect(service.collectDue().map(delivery => delivery.digestKey).sort()).toEqual(['deadline', 'urgent'])
+})
+
+it('handles cross-midnight quiet hours over a daylight-saving transition and rejects changed idempotency content', () => {
+  store.personal.configure({ ...store.personal.settings(), enabled: true, timezone: 'America/New_York', quietStart: '22:00', quietEnd: '07:00' }, 0)
+  const service = new PersonalAttentionService({ store, now: () => new Date('2026-03-08T06:30:00Z') })
+  const request = { title: 'DST', summary: 'reminder', priority: 'P1' as const, digestKey: 'dst' }
+  service.queue(request, 'same-request')
+  expect(() => service.queue({ ...request, summary: 'changed' }, 'same-request')).toThrow(AttentionConflict)
+  expect(service.collectDue({ at: new Date('2026-03-08T06:30:00Z') })).toEqual([])
+  expect(service.collectDue({ at: new Date('2026-03-08T11:00:00Z') })).toHaveLength(1)
+})
+
+it('pages beyond 200 queued attention records and keeps markSent all-or-nothing for a stale batch', () => {
+  store.personal.configure({ ...store.personal.settings(), enabled: true }, 0)
+  const service = new PersonalAttentionService({ store, now: () => new Date('2026-11-05T12:00:00Z') })
+  for (let i = 0; i < 205; i++) service.queue({ title: `Item ${i}`, summary: 'body', priority: 'P1', digestKey: 'many' }, `many-${i}`)
+  const deliveries = service.collectDue()
+  expect(deliveries).toHaveLength(11)
+  expect(deliveries.reduce((count, delivery) => count + delivery.items.length, 0)).toBe(205)
+  const batch = deliveries[0]!
+  service.acknowledge(batch.items[0]!.id)
+  expect(() => service.markSent(batch)).toThrow('Stale delivery snapshot')
+  expect(batch.items.slice(1).every(item => store.personal.get('attention', item.id)?.status === 'queued')).toBe(true)
 })

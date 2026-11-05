@@ -55,9 +55,10 @@ export class PersonalActionsService {
 
   /** Persists a request and a dedicated authorization record; duplicate keys replay only identical requests. */
   prepare(ticketId: string, input: ActionRequest): Action {
-    if (!this.deps.store.tickets.get(ticketId)) throw new ActionConflict(`Unknown ticket ${ticketId}`)
+    const ticket = this.deps.store.tickets.get(ticketId)
+    if (!ticket || ticket.ended) throw new ActionConflict(`Ticket ${ticketId} is missing or stopped`)
     if (!input.idempotencyKey || !input.action || !input.target || !Array.isArray(input.scope) || !input.scope.length) throw new TypeError('idempotencyKey, action, target, and scope are required')
-    if (!this.deps.adapters[input.action]) throw new ActionConflict(`No adapter registered for action ${input.action}`)
+    if (!Object.hasOwn(this.deps.adapters, input.action)) throw new ActionConflict(`No adapter registered for action ${input.action}`)
     const requestHash = this.requestHash(ticketId, input)
     const existing = this.all('action').find(row => row.idempotencyKey === input.idempotencyKey)
     if (existing) {
@@ -121,10 +122,12 @@ export class PersonalActionsService {
     let action = this.deps.store.personal.get('action', actionId)
     if (!action) throw new ActionConflict(`Unknown action ${actionId}`)
     if (action.status === 'verified') return action
-    const adapter = this.deps.adapters[action.action]
+    const adapter = Object.hasOwn(this.deps.adapters, action.action) ? this.deps.adapters[action.action] : undefined
     if (!adapter) throw new ActionConflict(`No adapter registered for action ${action.action}`)
     if (action.status === 'executing' || action.status === 'failed' || action.status === 'uncertain') {
-      const checked = await adapter.verify(action)
+      let checked: ActionVerification
+      try { checked = await adapter.verify(action) }
+      catch (error) { return this.saveResult(action, 'uncertain', { verification: 'adapter verify failed', error: this.errorText(error) }, false) }
       if (checked.state === 'executed') return this.saveResult(action, 'verified', checked.result, true)
       if (checked.state === 'unknown') return this.saveResult(action, 'uncertain', { verification: checked.reason ?? 'unknown' }, false)
       if (action.status === 'uncertain') return this.saveResult(action, 'failed', { verification: 'not_executed' }, false)
@@ -163,7 +166,7 @@ export class PersonalActionsService {
   private blockReason(action: Action): string | undefined {
     const ticket = this.deps.store.tickets.get(action.ticketId)
     if (!ticket || ticket.ended) return 'ticket_stopped'
-    if (!this.deps.adapters[action.action]) return 'adapter_unavailable'
+    if (!Object.hasOwn(this.deps.adapters, action.action)) return 'adapter_unavailable'
     if (!action.authorizationId) return 'authorization_missing'
     const authorization = this.deps.store.personal.get('authorization', action.authorizationId)
     if (!authorization) return 'authorization_missing'
