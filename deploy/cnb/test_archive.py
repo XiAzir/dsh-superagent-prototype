@@ -186,6 +186,36 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((restored / "state" / "legacy.json").read_text(encoding="utf-8"), '{"legacy":true}')
         self.assertFalse((restored / "napcat").exists())
 
+    def test_snowluma_login_configuration_identity_and_cache_roundtrip(self):
+        root = self.data / "snowluma"
+        values = {
+            "deployment.json": '{"enabled":true}',
+            "data/config/onebot.json": '{"websocketServers":[]}',
+            ".config/QQ/login/session.bin": "saved-login-ticket",
+            ".local/share/QQ/cache/native-state.bin": "client-state",
+            "identity/machine-id": "stable-device-id",
+            "data/node_modules/plugin/state.bin": "plugin-state",
+        }
+        for relative, value in values.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
+        self.make_snapshot()
+        paths = {entry["path"] for entry in validate_archive(self.archive)["files"]}
+        restored = self.base / "restored-snowluma"
+        restore_snapshot(self.archive, restored)
+        for relative, value in values.items():
+            with self.subTest(relative=relative):
+                self.assertIn(f"snowluma/{relative}", paths)
+                self.assertEqual((restored / "snowluma" / relative).read_text(encoding="utf-8"), value)
+
+    def test_snowluma_remains_optional_for_existing_snapshots(self):
+        self.make_snapshot()
+        restored = self.base / "restored-without-snowluma"
+        restore_snapshot(self.archive, restored)
+        self.assertTrue((restored / "state").is_dir())
+        self.assertFalse((restored / "snowluma").exists())
+
     def test_tampered_hash_rejected(self):
         (self.data / "state" / "value.json").write_text('{"ok":true}', encoding="utf-8")
         self.make_snapshot()

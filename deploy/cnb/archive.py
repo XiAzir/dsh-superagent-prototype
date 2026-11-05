@@ -1,7 +1,7 @@
 """Create, validate, and restore bounded private Superagent data snapshots.
 
 The archive contains ``snapshot/dsh-home``, ``snapshot/state`` and optionally
-``snapshot/work``, ``snapshot/home`` and ``snapshot/napcat``. It is a ZIP file with a JSON manifest at
+``snapshot/work``, ``snapshot/home``, ``snapshot/napcat`` and ``snapshot/snowluma``. It is a ZIP file with a JSON manifest at
 ``snapshot/manifest.json``. Source data is copied into a temporary staging
 directory before the archive is atomically installed. SQLite databases are
 copied through SQLite's online backup API so WAL contents are included.
@@ -35,9 +35,9 @@ MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_MEMBERS = 200_000
 CHUNK_SIZE = 1024 * 1024
 SQLITE_BACKUP_TIMEOUT = 15.0
-ROOTS = ("dsh-home", "state", "work", "home", "napcat")
+ROOTS = ("dsh-home", "state", "work", "home", "napcat", "snowluma")
 REQUIRED_ROOTS = ("dsh-home", "state")
-OPTIONAL_ROOTS = ("work", "home", "napcat")
+OPTIONAL_ROOTS = ("work", "home", "napcat", "snowluma")
 MANIFEST_NAME = "snapshot/manifest.json"
 
 _SKIP_DIRS = {"node_modules", ".pnpm-store"}
@@ -80,9 +80,9 @@ def _is_runtime_log(relative: Path, name: str) -> bool:
 
 
 def _is_generated_directory(root_name: str, relative: Path, name: str) -> bool:
-    # NapCat deliberately snapshots the complete runtime tree, including its
-    # portable app copy, plugin state, caches, and installed node modules.
-    if root_name == "napcat":
+    # QQ bridges preserve their complete login/runtime tree, including client
+    # configuration, native session data, plugin state and caches.
+    if root_name in {"napcat", "snowluma"}:
         return False
     if name.lower() in _SKIP_DIRS:
         return True
@@ -485,7 +485,7 @@ def create_snapshot(
 ) -> dict[str, Any]:
     """Create an atomic ZIP snapshot from data_dir and return its manifest.
 
-    ``data_dir`` contains dsh-home and state directories, plus optional work, home, and napcat.
+    ``data_dir`` contains dsh-home and state directories, plus optional work, home and QQ bridge data.
     Existing archives remain intact when creation fails.
     """
     source_input = Path(data_dir).absolute()
@@ -679,7 +679,7 @@ def validate_archive(
         _check_prefix_conflicts(entries)
         roots_seen = {name.split("/")[1] for name in entries if name != MANIFEST_NAME}
         if not set(REQUIRED_ROOTS).issubset(roots_seen) or not roots_seen.issubset(ROOTS):
-            raise SnapshotError("Snapshot must contain dsh-home and state roots, with optional work, home, or napcat")
+            raise SnapshotError("Snapshot must contain dsh-home and state roots, with optional work, home, napcat, or snowluma")
         manifest = _read_manifest(archive)
         declared: dict[str, dict[str, Any]] = {}
         for item in manifest["files"]:
