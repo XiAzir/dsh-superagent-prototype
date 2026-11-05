@@ -36,8 +36,16 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { QqSourceError, type QqBridge } from './qq-source.ts'
 import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
 import { ScheduleConfigSchema, ScheduleConflict, ScheduleLimit, ScheduleNotFound, type Schedules } from './schedules.ts'
+import { personalRoutes } from './personal-http.ts'
+import { PersonalError, type PersonalCoordinator } from './personal-coordinator.ts'
+import { PersonalConflict } from './personal-store.ts'
+import type { PersonalRuntime } from './personal-runtime.ts'
+import { ActionConflict, ActionAuthorizationError } from './personal-actions.ts'
+import { AttentionConflict } from './personal-attention.ts'
 
 export interface HttpHost {
+  readonly personal?: PersonalCoordinator
+  readonly personalRuntime?: PersonalRuntime
   readonly qq?: QqBridge | undefined
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
@@ -48,7 +56,7 @@ export interface HttpHost {
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct'>
+  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct' | 'cancelFollowup'>
   inspectWorker?(ticketId: string, signal?: AbortSignal): Promise<readonly SessionEvent[]>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
@@ -97,6 +105,10 @@ const MAX_WEB_ARTIFACT_BYTES = 50 * 1024 * 1024
 const encodedFilename = (name: string): string => encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof ActionAuthorizationError) return [403, { error: error.message }]
+  if (error instanceof ActionConflict || error instanceof AttentionConflict) return [409, { error: error.message }]
+  if (error instanceof PersonalError) return [error.status, { error: error.message }]
+  if (error instanceof PersonalConflict) return [409, { error: '记录已更新，请刷新后保存。' }]
   if (error instanceof QqSourceError) return [error.status, { error: error.message }]
   if (error instanceof WebTaskError) return [error.status, { error: error.message }]
   if (error instanceof ScheduleConflict) return [409, { error: error.message }]
@@ -191,6 +203,7 @@ function routes(runtime: HttpHost): Routes {
   const schedules = () => runtime.schedules ?? (() => { throw new RouteError(503, 'Schedules are not ready') })()
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    ...personalRoutes(runtime),
     'GET rooms': ({ query }) => {
       const page = z.object({ offset, limit: limit(50, 100) }).parse(query)
       return rooms().list(page.offset, page.limit)

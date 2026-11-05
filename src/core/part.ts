@@ -14,6 +14,8 @@ export interface EngineOptions {
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
   now?: () => string
+  /** Optional deployment switch; a disabled scheduler retains checks for a later explicit re-enable. */
+  followupsEnabled?: () => boolean
   emit?: (event: DomainEvent) => void
 }
 

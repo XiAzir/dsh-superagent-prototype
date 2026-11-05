@@ -12,6 +12,7 @@ import type { WebTaskSummary, WebTaskView } from './web-tasks.ts'
 import type { QqStatus } from './qq-source.ts'
 import type { ScheduleConfig, ScheduleItem, ScheduleList } from './schedules.ts'
 import type { TaskRoomSummary, TaskRoomView, RoomActivity } from './task-rooms.ts'
+import type { PersonalApi } from './personal-http.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -21,7 +22,7 @@ interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
 
-export interface Api {
+export interface Api extends PersonalApi {
   'GET rooms': { query?: Paged; response: { items: TaskRoomSummary[]; next_offset: number | null } }
   'GET rooms/:key': { query?: { before?: string; limit?: number }; response: TaskRoomView }
   'POST rooms/:key/messages': { body: { text: string; requestId: string; recipient?: string }; response: TaskRoomView }

@@ -50,6 +50,9 @@ import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { ArtifactRegistry } from './artifacts.ts'
 import { Schedules } from './schedules.ts'
+import { PersonalCoordinator } from './personal-coordinator.ts'
+import { personalTools } from './tools/personal.ts'
+import { PersonalRuntime } from './personal-runtime.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -75,6 +78,8 @@ export class Runtime extends Service implements SourceHost {
   readonly assessor: MasterAssessor
   readonly outbox: Outbox
   readonly schedules: Schedules
+  readonly personal: PersonalCoordinator
+  readonly personalRuntime: PersonalRuntime
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
@@ -103,6 +108,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      this.personal = new PersonalCoordinator({ store, personalMode: () => (machine.mode ?? 'repository') === 'personal' })
       this.artifacts = new ArtifactRegistry(store, machine.stateDir)
       if ((machine.mode ?? 'repository') === 'personal') {
         const initial = store.settings()
@@ -142,7 +148,8 @@ export class Runtime extends Service implements SourceHost {
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
-        tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
+        tools: (agent, ticket) => [...(ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent)),
+          ...personalTools(this.personal, ticket?.id, this.personalRuntime)] })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
@@ -153,9 +160,11 @@ export class Runtime extends Service implements SourceHost {
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
+      this.personalRuntime = new PersonalRuntime({ store, coordinator: this.personal, outbox, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
+        followupsEnabled: () => !personal() || this.personal.enabled(),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
@@ -167,6 +176,11 @@ export class Runtime extends Service implements SourceHost {
           if (followup) sessions.relay(followup.id, followup.text)
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
+          if (ended) {
+            this.personalRuntime.attention.resolve({ ticketId: ended.id })
+            for (const receipt of store.receipts.waiting()) if (receipt.ticketId === ended.id
+              && (receipt.id.startsWith('personal-action:') || receipt.id.startsWith('personal-attention:'))) outbox.withdraw(receipt.id)
+          }
           if (ended && setup.configured() && setup.deployment.repository) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
@@ -174,7 +188,7 @@ export class Runtime extends Service implements SourceHost {
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
+      const evaluateDue = () => { engine.evaluateDue(); this.personalRuntime.tick(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
@@ -249,6 +263,8 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes, schedules } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, artifacts: this.artifacts, schedules,
+      personal: this.personal,
+      personalRuntime: this.personalRuntime,
       get qq() { return runtime.qq },
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
@@ -265,7 +281,7 @@ export class Runtime extends Service implements SourceHost {
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([schedules, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
+      await Promise.allSettled([schedules, passes, this.personalRuntime.drain(), this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

@@ -8,3 +8,10 @@ For pure status questions, record progress internally; Router replies from saved
 On shared subscribed threads, use orchestrator_thread_publish only for findings or questions that affect peer work; skip routine updates. Coordinate on-thread, send key conclusions through orchestrator_report, and ask Router to arrange bounded parallel work within this mandate.
 
 Use repository-specific pull request workflows only when a GitHub repository and account are configured. When no repository is configured, report the completed local result through orchestrator_report.
+# Structured progress and personal context
+
+Read `orchestrator_personal_context` for confirmed facts and commitments linked to your ticket when available. Keep source dates and effective scope. Report completed and pending steps plus evidence in `orchestrator_report`.
+
+For an external wait, report `state=waiting`, `waiting_for` and `next_check` (stable key, zoned timestamp, purpose, success_condition, resume_instruction). Finish the current turn after recording the wait. A scheduled check resumes this same ticket; inspect current state before repeating a side effect. For a human decision use `waiting_for.kind=human` and a concrete `human_action` question. Clear or cancel checks once resolved.
+
+Managed outgoing messages can be prepared through `orchestrator_personal_action`; the user reviews the exact target and full body in the personal assistant page. Check the durable action status before attempting a retry. Keep a request key stable across retries.

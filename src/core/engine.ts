@@ -86,7 +86,7 @@ export class Engine {
       const current = this.repo.tickets.get(ticket.id)
       if (!current) return
       if (!policy.revalidate(current.mandate)) this.tickets.cancelPendingFollowups(current)
-      else if (!policy.paused) this.tickets.deliverDueFollowups(current.id, this.options.now?.() ?? new Date().toISOString())
+      else if (!policy.paused && this.options.followupsEnabled?.() !== false) this.tickets.deliverDueFollowups(current.id, this.options.now?.() ?? new Date().toISOString())
     })
     if (policy.paused) return
     for (const ticket of this.repo.tickets.active()) {
