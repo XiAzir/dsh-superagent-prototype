@@ -95,7 +95,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       description: 'Report structured progress, waiting, ready, blocked, failed or dropped, as the work and handoff sections say. Schedule external rechecks with next_check.',
       schema: z.object({
         state: z.enum(['progress', 'waiting', 'ready', 'blocked', 'failed', 'dropped']),
-        summary: z.string().trim().min(1).max(4000),
+        summary: z.string().min(1).max(4000).refine(value => value.trim().length > 0, 'Summary must contain text'),
         completed: z.array(z.string().trim().min(1).max(500)).max(30).optional(),
         pending: z.array(z.string().trim().min(1).max(500)).max(30).optional(),
         waiting_for: z.object({ subject: z.string().trim().min(1).max(500), expected_at: z.string().datetime({ offset: true }).optional(),
