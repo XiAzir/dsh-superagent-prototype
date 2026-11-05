@@ -2,7 +2,7 @@
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket, runningAssignment, threadKey as threadKeyOf } from './model.ts'
 import { key } from './ids.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, Decision, PolicyEffect, ReportNextCheck, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -82,6 +82,12 @@ export class Engine {
   evaluateDue(): void {
     const policy = this.options.policy()
     for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
+    for (const ticket of this.repo.tickets.open()) this.repo.atomic(() => {
+      const current = this.repo.tickets.get(ticket.id)
+      if (!current) return
+      if (!policy.revalidate(current.mandate)) this.tickets.cancelPendingFollowups(current)
+      else if (!policy.paused) this.tickets.deliverDueFollowups(current.id, this.options.now?.() ?? new Date().toISOString())
+    })
     if (policy.paused) return
     for (const ticket of this.repo.tickets.active()) {
       if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
@@ -378,6 +384,30 @@ export class Engine {
   report(ticketId: string, report: WorkerReport, expectedAssignmentId?: string): Ticket {
     return this.repo.atomic(() => this.assignments.report(ticketId, report, expectedAssignmentId))
   }
+  /** Schedule a durable check under the ticket's existing Mandate. Worker callers bind it to their current Assignment. */
+  scheduleFollowup(ticketId: string, input: ReportNextCheck, expectedAssignmentId?: string): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket) throw new UserError('unknownTicket')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      if (!this.options.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+      if (expectedAssignmentId !== undefined && runningAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+      this.tickets.scheduleFollowup(ticket, input)
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
+  /** Cancel a scheduled check by its stable key. */
+  cancelFollowup(ticketId: string, keyValue: string, expectedAssignmentId?: string): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket) throw new UserError('unknownTicket')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      if (!this.options.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+      if (expectedAssignmentId !== undefined && runningAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+      this.tickets.cancelFollowup(ticket, keyValue)
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
@@ -394,21 +424,25 @@ export class Engine {
    * under the new version.
    */
   policyChanged(from: string, to: string, effects: ReadonlyMap<string, PolicyEffect> = new Map()): void {
-    this.repo.atomic(() => { this.tickets.policyChanged(from, to, effects); this.evals.policyChanged(from, to) })
+    this.repo.atomic(() => {
+      this.tickets.policyChanged(from, to, effects); this.evals.policyChanged(from, to)
+      const policy = this.options.policy()
+      for (const ticket of this.repo.tickets.open()) if (!policy.revalidate(ticket.mandate)) this.tickets.cancelPendingFollowups(ticket)
+    })
   }
 }
 
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'direct' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'direct' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note' | 'scheduleFollowup' | 'cancelFollowup'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Omit<Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'reply'>, 'report'> & {
+    | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'reply' | 'scheduleFollowup' | 'cancelFollowup'>, 'report'> & {
     /** A report is bound to the Assignment whose worker produced it, including reports that finish after asynchronous reads. */
     report(ticketId: string, report: WorkerReport, expectedAssignmentId: string): Ticket
   }

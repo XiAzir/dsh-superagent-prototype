@@ -233,6 +233,21 @@ export type AssignmentState = 'pending' | 'running' | 'ended'
  * ready (`ready`), a person must act to unblock or recover it (`blocked` or `failed`), or nothing is left to do (`dropped`).
  */
 export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+export interface ReportWaitingFor { subject: string; expectedAt?: string; kind: 'external' | 'human' | 'event' }
+export interface ReportEvidence { description: string; ref?: string }
+export interface ReportNextCheck { key: string; at: string; purpose: string; successCondition: string; resumeInstruction: string }
+export interface StructuredWorkerReport {
+  completed?: string[]
+  pending?: string[]
+  waitingFor?: ReportWaitingFor
+  evidence?: ReportEvidence[]
+  nextCheck?: ReportNextCheck
+}
+export type FollowupStatus = 'scheduled' | 'delivered' | 'cancelled'
+export interface Followup {
+  id: string; key: string; revision: number; at: string; purpose: string; successCondition: string; resumeInstruction: string
+  status: FollowupStatus; createdAt: string; deliveredAt?: string
+}
 /** Binding between a ticket and one executor instance. */
 export interface Assignment {
   id: string
@@ -241,7 +256,7 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string; artifacts?: string[] }
+  report?: { state: ReportState; summary: string; at: string; artifacts?: string[] } & StructuredWorkerReport
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -271,7 +286,7 @@ export type TicketInput =
   | { id: string; kind: 'reopen'; decisionId: string; at: string }
   /** A human's message on one of its Threads resumed the ended ticket under its unchanged Mandate. */
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
-  | { id: string; kind: 'text'; text: string; at: string }
+  | { id: string; kind: 'text'; text: string; at: string; followupId?: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
   | { id: string; kind: 'note'; text: string; at: string; collaborationTriggerId?: string }
 
@@ -306,6 +321,8 @@ export interface Ticket {
   attention?: Attention
   assignments: Assignment[]
   inputs: TicketInput[]
+  /** Durable authority for scheduled worker rechecks. */
+  followups?: Followup[]
   /** Inputs not yet handed to a running assignment. */
   undelivered: string[]
   /**

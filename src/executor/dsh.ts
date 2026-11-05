@@ -676,8 +676,14 @@ export class DshExecutor implements Executor {
     this.host.store.atomic(() => {
       const finalTicket = live()
       if (!finalTicket || handedOff(finalTicket)) return
-      const before = latestReport(finalTicket)?.summary ?? ''
-      const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before }, idle.id)
+      const previous = latestReport(finalTicket), before = previous?.summary ?? ''
+      const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before,
+        ...(previous?.completed !== undefined ? { completed: previous.completed } : {}),
+        ...(previous?.pending !== undefined ? { pending: previous.pending } : {}),
+        ...(previous?.waitingFor ? { waitingFor: previous.waitingFor } : {}),
+        ...(previous?.evidence !== undefined ? { evidence: previous.evidence } : {}),
+        ...(previous?.nextCheck ? { nextCheck: previous.nextCheck } : {}),
+        ...(previous?.artifacts ? { artifacts: previous.artifacts } : {}) }, idle.id)
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
       if (said) this.relay(resultRelay(updated, 'waiting', said))
       else if (!before.trim()) {

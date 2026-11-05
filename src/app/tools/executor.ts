@@ -11,7 +11,7 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'cancelFollowup'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
@@ -92,11 +92,19 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     }),
     tool({
       name: 'orchestrator_report',
-      description: 'Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.',
+      description: 'Report structured progress, waiting, ready, blocked, failed or dropped, as the work and handoff sections say. Schedule external rechecks with next_check.',
       schema: z.object({
-        state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
-        summary: z.string().min(1),
-        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+        state: z.enum(['progress', 'waiting', 'ready', 'blocked', 'failed', 'dropped']),
+        summary: z.string().trim().min(1).max(4000),
+        completed: z.array(z.string().trim().min(1).max(500)).max(30).optional(),
+        pending: z.array(z.string().trim().min(1).max(500)).max(30).optional(),
+        waiting_for: z.object({ subject: z.string().trim().min(1).max(500), expected_at: z.string().datetime({ offset: true }).optional(),
+          kind: z.enum(['external', 'human', 'event']) }).strict().optional(),
+        evidence: z.array(z.object({ description: z.string().trim().min(1).max(1000), ref: z.string().trim().min(1).max(1000).optional() }).strict()).max(30).optional(),
+        next_check: z.object({ key: z.string().trim().min(1).max(200), at: z.string().datetime({ offset: true }),
+          purpose: z.string().trim().min(1).max(500), success_condition: z.string().trim().min(1).max(1000),
+          resume_instruction: z.string().trim().min(1).max(2000) }).strict().optional(),
+        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress or waiting; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(host.github.deployment.github
           ? `The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`
@@ -124,7 +132,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          const report = { state: args.state, summary: args.summary,
+            ...(args.completed ? { completed: args.completed } : {}), ...(args.pending ? { pending: args.pending } : {}),
+            ...(args.waiting_for ? { waitingFor: { subject: args.waiting_for.subject, kind: args.waiting_for.kind,
+              ...(args.waiting_for.expected_at ? { expectedAt: args.waiting_for.expected_at } : {}) } } : {}),
+            ...(args.evidence ? { evidence: args.evidence } : {}), ...(args.next_check ? { nextCheck: { key: args.next_check.key, at: args.next_check.at,
+              purpose: args.next_check.purpose, successCondition: args.next_check.success_condition,
+              resumeInstruction: args.next_check.resume_instruction } } : {}),
+            ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...artifacts.length ? { artifacts: artifacts.map(item => item.id) } : {},
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
@@ -136,6 +151,18 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           return { reported: true, notification, ...artifacts.length ? { artifacts: artifacts.map(({ id, name, size }) => ({ id, name, size })) } : {},
             ...(updated.attention ? { attention: updated.attention } : {}) }
         })
+      },
+    }),
+    tool({
+      name: 'orchestrator_followup_cancel',
+      description: 'Cancel this ticket’s scheduled recheck by its stable key.',
+      schema: z.object({ key: z.string().trim().min(1).max(200) }).strict(),
+      execute: async args => {
+        const current = host.store.tickets.get(ticketId)
+        const assignmentId = current && runningAssignment(current)?.id
+        if (!assignmentId) throw new Error('No running Assignment owns this cancellation')
+        host.engine.cancelFollowup(ticketId, args.key, assignmentId)
+        return { cancelled: true, key: args.key }
       },
     }),
   ]

@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
-import type { ReportState, Ticket } from './model.ts'
+import type { ReportEvidence, ReportNextCheck, ReportState, ReportWaitingFor, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -11,6 +11,11 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  completed?: string[]
+  pending?: string[]
+  waitingFor?: ReportWaitingFor
+  evidence?: ReportEvidence[]
+  nextCheck?: ReportNextCheck
   /** Host-validated immutable task artifacts available for the Router to deliver. */
   artifacts?: string[]
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
@@ -105,6 +110,12 @@ export class Assignments extends EnginePart {
     // that created the tool call, and reject them before any attention, reply, or ticket state is changed.
     if (expectedAssignmentId !== undefined && latestAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
     if (report.question && (report.state === 'ready' || report.answers)) throw new UserError('questionWithResult')
+    if (report.waitingFor?.kind === 'human' && !report.question) throw new UserError('notAdmissible', { reason: 'a report waiting for a person needs a concrete human_action question' })
+    if (report.waitingFor?.kind === 'external' && !report.nextCheck
+      && !ticket.followups?.some(item => item.status === 'scheduled')) {
+      throw new UserError('notAdmissible', { reason: 'a report waiting on an external event needs a next_check or an existing scheduled follow-up' })
+    }
+    if (report.nextCheck && !['progress', 'waiting'].includes(report.state)) throw new UserError('notAdmissible', { reason: 'a follow-up check can only be scheduled on a progress or waiting report' })
     if (report.askedBy && !report.question) throw new UserError('askerWithoutQuestion')
     const person = (id: string, channel: boolean) => {
       const trigger = this.repo.triggers.get(id)
@@ -126,7 +137,14 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    assignment.report = { state: report.state, summary: report.summary, at, ...report.artifacts?.length ? { artifacts: report.artifacts } : {} }
+    assignment.report = { state: report.state, summary: report.summary, at,
+      ...report.completed ? { completed: report.completed } : {}, ...report.pending ? { pending: report.pending } : {},
+      ...report.waitingFor ? { waitingFor: report.waitingFor } : {}, ...report.evidence ? { evidence: report.evidence } : {},
+      ...report.nextCheck ? { nextCheck: report.nextCheck } : {}, ...report.artifacts?.length ? { artifacts: report.artifacts } : {} }
+    if (report.nextCheck) this.tickets.scheduleFollowup(ticket, report.nextCheck)
+    if (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) || report.waitingFor?.kind === 'human') {
+      this.tickets.cancelPendingFollowups(ticket)
+    }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)

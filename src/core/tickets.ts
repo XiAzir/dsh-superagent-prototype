@@ -1,8 +1,8 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
+import { isoTime, latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import type { Assignment, ChannelRef, Evaluation, Follow, Followup, ReportNextCheck, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
   Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -11,7 +11,8 @@ import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
-export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
+export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note'
+  || (input?.kind === 'text' && !!input.followupId) || (input?.kind === 'trigger' && !input.human)
 /**
  * Whether a ticket's worker read a Trigger Input before `until`, its latest report or turn end: its Session took the message
  * into a step before then. One delivered before reads were recorded counts as read once it reached the worker by then.
@@ -199,6 +200,66 @@ export class Tickets extends EnginePart {
     if (!liveTicket(ticket) || runningAssignment(ticket)?.report?.state !== 'waiting') return false
     this.addInput(ticket, { id: `status:${ticketId}:${ticket.updatedAt}`, kind: 'text', text: STATUS_REQUEST, at: this.now() })
     return true
+  }
+  /** Schedule or revise a durable ticket check; replaying identical details is idempotent. */
+  scheduleFollowup(ticket: Ticket, input: ReportNextCheck): Followup {
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const report = latestReport(ticket)
+    if (report && (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) || report.waitingFor?.kind === 'human')) {
+      throw new UserError('notAdmissible', { reason: 'this ticket report does not permit automatic follow-up checks' })
+    }
+    validateFollowup(input)
+    const previous = [...ticket.followups ?? []].reverse().find(item => item.key === input.key)
+    if (previous && previous.at === isoTime(input.at) && previous.purpose === input.purpose
+      && previous.successCondition === input.successCondition && previous.resumeInstruction === input.resumeInstruction) return previous
+    const at = this.now()
+    const scheduledCount = (ticket.followups ?? []).filter(item => item.status === 'scheduled').length
+    if (scheduledCount >= 100 && previous?.status !== 'scheduled') {
+      throw new UserError('notAdmissible', { reason: 'a ticket can have at most 100 scheduled follow-up checks' })
+    }
+    if (previous?.status === 'scheduled') previous.status = 'cancelled'
+    const followup: Followup = { id: key('followup', ticket.id, input.key, String((previous?.revision ?? 0) + 1)), key: input.key,
+      revision: (previous?.revision ?? 0) + 1, at: isoTime(input.at), purpose: input.purpose, successCondition: input.successCondition,
+      resumeInstruction: input.resumeInstruction, status: 'scheduled', createdAt: at }
+    ticket.followups = [...ticket.followups ?? [], followup]
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return followup
+  }
+  /** Cancel the scheduled revision of a key; delivered history remains auditable. */
+  cancelFollowup(ticket: Ticket, keyValue: string): boolean {
+    const scheduled = [...ticket.followups ?? []].reverse().find(item => item.key === keyValue && item.status === 'scheduled')
+    if (!scheduled) return false
+    scheduled.status = 'cancelled'; ticket.updatedAt = this.now(); this.repo.tickets.save(ticket)
+    return true
+  }
+  cancelPendingFollowups(ticket: Ticket): void {
+    let changed = false
+    for (const item of ticket.followups ?? []) if (item.status === 'scheduled') { item.status = 'cancelled'; changed = true }
+    if (changed) { ticket.updatedAt = this.now(); this.repo.tickets.save(ticket) }
+  }
+  /** Turn due checks into stable Inputs only after the original worker Session has gone idle. */
+  deliverDueFollowups(ticketId: string, now: string): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) { this.cancelPendingFollowups(ticket); return }
+    const report = latestReport(ticket)
+    if (ticket.attention || waitsForPerson(ticket)
+      || (report && (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) || report.waitingFor?.kind === 'human'))) {
+      this.cancelPendingFollowups(ticket); return
+    }
+    const assignment = runningAssignment(ticket)
+    if (!assignment?.idleAt || (assignment.deliveredAt && assignment.deliveredAt > assignment.idleAt)
+      || (assignment.report?.at && assignment.report.at > assignment.idleAt)) return
+    const due = (ticket.followups ?? []).filter(item => item.status === 'scheduled' && Date.parse(item.at) <= Date.parse(now))
+    for (const followup of due) {
+      const deliveredAt = this.now()
+      followup.status = 'delivered'; followup.deliveredAt = deliveredAt
+      const text = `Scheduled follow-up check: ${followup.purpose}\nSuccess condition: ${followup.successCondition}\nResume instruction: ${followup.resumeInstruction}`
+      const input: TicketInput = { id: key('input', ticket.id, 'followup', followup.id), kind: 'text', followupId: followup.id, text, at: deliveredAt }
+      ticket.updatedAt = deliveredAt
+      this.repo.tickets.save(ticket)
+      this.addInput(ticket, input)
+    }
   }
   /**
    * Stops a ticket on behalf of a human, ending any active assignments.
@@ -400,6 +461,7 @@ export class Tickets extends EnginePart {
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
     // An end dated earlier, such as a PR's merge, does not move the ticket's last change back.
     ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
+    this.cancelPendingFollowups(ticket)
     delete ticket.attention; delete ticket.delivery
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
@@ -466,5 +528,24 @@ export class Tickets extends EnginePart {
     if (!thread.subscriptions.includes(ticketId)) { thread.subscriptions.push(ticketId); this.emit('thread.subscribed', { threadKey: thread.key, ticketId }) }
     if (thread.context?.includes(ticketId)) thread.context = thread.context.filter(id => id !== ticketId)
     this.repo.threads.save(thread)
+  }
+}
+
+/** Validate the public Engine API too: offsets are required and Date.parse alone accepts calendar rollovers. */
+function validateFollowup(input: ReportNextCheck): void {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(input.at)
+  if (!match || !Number.isFinite(Date.parse(input.at))) throw new UserError('notAdmissible', { reason: 'follow-up at must be a valid ISO datetime with a timezone offset' })
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offset] = match
+  const year = Number(yearText), month = Number(monthText), day = Number(dayText)
+  const hour = Number(hourText), minute = Number(minuteText), second = Number(secondText)
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const days = month === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31
+  if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59
+    || (offset && offset !== 'Z' && (Number(offset.slice(1, 3)) > 23 || Number(offset.slice(4, 6)) > 59))) {
+    throw new UserError('notAdmissible', { reason: 'follow-up at must be a valid ISO datetime with a timezone offset' })
+  }
+  for (const [name, value, max] of [['key', input.key, 200], ['purpose', input.purpose, 500],
+    ['successCondition', input.successCondition, 1000], ['resumeInstruction', input.resumeInstruction, 2000]] as const) {
+    if (value.trim().length < 1 || value.length > max) throw new UserError('notAdmissible', { reason: `follow-up ${name} must contain 1 to ${max} characters` })
   }
 }
