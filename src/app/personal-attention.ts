@@ -21,6 +21,7 @@ const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.m
   : value !== null && typeof value === 'object' ? `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
     .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}` : JSON.stringify(value)
 const digest = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex')
+const deliveryId = (items: readonly Attention[]) => `attention:${digest([...items].sort((a, b) => a.id.localeCompare(b.id)).map(item => [item.id, item.revision]))}`
 
 /** Stores attention items and returns stable delivery snapshots for a caller-owned sink. */
 export class PersonalAttentionService {
@@ -95,8 +96,8 @@ export class PersonalAttentionService {
       const batches: Attention[][] = []
       for (let i = 0; i < sorted.length; i += 20) batches.push(sorted.slice(i, i + 20))
       return batches.map(items => {
-        const deliveryId = `attention:${digest(items.map(item => [item.id, item.revision]))}`
-        return { deliveryId, digestKey, priority, items,
+        const stableDeliveryId = deliveryId(items)
+        return { deliveryId: stableDeliveryId, digestKey, priority, items,
           text: items.map(item => `${item.title}\n${item.summary}`).join('\n\n') }
       })
     })
@@ -104,7 +105,7 @@ export class PersonalAttentionService {
 
   /** Marks exactly the delivered snapshot. A merged/changed item invalidates its old delivery token. */
   markSent(delivery: Pick<AttentionDelivery, 'deliveryId' | 'items'>, sentAt = this.now()): Attention[] {
-    const expectedId = `attention:${digest([...delivery.items].sort((a, b) => a.id.localeCompare(b.id)).map(item => [item.id, item.revision]))}`
+    const expectedId = deliveryId(delivery.items)
     if (delivery.deliveryId !== expectedId) throw new AttentionConflict('Invalid delivery snapshot')
     const timestamp = iso(sentAt), saved: Attention[] = []
     const work = () => {
