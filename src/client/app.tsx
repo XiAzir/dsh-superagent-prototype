@@ -9,6 +9,7 @@ import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
 import { PersonalPage } from './personal.tsx'
+import { PersonalAssistantPage } from './assistant.tsx'
 import { RoomsPage } from './rooms.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
@@ -162,6 +163,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
         : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
       case 'tasks': return state?.mode === 'personal' ? <PersonalPage key={route.id ?? 'tasks'} id={route.id} /> : waiting
       case 'rooms': return state?.mode === 'personal' ? <RoomsPage key={route.id ?? 'rooms'} id={route.id} /> : waiting
+      case 'assistant': return state?.mode === 'personal' ? <PersonalAssistantPage /> : waiting
       case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
         deploymentForm={deploymentForm} /> : waiting
     }
@@ -171,7 +173,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
       <Header masterId={state?.masterId} mode={state?.mode} masterReady={state?.masterReady ?? false} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
       <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
-        items={TABS.filter(value => !['tasks', 'rooms'].includes(value) || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
+        items={TABS.filter(value => !['tasks', 'rooms', 'assistant'].includes(value) || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
           id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
       <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page}`} className="dt-main">{page}</main>
     </div>

@@ -430,3 +430,23 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-admission-slot { display: inline-flex; flex: none; width: 16px; }
 .dt-info-warn { color: var(--dsw-alias-state-warn-primary); }
 .dt-field-segmented { max-width: 240px; }
+.dt-assistant-page { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.dt-assistant-settings { gap: 14px !important; }
+.dt-assistant-enabled { display: inline-flex; align-items: center; gap: 10px; min-height: 40px; font-size: 14px; }
+.dt-assistant-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.dt-assistant-tabs { display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 0.5px solid var(--dsw-alias-border-l3); }
+.dt-assistant-tab { min-height: 40px; padding: 0 12px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; cursor: pointer; }
+.dt-assistant-tab[aria-pressed='true'] { color: var(--dsw-alias-label-primary); border-bottom-color: var(--dsw-alias-brand-primary); }
+.dt-assistant-tab:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
+.dt-assistant-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.dt-assistant-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px; min-width: 0; padding: 12px 8px; border-bottom: 0.5px solid var(--dsw-alias-border-l3); }
+.dt-assistant-record { display: flex; flex: 1 1 240px; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.dt-assistant-record p { flex-basis: 100%; margin: 0; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.dt-assistant-details { display: grid; flex-basis: 100%; gap: 6px; margin: 4px 0; }
+.dt-assistant-details > div { display: grid; grid-template-columns: minmax(100px, 140px) minmax(0, 1fr); gap: 8px; }
+.dt-assistant-details dt { color: var(--dsw-alias-label-caption); }
+.dt-assistant-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.dt-assistant-details pre { max-height: 240px; overflow: auto; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.dt-assistant-editor { gap: 14px !important; }
+.dt-assistant-page .dt-field { min-width: 0; }
+@container (max-width: 640px) { .dt-assistant-grid { grid-template-columns: 1fr; } .dt-assistant-row { flex-direction: column; } }

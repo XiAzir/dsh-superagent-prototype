@@ -4,7 +4,7 @@ import type { SetupPlace } from '../setup.ts'
 import { DECISION_FILTERS, type DecisionFilter } from './api.ts'
 import type { T } from './text.ts'
 
-export const TABS = ['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'rooms', 'tasks'] as const
+export const TABS = ['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'rooms', 'tasks', 'assistant'] as const
 export type Tab = typeof TABS[number]
 export const SETTINGS_GROUPS = ['source', 'eval', 'execution', 'schedules', 'prompts', 'deployment'] as const
 export type SettingsGroup = typeof SETTINGS_GROUPS[number]
@@ -16,6 +16,7 @@ export type Route = { page: 'overview' | 'source'; id?: undefined; query?: undef
   | { page: 'execution'; id: string; query?: undefined }
   | { page: 'tasks'; id?: string; query?: undefined }
   | { page: 'rooms'; id?: string; query?: undefined }
+  | { page: 'assistant'; id?: undefined; query?: undefined }
   | { page: 'settings'; id?: undefined; query: { group: SettingsGroup; source?: string; version?: string } }
 export const HOME: Route = { page: 'overview' }
 export const settingsRoute = (group: SettingsGroup, query: { source?: string; version?: string } = {}): Route =>
@@ -39,6 +40,7 @@ export function parseRoute(value: unknown): Route | undefined {
     case 'overview': case 'source': return { page }
     case 'tasks': return record ? { page, id: record } : { page }
     case 'rooms': return record ? { page, id: record } : { page }
+    case 'assistant': return { page }
     case 'trigger': return record ? { page, id: record, query: compact({ trigger: text('trigger') }) }
       : { page, query: compact({ filter: pick(THREAD_FILTERS, query?.filter) }) }
     case 'eval': return { page, query: compact({ filter: pick(DECISION_FILTERS, query?.filter),

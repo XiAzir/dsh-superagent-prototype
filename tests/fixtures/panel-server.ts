@@ -6,6 +6,8 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { PersonalApi, PersonalDashboard } from '../../src/app/personal-http.ts'
+import type { PersonalKind, PersonalRecord, PersonalRecordMap, PersonalSettings } from '../../src/core/personal/model.ts'
 import type { RoomActivity, RoomMessage, TaskRoomSummary, TaskRoomView } from '../../src/app/task-rooms.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
@@ -140,6 +142,8 @@ export interface PanelServer {
   qqStatus: ApiResponse<'GET qq/status'>
   qqToken?: string
   qqTokenError?: string
+  personal: PersonalDashboard
+  personalRecords: { [K in PersonalKind]: PersonalRecordMap[K][] }
 }
 export let server: PanelServer
 
@@ -286,6 +290,20 @@ function initial(): PanelServer {
     setup: { machine: { ...MACHINE, mode: 'repository' }, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
+    personal: { settings: { enabled: true, timezone: 'Asia/Shanghai', ownerActors: ['web:owner'], quietStart: '22:00', quietEnd: '08:00', digestMinutes: 60, revision: 1 },
+      counts: { goal: 1, commitment: 0, fact: 1, constraint: 0, attention: 0, authorization: 1, action: 1 }, followups: [] },
+    personalRecords: {
+      goal: [{ id: 'goal-demo', revision: 0, createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-01T00:00:00.000Z', sourceRefs: [],
+        title: '整理每周计划', priority: 60, successCriteria: ['每周日回顾'], status: 'active' }],
+      commitment: [], fact: [{ id: 'fact-candidate', revision: 0, createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-01T00:00:00.000Z',
+        sourceRefs: ['trigger/source-note'], subject: '工作时间', predicate: '偏好', value: '上午', confidence: 0.7, confirmation: 'inferred', status: 'candidate' }],
+      constraint: [], attention: [],
+      authorization: [{ id: 'auth-demo', revision: 0, createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-01T00:00:00.000Z',
+        sourceRefs: [], ticketId: 't1', risk: 'L2', scope: ['calendar.write'], status: 'requested', requestHash: 'a'.repeat(64) }],
+      action: [{ id: 'action-demo', revision: 0, createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-01T00:00:00.000Z', sourceRefs: [],
+        ticketId: 't1', authorizationId: 'auth-demo', idempotencyKey: 'demo', action: 'calendar.create', target: 'Alice · 2026-11-08 10:00',
+        requestHash: 'a'.repeat(64), payload: { text: '周日 10:00 在上海时区创建“周计划回顾”，邀请 Alice。' }, status: 'prepared' }],
+    },
     settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
     rooms: (() => {
       const key = 'web:demo'
@@ -356,6 +374,81 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET personal': { answer: () => server.personal },
+  'PUT personal/settings': { body: true, answer: ({ body }) => {
+    if (body.revision !== server.personal.settings.revision) return refuse(409, '设置已在别处修改。')
+    server.personal.settings = { ...body.value, revision: body.revision + 1 }; return server.personal.settings
+  } },
+  'GET personal/records/:kind': { query: ['offset', 'limit', 'status', 'ticketId'], answer: ({ params, query }) => {
+    const kind = params.kind as PersonalKind
+    const rows = server.personalRecords[kind].filter(item => (!query.status || item.status === query.status)
+      && (!query.ticketId || ('ticketId' in item && item.ticketId === query.ticketId)))
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    return { items: rows.slice(offset, offset + limit), next_offset: offset + limit < rows.length ? offset + limit : null }
+  } },
+  'PUT personal/records/:kind/:id': { body: true, answer: ({ params, body }) => {
+    const kind = params.kind as PersonalKind, rows = server.personalRecords[kind]
+    if (Object.keys(body.value).some(field => ['id', 'revision', 'createdAt', 'updatedAt', 'sourceRefs'].includes(field))) {
+      return refuse(400, '身份、来源和版本由服务端保存。')
+    }
+    const index = rows.findIndex(item => item.id === params.id)
+    if (index >= 0 && rows[index]!.revision !== body.revision) return refuse(409, '记录版本冲突。')
+    const at = new Date().toISOString(), prior = rows[index]
+    const item = { ...prior, ...body.value, id: params.id, revision: (prior?.revision ?? -1) + 1,
+      createdAt: prior?.createdAt ?? at, updatedAt: at, sourceRefs: prior?.sourceRefs ?? [] } as PersonalRecord
+    const save = <K extends PersonalKind>(records: PersonalRecordMap[K][], value: PersonalRecordMap[K]) => {
+      if (index < 0) records.unshift(value); else records[index] = value
+    }
+    switch (kind) {
+      case 'goal': save(server.personalRecords.goal, item as PersonalRecordMap['goal']); break
+      case 'commitment': save(server.personalRecords.commitment, item as PersonalRecordMap['commitment']); break
+      case 'fact': save(server.personalRecords.fact, item as PersonalRecordMap['fact']); break
+      case 'constraint': save(server.personalRecords.constraint, item as PersonalRecordMap['constraint']); break
+      case 'attention': save(server.personalRecords.attention, item as PersonalRecordMap['attention']); break
+      case 'authorization': save(server.personalRecords.authorization, item as PersonalRecordMap['authorization']); break
+      case 'action': save(server.personalRecords.action, item as PersonalRecordMap['action']); break
+    }
+    return { item }
+  } },
+  'DELETE personal/records/:kind/:id': { body: true, answer: ({ params, body }) => {
+    const rows = server.personalRecords[params.kind as PersonalKind], index = rows.findIndex(item => item.id === params.id)
+    if (index >= 0 && rows[index]!.revision !== body.revision) return refuse(409, '记录版本冲突。')
+    if (index >= 0) rows.splice(index, 1)
+    return { removed: true }
+  } },
+  'GET personal/records/:kind/:id/history': { answer: () => ({ items: [] }) },
+  'POST personal/attention/:id/acknowledge': { answer: ({ params }) => {
+    const rows = server.personalRecords.attention, item = rows.find(row => row.id === params.id)
+    if (!item) return refuse(404, '待确认事项不存在。')
+    const updated = { ...item, status: 'acknowledged' as const, revision: item.revision + 1, updatedAt: new Date().toISOString() }
+    rows[rows.indexOf(item)] = updated; return { item: updated }
+  } },
+  'POST personal/authorizations/:id/grant': { body: true, answer: ({ params, body }) => {
+    const rows = server.personalRecords.authorization, item = rows.find(row => row.id === params.id)
+    if (!item || item.requestHash !== body.requestHash || item.revision !== body.revision) return refuse(409, '授权内容已变化。')
+    const updated = { ...item, status: 'granted' as const, ...(body.expiresAt ? { expiresAt: body.expiresAt } : {}), revision: item.revision + 1, updatedAt: new Date().toISOString() }
+    rows[rows.indexOf(item)] = updated; return { item: updated }
+  } },
+  'GET personal/authorizations/:id/request': { answer: ({ params }) => {
+    const authorization = server.personalRecords.authorization.find(item => item.id === params.id)
+    const action = server.personalRecords.action.find(item => item.authorizationId === params.id)
+    if (!authorization || !action) return refuse(404, '授权请求或行动记录不存在。')
+    return { authorization, action }
+  } },
+  'POST personal/authorizations/:id/revoke': { body: true, answer: ({ params, body }) => {
+    const rows = server.personalRecords.authorization, item = rows.find(row => row.id === params.id)
+    if (!item || item.requestHash !== body.requestHash || item.revision !== body.revision) return refuse(409, '授权内容已变化。')
+    const updated = { ...item, status: 'revoked' as const, revision: item.revision + 1, updatedAt: new Date().toISOString() }
+    rows[rows.indexOf(item)] = updated; return { item: updated }
+  } },
+  'POST personal/actions/:id/execute': { answer: ({ params }) => {
+    const rows = server.personalRecords.action, item = rows.find(row => row.id === params.id)
+    if (!item) return refuse(404, '行动不存在。')
+    const updated = { ...item, status: 'verified' as const, verifiedAt: new Date().toISOString(), revision: item.revision + 1 }
+    rows[rows.indexOf(item)] = updated; return { item: updated }
+  } },
+  'POST personal/followups/:ticketId/:key/cancel': { answer: () => ({ cancelled: true }) },
+  'POST personal/conflicts': { body: true, answer: () => ({ items: [] }) },
   'GET rooms': { query: ['offset', 'limit'], answer: ({ query }) => {
     const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50), items = server.rooms.items.slice(offset, offset + limit)
     return { items, next_offset: offset + limit < server.rooms.items.length ? offset + limit : null }
