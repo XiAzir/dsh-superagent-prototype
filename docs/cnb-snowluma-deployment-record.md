@@ -29,6 +29,8 @@ CNB Docker service 的 nofile 硬上限为65535，容器使用 `65535:65535`。D
 
 QQ Chromium 的主配置目录及 `Partitions/qqnt_*`、`Partitions/qq-browser-*` 中，`SharedStorage`、`DIPS` 隐私缓存会长期持有独占 SQLite 锁。归档仅排除这组可重建浏览器缓存及其 sidecar，QQ 登录态、账号数据库和其他文件继续保存。回归覆盖持锁期间归档、登录状态文件恢复，以及其他路径同名文件的保留。
 
+登录后浏览器 `WebStorage/QuotaManager` 也会持有独占锁。为保留该数据，归档对 SnowLuma QQ 目录中的锁错误增加稳定文件组克隆：复制main/WAL/journal，组前后核对文件状态，在私有副本中恢复事务并执行quick_check，然后生成一致的单文件SQLite快照。普通应用数据库保留在线备份路径。回归覆盖已提交WAL、回滚未提交事务、源日志变化、符号链接拒绝和重试时清理旧副本日志。
+
 WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据保存于私有数据根 `snowluma/operator-webui-access.json`；VNC 密码位于 `snowluma/data/config/vnc-password`，随私有快照保存。
 
 本次临时登录入口：SSH 转发15099/16081，HTTP兼容代理15100；验收完成后清理。代理逐请求关闭连接，处理 CNB SSH 对闲置 HTTP keep-alive socket 的兼容问题。日常 SA 入口继续使用 `https://superagent.1994622.xyz/`。
@@ -36,7 +38,7 @@ WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据�
 ## 验收结果
 
 - `pnpm check`：类型检查、1466项测试、构建通过；31项测试跳过。
-- Linux 部署单测110项全部通过；Windows对应检查通过，5项按平台跳过。
+- Linux部署单测115项通过；Windows对应检查通过，6项按平台跳过。
 - 真实HTTP备份/恢复集成测试1项通过，Web网关10项通过。
 - 实际容器配置与管理器预期一致，SnowLuma WebUI健康，监督器healthy；NapCat停止。
 - 已上传包含 SnowLuma 数据的私有快照，manifest 覆盖 QQ 配置、三个数据卷及设备身份。

@@ -271,7 +271,7 @@ class SnapshotTests(unittest.TestCase):
             connection.execute("SELECT * FROM quota").fetchall()
             wal = Path(str(db) + "-wal")
             self.assertTrue(wal.exists())
-            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.1), mock.patch.object(
+            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.2), mock.patch.object(
                 archive_module, "_sqlite_backup_from_clone", wraps=archive_module._sqlite_backup_from_clone,
             ) as clone_backup:
                 self.make_snapshot()
@@ -298,7 +298,7 @@ class SnapshotTests(unittest.TestCase):
         connection.execute("UPDATE quota SET value='uncommitted'")
         self.assertTrue(Path(str(db) + "-journal").exists())
         try:
-            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.1), mock.patch.object(
+            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.2), mock.patch.object(
                 archive_module, "_sqlite_backup_from_clone", wraps=archive_module._sqlite_backup_from_clone,
             ) as clone_backup:
                 self.make_snapshot()
