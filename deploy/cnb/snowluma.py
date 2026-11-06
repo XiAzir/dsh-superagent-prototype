@@ -278,13 +278,13 @@ class SnowLuma:
             and host.get('NetworkMode') == 'bridge'
             and host.get('RestartPolicy', {}).get('Name') == 'unless-stopped'
             and host.get('ShmSize') == 1073741824
-            and sorted(host.get('CapAdd') or []) == ['SYS_PTRACE']
+            and sorted(cap.removeprefix('CAP_') for cap in (host.get('CapAdd') or [])) == ['SYS_PTRACE']
             and set(host.get('SecurityOpt') or []) == {'seccomp=unconfined', 'no-new-privileges:true'}
             and host.get('Privileged') is False
             and mac_matches
             and (host.get('PortBindings') or {}) == self._expected_ports(config)
             and host.get('Ulimits') and any(item.get('Name') == 'nofile'
-                                             and item.get('Soft') == 65536 and item.get('Hard') == 1048576
+                                             and item.get('Soft') == 65535 and item.get('Hard') == 65535
                                              for item in host['Ulimits'])
             and (host.get('LogConfig') or {}).get('Type') == 'json-file'
             and (host.get('LogConfig') or {}).get('Config') == {'max-size': '10m', 'max-file': '3'}
@@ -295,7 +295,7 @@ class SnowLuma:
             'docker', 'run', '-d', '--name', CONTAINER,
             '--hostname', 'superagent-snowluma', '--label', f'{LABEL_KEY}={LABEL_VALUE}',
             '--restart', 'unless-stopped', '--network', 'bridge',
-            '--shm-size=1g', '--ulimit', 'nofile=65536:1048576', '--cap-add=SYS_PTRACE',
+            '--shm-size=1g', '--ulimit', 'nofile=65535:65535', '--cap-add=SYS_PTRACE',
             '--security-opt', 'seccomp=unconfined', '--security-opt', 'no-new-privileges:true',
             '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
             '--mac-address', mac,

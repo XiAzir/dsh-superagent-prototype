@@ -219,6 +219,17 @@ class SnowLumaTests(unittest.TestCase):
         self.assertTrue(self.client.stop())
         self.assertIn(['docker', 'stop', '--time', '30', snowluma.CONTAINER], [call[0] for call in self.docker.calls])
 
+    def test_docker_canonical_capability_and_cnb_nofile_limit_are_reusable(self):
+        self.write_config({"enabled": True})
+        with patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started()
+            self.docker.info['HostConfig']['CapAdd'] = ['CAP_SYS_PTRACE']
+            self.assertEqual(self.docker.info['HostConfig']['Ulimits'],
+                             [{'Name': 'nofile', 'Soft': 65535, 'Hard': 65535}])
+            self.client.ensure_started()
+        creates = [args for args, _env in self.docker.calls if args[:3] == ['docker', 'run', '-d']]
+        self.assertEqual(len(creates), 1)
+
     def test_symlinked_managed_path_is_rejected(self):
         if os.name == 'nt': self.skipTest('symlink creation requires privileges unavailable in standard Windows sessions')
         self.write_config({'enabled': True})
