@@ -56,6 +56,8 @@ NapCat 配置文件对应 `network.websocketClients[]`，常用字段为 `enable
 
 按 [官方 Docker 部署说明](https://snowluma.github.io/zh/docs/guide/deploy/docker) 启动，使用 noVNC（6081）完成 QQ 登录，WebUI 默认 5099。宿主机 SA 连接发布到 loopback 的 `ws://127.0.0.1:3001/`；同 Docker 网络可连接容器名。
 
+首次 QQ 登录时勾选“自动登录”，再登录账号；该选项随 QQ 配置持久保存。保存的账号会在后续客户端启动时自动登录，安全验证按 QQ 当时的提示处理。
+
 SnowLuma 的配置为 `data/config/onebot.json`（可选账号级 `onebot_<QQ号>.json`），使用 `networks.wsServers[]` 的 `host`、`port`、`path`、`role: Universal`、`accessToken`、`messageFormat: array`。容器内监听 `0.0.0.0`，宿主仅发布 `127.0.0.1`。将其 `accessToken` 保存到 SA 的 QQ 来源令牌。RPC echo 同时兼容数字及字符串。
 
 ## 3. 保存访问令牌与授权范围

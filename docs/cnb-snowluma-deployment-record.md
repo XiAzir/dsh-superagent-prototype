@@ -2,7 +2,7 @@
 
 ## 部署内容
 
-用户授权在 `XiAzir/dsh-superagent` 的 CNB Linux 工作区部署 Docker SnowLuma，并完成 Superagent 适配。当前工作区为 `cnb-e0d-1k6m1ij78`，4 核、8 GiB。部署代码已推送 CNB `linux` 分支。
+用户授权在 `XiAzir/dsh-superagent` 的 CNB Linux 工作区部署 Docker SnowLuma，并完成 Superagent 适配。首次部署工作区为 `cnb-e0d-1k6m1ij78`；完整重建验收后当前工作区为 `cnb-v08-1k6nfnt67`，4 核、8 GiB。部署代码已推送 CNB `linux` 分支。
 
 - 镜像：SnowLuma Docker v2.4.0，固定 `motricseven7/snowluma@sha256:9b035551e8615a20d8367601a6a61c641796d9ed870f5501830f045b68f74667`。
 - 容器：`superagent-snowluma`，`unless-stopped` 重启策略；WebUI5099、noVNC6081、OneBotWS3001 均发布到宿主 `127.0.0.1`。
@@ -31,9 +31,9 @@ QQ Chromium 的 `.config/QQ/SharedStorage`、`.config/QQ/Partitions/qqnt_*/Share
 
 WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据保存于私有数据根 `snowluma/operator-webui-access.json`；VNC 密码位于 `snowluma/data/config/vnc-password`，随私有快照保存。
 
-本次临时登录入口：SSH 转发15099/16081，HTTP兼容代理15100。代理逐请求关闭连接，处理 CNB SSH 对闲置 HTTP keep-alive socket 的兼容问题。日常 SA 入口继续使用 `https://superagent.1994622.xyz/`。
+本次临时登录入口：SSH 转发15099/16081，HTTP兼容代理15100；验收完成后清理。代理逐请求关闭连接，处理 CNB SSH 对闲置 HTTP keep-alive socket 的兼容问题。日常 SA 入口继续使用 `https://superagent.1994622.xyz/`。
 
-## 验证与待完成项
+## 验收结果
 
 - `pnpm check`：类型检查、1466项测试、构建通过；31项测试跳过。
 - Linux 部署单测110项全部通过；Windows对应检查通过，5项按平台跳过。
@@ -41,7 +41,11 @@ WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据�
 - 实际容器配置与管理器预期一致，SnowLuma WebUI健康，监督器healthy；NapCat停止。
 - 已上传包含 SnowLuma 数据的私有快照，manifest 覆盖 QQ 配置、三个数据卷及设备身份。
 - 修复后在线归档并上传成功（HTTP200）：438,653,073字节、5433文件，其中SnowLuma2384文件；包含新WebUI运维凭据，两个Chromium SharedStorage缓存按规则排除。
-- QQ组件正在等待账号登录，SA OneBot 来源等待连接。浏览器由用户接管；账号登录完成后继续验证 SA 连接、登录态重启恢复及环境启动恢复。
+- 用户完成首次登录后，SA 实际连接机器人账号 `1152578024`，来源授权仍为1人、0个群。
+- 第一轮完整重建创建 `cnb-7a0-1k6nf3lg9`，证明三个数据卷、设备身份、OneBot和WebUI配置可从外部快照恢复；QQ窗口中的“自动登录”原为关闭状态。已在官方QQ窗口勾选该选项并登录保存的账号，SA随即恢复连接。
+- 保存新的登录配置后，第二轮完整重建创建 `cnb-v08-1k6nfnt67`。CNB自动恢复快照、启动SnowLuma、QQ自动登录原账号、SA OneBot恢复connected，监督器healthy。该轮账号恢复全程自动完成。
+- 冷启动校验标记保留；MAC、machine-id、deployment、默认及账号级OneBot、WebUI配置的6项SHA-256比较全部一致。受管容器配置与管理器预期一致。
+- 验收原始记录位于新工作区 `control/snowluma-coldboot-verification.json`，本机副本位于工作区外的 `output/snowluma-cnb-20261105/coldboot-verification.json`。首次登录时勾选“自动登录”已补入部署说明。
 
 ## 回退
 
