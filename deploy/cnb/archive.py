@@ -79,16 +79,18 @@ def _is_runtime_log(relative: Path, name: str) -> bool:
     return relative.parts[:1] == (".artifacts",) and bool(_RUNTIME_LOG.fullmatch(name))
 
 
-def _is_chromium_shared_storage(root_name: str, relative: Path) -> bool:
-    # QQ's Chromium Shared Storage cache holds an exclusive SQLite lock for
+def _is_chromium_transient_storage(root_name: str, relative: Path) -> bool:
+    # QQ's Chromium privacy caches hold an exclusive SQLite lock for
     # the process lifetime. Chromium recreates it; account/session databases
     # elsewhere in the profile continue to use consistent SQLite snapshots.
     parts = relative.parts
     profile_cache = len(parts) == 3 and parts[:2] == (".config", "QQ")
     partition_cache = (len(parts) == 5 and parts[:3] == (".config", "QQ", "Partitions")
-                       and parts[3].startswith("qqnt_"))
+                       and parts[3].startswith(("qqnt_", "qq-browser-")))
+    cache_names = {base + suffix for base in ("SharedStorage", "DIPS")
+                   for suffix in ("", "-wal", "-shm", "-journal")}
     return (root_name == "snowluma" and (profile_cache or partition_cache)
-            and parts[-1] in {"SharedStorage", "SharedStorage-wal", "SharedStorage-shm", "SharedStorage-journal"})
+            and parts[-1] in cache_names)
 
 
 def _is_generated_directory(root_name: str, relative: Path, name: str) -> bool:
@@ -413,7 +415,7 @@ def _walk_source(
                     _mkdir_private(root_stage / rel_path, parents=True, exist_ok=True)
                     visit(src_path, rel_path, expected_stat=file_stat, parent_fd=directory_fd, entry_name=name)
                 elif stat.S_ISREG(file_stat.st_mode):
-                    if _is_runtime_log(rel_path, name) or _is_chromium_shared_storage(root_name, rel_path):
+                    if _is_runtime_log(rel_path, name) or _is_chromium_transient_storage(root_name, rel_path):
                         skip_counts["generated_file"] += 1
                         continue
                     # SQLite's adjacent WAL and SHM are represented by the consistent backup.

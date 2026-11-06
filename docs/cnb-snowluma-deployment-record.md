@@ -27,7 +27,7 @@ CNB Docker service 的 nofile 硬上限为65535，容器使用 `65535:65535`。D
 
 武汉接收端 `archive.py` 已同步 SnowLuma 数据根支持，原代码备份于 `/root/.cnb-superagent/storage-backups/snowluma-20261105T163709`；后续快照修复备份于 `snowluma-cache-20261106T024648`。
 
-QQ Chromium 的 `.config/QQ/SharedStorage`、`.config/QQ/Partitions/qqnt_*/SharedStorage` 长期持有独占 SQLite 锁。归档仅排除这组可重建浏览器缓存及其 sidecar，QQ 登录态、账号数据库和其他文件继续保存。回归覆盖持锁期间归档、登录状态文件恢复，以及其他路径同名文件的保留。
+QQ Chromium 的主配置目录及 `Partitions/qqnt_*`、`Partitions/qq-browser-*` 中，`SharedStorage`、`DIPS` 隐私缓存会长期持有独占 SQLite 锁。归档仅排除这组可重建浏览器缓存及其 sidecar，QQ 登录态、账号数据库和其他文件继续保存。回归覆盖持锁期间归档、登录状态文件恢复，以及其他路径同名文件的保留。
 
 WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据保存于私有数据根 `snowluma/operator-webui-access.json`；VNC 密码位于 `snowluma/data/config/vnc-password`，随私有快照保存。
 
@@ -40,7 +40,7 @@ WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据�
 - 真实HTTP备份/恢复集成测试1项通过，Web网关10项通过。
 - 实际容器配置与管理器预期一致，SnowLuma WebUI健康，监督器healthy；NapCat停止。
 - 已上传包含 SnowLuma 数据的私有快照，manifest 覆盖 QQ 配置、三个数据卷及设备身份。
-- 修复后在线归档并上传成功（HTTP200）：438,653,073字节、5433文件，其中SnowLuma2384文件；包含新WebUI运维凭据，两个Chromium SharedStorage缓存按规则排除。
+- 修复后在线归档并上传成功（HTTP200）：438,653,073字节、5433文件，其中SnowLuma2384文件；包含新WebUI运维凭据，Chromium SharedStorage缓存按规则排除。
 - 用户完成首次登录后，SA 实际连接机器人账号 `1152578024`，来源授权仍为1人、0个群。
 - 第一轮完整重建创建 `cnb-7a0-1k6nf3lg9`，证明三个数据卷、设备身份、OneBot和WebUI配置可从外部快照恢复；QQ窗口中的“自动登录”原为关闭状态。已在官方QQ窗口勾选该选项并登录保存的账号，SA随即恢复连接。
 - 保存新的登录配置后，第二轮完整重建创建 `cnb-v08-1k6nfnt67`。CNB自动恢复快照、启动SnowLuma、QQ自动登录原账号、SA OneBot恢复connected，监督器healthy。该轮账号恢复全程自动完成。

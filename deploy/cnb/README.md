@@ -39,7 +39,7 @@ CNB 应用的持久数据统一位于 `/workspace/.superagent-runtime/data`：
 | `state` | Superagent SQLite、任务、定时任务、QQ附件、默认Worker工作目录 |
 | `work` | DSH默认工作目录与手工保存的工作文件 |
 | `home` | 应用HOME；工具配置、XDG数据、浏览器profile等 |
-| `snowluma` | SnowLuma data、QQ .config/.local/share、稳定设备身份；排除 Chromium SharedStorage 缓存 |
+| `snowluma` | SnowLuma data、QQ .config/.local/share、稳定设备身份；排除 Chromium SharedStorage/DIPS 缓存 |
 | `napcat` | QQ登录数据、NapCat配置、插件、app、缓存、设备身份；完整保存依赖与缓存 |
 
 监督器显式设置HOME/XDG相关变量，并在复用tmux会话时更新每个新pane的环境。临时文件与运行socket位于同一workspace下的`control/tmp`和`control/run`。归档服务兼容较早仅包含dsh-home/state/work的快照。
@@ -71,7 +71,7 @@ NapCat的WebUI token从已持久的`napcat/config/webui.json`读取，OneBot tok
 
 SnowLuma 容器 `superagent-snowluma` 固定 v2.4.0 镜像 digest，使用 `unless-stopped` 重启策略。CNB `.cnb.yml` 每次启动执行 `runtime.py start`，恢复快照后启动 QQ 后端，再启动 DSH；运行期间检查容器/WebUI并重试。人工暂停、环境结束或失去租约时停止 QQ 容器；环境结束保存快照并允许下一工作区恢复。手机验证要求以 QQ 的提示为准。
 
-三个持久卷为 `snowluma/data:/app/data`、`snowluma/.config:/app/.config`、`snowluma/.local/share:/app/.local/share`；`data/config/machine-id` 及 `identity/mac-address` 持久保存。SnowLuma 数据根参与私有快照；仅排除 `.config/QQ/SharedStorage`、`.config/QQ/Partitions/qqnt_*/SharedStorage` 及对应 SQLite sidecar，这是由 Chromium 重建的浏览器缓存，长期独占锁会阻塞在线备份。QQ 登录态、账号数据库及其他缓存继续保存。归档接收端须同步新版 `archive.py`，支持 `snowluma` 根。
+三个持久卷为 `snowluma/data:/app/data`、`snowluma/.config:/app/.config`、`snowluma/.local/share:/app/.local/share`；`data/config/machine-id` 及 `identity/mac-address` 持久保存。SnowLuma 数据根参与私有快照；仅排除 QQ 主配置目录及 `Partitions/qqnt_*`、`Partitions/qq-browser-*` 中的 `SharedStorage`、`DIPS` 及对应 SQLite sidecar，这是由 Chromium 重建的浏览器缓存，长期独占锁会阻塞在线备份。QQ 登录态、账号数据库及其他缓存继续保存。归档接收端须同步新版 `archive.py`，支持 `snowluma` 根。
 
 WebUI 5099、noVNC 6081、OneBot WS 3001 发布到宿主 `127.0.0.1`；可选 `http_enabled:true` 发布 HTTP 3000。应用默认 UID/GID1000。CNB Docker service 的 nofile 上限为65535，因此容器使用 `65535:65535`；Docker capability `CAP_SYS_PTRACE` 与 `SYS_PTRACE` 统一校验。镜像的 Node 二进制具有 `cap_sys_ptrace=ep`，显式设置 `no-new-privileges=false`，保留该文件 capability 供 UID1000 加载 QQ 组件；CNB Docker daemon 默认开启的 no-new-privileges 会屏蔽该能力。
 
