@@ -119,6 +119,64 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('observes opted-in discussion in bounded threads, preserves native replies and stays silent in observe mode', async () => {
+    const { runtime, store, bridge: qq } = await startQq({ groups: [{ id: groupId, listen: 'observe' }] })
+    const observingSettings = store.settings(); observingSettings.eval.mode = 'observe'; store.saveSettings(observingSettings)
+    await push(event(900, 'group', owner, [{ type: 'text', data: { text: '登录按钮刚才出现了超时' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const first = qqTriggers(runtime)[0]!
+    expect(first.addressed).toBeUndefined()
+    expect(first.meta).toMatchObject({ observation: { groupId } })
+    expect(qq.kind.scope!({ meta: first.meta }, QqConfigSchema.parse(store.settings().sources.qq!.config)))
+      .toMatchObject({ listened: true, observed: true, row: groupId })
+    await push(event(901, 'group', owner, [{ type: 'reply', data: { id: '900' } }, { type: 'text', data: { text: '这是同一个问题的日志' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 2)
+    const reply = qqTriggers(runtime)[1]!
+    expect(reply.threads).toEqual(first.threads)
+    expect(reply.addressed).toBeUndefined()
+    expect(qq.observations.records().items.filter(row => row.kind === 'candidate')).toHaveLength(2)
+    expect(confirmed).toEqual([])
+    expect(store.tickets.list()).toEqual([])
+    expect(() => runtime.engine.decide(first.id, { kind: 'accept', title: '复现超时', name: 'observe-timeout', scope: '复现', reason: 'Observed', rules: ['copy'] })).toThrow()
+  })
+
+  it('enforces persistent candidate input budgets before creating more model assessment effects', async () => {
+    const { runtime, store, bridge: qq } = await startQq({ groups: [{ id: groupId, listen: 'observe' }], observation: { maxCandidatesPerHour: 1 } })
+    await push(event(910, 'group', owner, [{ type: 'text', data: { text: '发现一个设置问题' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    await push(event(911, 'group', owner, [{ type: 'text', data: { text: '又一条独立讨论' } }]))
+    await waitFor(() => qq.observations.records().items.some(row => row.kind === 'discarded'))
+    expect(qqTriggers(runtime)).toHaveLength(1)
+    expect(qq.observations.records().items.find(row => row.kind === 'discarded')?.reason).toContain('candidate budget')
+    const changed = store.settings(); changed.sources.qq!.config = { ...changed.sources.qq!.config, groups: [{ id: groupId, listen: 'requests' }] }; store.saveSettings(changed)
+    expect(qq.ingest(event(912, 'group', owner, [{ type: 'text', data: { text: '停止观察后保留闲聊' } }]))).toBeUndefined()
+    expect(confirmed).toEqual([])
+  })
+
+  it('attaches observation context to existing work only in auto mode and keeps later discussion inferred', async () => {
+    const { runtime, store } = await startQq({ groups: [{ id: groupId, listen: 'observe' }] })
+    const observingSettings = store.settings(); observingSettings.eval.mode = 'observe'; store.saveSettings(observingSettings)
+    await push(event(920, 'group', owner, [{ type: 'at', data: { qq: selfId } }, { type: 'text', data: { text: '请检查登录超时' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 1)
+    const explicit = qqTriggers(runtime)[0]!
+    const decision = runtime.engine.decide(explicit.id, { kind: 'accept', title: '检查超时', name: 'check-timeout', scope: '检查登录超时', reason: 'Explicit request' })
+    const ticketId = decision.ticketId!
+    await push(event(921, 'group', owner, [{ type: 'text', data: { text: '登录超时似乎只在代理环境发生' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 2)
+    const observed = qqTriggers(runtime)[1]!
+    expect(() => runtime.engine.attach(ticketId, observed.id)).toThrow()
+    const current = store.settings(); current.eval.mode = 'auto'; store.saveSettings(current)
+    runtime.engine.attach(ticketId, observed.id)
+    expect(store.triggers.disposition(observed.id)?.fanout).toContain(ticketId)
+    await push(event(922, 'group', owner, [{ type: 'reply', data: { id: '921' } }, { type: 'text', data: { text: '这是继续讨论的补充证据' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 3)
+    const later = qqTriggers(runtime)[2]!
+    expect(later.addressed).toBeUndefined()
+    runtime.engine.evaluateDue()
+    expect(runtime.engine.candidate(later.id)?.strength).toBe('inferred')
+    expect(confirmed).toEqual([])
+  })
+
   it('delivers a direct answer even when the Router supplies a placeholder ticket', async () => {
     const { runtime, store } = await startQq()
     await push(event(90, 'private', owner, [{ type: 'text', data: { text: '你好' } }]))

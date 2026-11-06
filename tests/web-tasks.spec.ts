@@ -37,12 +37,55 @@ beforeEach(() => {
     outbox: { send: () => {}, status: () => undefined, withdraw: () => {} } })
   requestPass = vi.fn(() => {})
   tasks = new WebTasks({ store, mode: () => 'personal', configured: () => true, health: () => ({}),
-    receive: trigger => engine.receive(trigger), requestPass, artifacts })
+    receive: trigger => engine.receive(trigger), engine, requestPass, artifacts })
 })
 
 afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
 
 const id = (value: string) => `request_${value}01`
+
+it('handles explicit status, supplement and stop without queuing Router evaluation, with durable replay and owner checks', () => {
+  const task = tasks.create({ text: '检查登录页', requestId: id('action-origin') })
+  const origin = task.messages[0]!.id
+  const accepted = engine.decide(origin, { kind: 'accept', title: '登录页检查', scope: '检查登录页', reason: 'Explicit work' })
+  const ticketId = accepted.ticketId!, ticket = store.tickets.get(ticketId)!
+  const assignment = ticket.assignments.at(-1)!
+  engine.assignmentStarted(ticketId, assignment.id)
+  const threadBefore = store.threads.get(`web:${task.id}`)!
+  const inputsBefore = store.tickets.get(ticketId)!.inputs.length
+  const request = { kind: 'status', ticketId, requestId: id('action-status') }
+  const status = tasks.action(task.id, request)
+  expect(status.snapshot).toMatchObject({ ticket_id: ticketId })
+  expect(store.tickets.get(ticketId)!.inputs).toHaveLength(inputsBefore)
+  expect(store.threads.get(`web:${task.id}`)?.pending).toEqual(threadBefore.pending)
+  expect(tasks.action(task.id, request).snapshot).toEqual(status.snapshot)
+  expect(() => tasks.action(task.id, { ...request, kind: 'stop' })).toThrow('编号')
+  const supplement = { kind: 'supplement', ticketId, text: '采用深色主题', requestId: id('action-supplement') }
+  tasks.action(task.id, supplement)
+  tasks.action(task.id, supplement)
+  const added = store.tickets.get(ticketId)!.inputs.filter(input => input.kind === 'trigger' && input.triggerId.startsWith('web-action-'))
+  expect(added).toHaveLength(1)
+  expect(store.threads.get(`web:${task.id}`)?.pending).toEqual(threadBefore.pending)
+  tasks.action(task.id, { kind: 'stop', ticketId, requestId: id('action-stop') })
+  expect(store.tickets.get(ticketId)?.ended).toMatchObject({ by: 'human', outcome: 'stopped' })
+  expect(tasks.action(task.id, { kind: 'status', ticketId, requestId: id('action-stopped-status') }).snapshot).toMatchObject({ outcome: 'stopped' })
+  expect(() => tasks.action(task.id, { ...supplement, requestId: id('action-after-stop') })).toThrow('结束')
+  const other = tasks.create({ text: '另一件事', requestId: id('action-other') })
+  expect(() => tasks.action(other.id, { ...request, requestId: id('action-cross') })).toThrow('不属于')
+  enableWeb(false)
+  expect(() => tasks.action(task.id, request)).toThrow('授权')
+})
+
+it('reads completed task status through structured actions without resuming its assignment', () => {
+  const task = tasks.create({ text: '生成说明', requestId: id('finished-origin') })
+  const decision = engine.decide(task.messages[0]!.id, { kind: 'accept', title: '说明', scope: '生成说明', reason: 'Explicit' })
+  const ticketId = decision.ticketId!, ticket = store.tickets.get(ticketId)!
+  engine.assignmentStarted(ticketId, ticket.assignments.at(-1)!.id)
+  engine.report(ticketId, { state: 'ready', summary: '说明已完成' }, ticket.assignments.at(-1)!.id)
+  const before = store.tickets.get(ticketId)
+  expect(tasks.action(task.id, { kind: 'status', ticketId, requestId: id('finished-status') }).snapshot).toMatchObject({ outcome: 'completed' })
+  expect(store.tickets.get(ticketId)).toEqual(before)
+})
 
 it('shows a current model failure on the Web task and clears it when the session recovers', () => {
   let failure: { message: string; at: string } | undefined

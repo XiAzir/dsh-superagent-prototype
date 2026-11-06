@@ -44,8 +44,14 @@ import type { PersonalRuntime } from './personal-runtime.ts'
 import { ActionConflict, ActionAuthorizationError } from './personal-actions.ts'
 import { AttentionConflict } from './personal-attention.ts'
 import { MAX_WEB_IMAGE_BODY_BYTES, WebAttachmentStore, WebImageError } from './web-attachments.ts'
+import { EnvironmentError } from '../remote/protocol.ts'
 
 export interface HttpHost {
+  runtimeManifest?(): ReturnType<typeof import('./runtime-manifest.ts').runtimeManifestState>
+  readonly evaluation?: import('../evaluation/ledger.ts').EvaluationLedger
+  readonly remote?: import('../remote/client.ts').RemoteEnvironments
+  readonly supervision?: import('./supervision.ts').SupervisionService
+  readonly verification?: import('./verification.ts').VerificationService
   readonly personal?: PersonalCoordinator
   readonly personalRuntime?: PersonalRuntime
   readonly qq?: QqBridge | undefined
@@ -56,9 +62,10 @@ export interface HttpHost {
   readonly schedules?: Pick<Schedules, 'list' | 'create' | 'update' | 'runNow' | 'remove'> | undefined
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'conversationIds'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'conversationIds'> & Partial<Pick<Sessions, 'refreshEnvironmentTools'>>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct' | 'cancelFollowup'>
+  readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct' | 'cancelFollowup' | 'status'>
+    & Partial<Pick<Engine, 'releaseTicket' | 'holdTicket'>>
   inspectWorker?(ticketId: string, signal?: AbortSignal): Promise<readonly SessionEvent[]>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
@@ -123,6 +130,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError) return [error.status, { error: error.message }]
+  if (error instanceof EnvironmentError) return [error.status, { error: error.message, code: error.code }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
@@ -145,7 +153,8 @@ export function stateView(runtime: HttpHost) {
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
     mode: runtime.machine.mode ?? 'repository', masterReady: runtime.configured() && runtime.health.runtime?.state === 'ready',
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    ...runtime.runtimeManifest ? { runtime_manifest: runtime.runtimeManifest() } : {} }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -198,6 +207,7 @@ function routes(runtime: HttpHost): Routes {
     const failures = runtime.sessions?.status?.().failures ?? []
     return new WebTasks({ store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
       health: () => runtime.health, receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() },
+      engine: runtime.engine,
       attachments: images(),
       failure: ticketIds => {
         const ids = new Set([runtime.masterId, ...ticketIds.map(workerSessionId)])
@@ -208,6 +218,123 @@ function routes(runtime: HttpHost): Routes {
   const schedules = () => runtime.schedules ?? (() => { throw new RouteError(503, 'Schedules are not ready') })()
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET environments': () => ({ items: runtime.remote?.list() ?? [] }),
+    'POST environments': async ({ body }) => {
+      if (!runtime.remote) throw new RouteError(503, 'Remote environments are unavailable')
+      runtime.remote.register(z.object({ id: z.string().min(1).max(64), label: z.string().min(1).max(100),
+        url: z.string().url(), credentialRef: z.string().min(1).max(500), allowInsecureHttp: z.boolean().optional() }).strict().parse(await body()))
+      return { registered: true }
+    },
+    'POST environments/:id/probe': ({ params }) => {
+      if (!runtime.remote) throw new RouteError(503, 'Remote environments are unavailable')
+      return runtime.remote.probe(params.id)
+    },
+    'GET tickets/:id/environment': ({ params }) => {
+      const id = ticket(params.id)
+      return { deviceId: runtime.remote?.binding(id) ?? null, commands: runtime.remote?.commands(id) ?? [] }
+    },
+    'PUT tickets/:id/environment': async ({ params, body }) => {
+      if (!runtime.remote || !runtime.engine.holdTicket || !runtime.engine.releaseTicket) throw new RouteError(503, 'Remote environment binding is unavailable')
+      const value = z.object({ deviceId: z.string().min(1).max(64) }).strict().parse(await body()), id = ticket(params.id)
+      store.atomic(() => {
+        const current = store.tickets.get(id)!
+        if (current.ended) throw new RouteError(400, 'Bind an active task')
+        const held = !!current.hold
+        runtime.remote!.bind(id, value.deviceId)
+        runtime.engine.holdTicket!(id, { kind: 'operator', at: new Date().toISOString(), reason: 'Switching the task execution environment.' })
+        runtime.sessions.refreshEnvironmentTools?.(id)
+        if (!held) runtime.engine.releaseTicket!(id)
+      })
+      runtime.requestPass(); return { deviceId: value.deviceId }
+    },
+    'POST tickets/:id/environment/commands/:commandId/cancel': ({ params }) => {
+      if (!runtime.remote) throw new RouteError(503, 'Remote environments are unavailable')
+      return runtime.remote.cancel(ticket(params.id), params.commandId)
+    },
+    'POST tickets/:id/environment/commands/:commandId/resolve': async ({ params, body }) => {
+      if (!runtime.remote) throw new RouteError(503, 'Remote environments are unavailable')
+      const value = z.object({ outcome: z.enum(['completed', 'failed', 'cancelled']), evidence: z.string().trim().min(1).max(2000),
+        expectedUpdatedAt: z.string().optional() }).strict().parse(await body())
+      const result = runtime.remote.resolveUnknown(ticket(params.id), params.commandId, value)
+      runtime.requestPass(); return result
+    },
+    'GET evaluation/summary': () => {
+      if (!runtime.evaluation) throw new RouteError(503, 'Evaluation records are unavailable')
+      return runtime.evaluation.summary()
+    },
+    'POST tickets/:id/feedback': async ({ params, body }) => {
+      if (!runtime.evaluation) throw new RouteError(503, 'Evaluation records are unavailable')
+      const value = z.object({ requestId: z.string().min(1).max(200), accepted: z.boolean().optional(), correct: z.boolean().optional(),
+        routingCorrection: z.boolean().optional() }).strict().parse(await body()), id = ticket(params.id)
+      store.atomic(() => {
+        if (value.accepted !== undefined) runtime.evaluation!.record({ id: `feedback:${id}:${value.requestId}:adoption`, kind: 'adoption', ticketId: id, data: { accepted: value.accepted } })
+        if (value.correct !== undefined) {
+          const published = !!store.db.prepare("SELECT 1 FROM outbox WHERE value ->> '$.ticketId'=? AND value ->> '$.status'='sent' AND value ->> '$.purpose'='result' LIMIT 1").get(id)
+          runtime.evaluation!.record({ id: `feedback:${id}:${value.requestId}:completion`, kind: 'completion', ticketId: id, data: { correct: value.correct, published } })
+        }
+        if (value.routingCorrection) runtime.evaluation!.record({ id: `feedback:${id}:${value.requestId}:route`, kind: 'intervention', ticketId: id, data: { kind: 'routing-correction' } })
+      })
+      return { recorded: true }
+    },
+    'GET verification/config': () => {
+      if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')
+      return runtime.verification.config()
+    },
+    'PUT verification/config': async ({ body }) => {
+      if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')
+      return runtime.verification.config(await body())
+    },
+    'GET tickets/:id/verification': ({ params }) => {
+      const value = store.tickets.get(ticket(params.id))!
+      if (runtime.verification) return runtime.verification.view(value.id)
+      return { acceptance: value.acceptance ?? null, verification: value.verification ?? null,
+        history: [] }
+    },
+    'PUT tickets/:id/acceptance': async ({ params, body }) => {
+      if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')
+      const value = z.object({ expectedRevision: z.number().int().min(0), criteria: z.array(z.unknown()).min(1).max(30) }).strict().parse(await body())
+      return { acceptance: runtime.verification.setCriteria(ticket(params.id), value.expectedRevision, value.criteria).acceptance! }
+    },
+    'POST tickets/:id/verify': async ({ params, body }) => {
+      if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')
+      const value = z.object({ requestId: z.string().min(1).max(200) }).strict().parse(await body())
+      const reviewId = runtime.verification.enqueue(store.tickets.get(ticket(params.id))!, value.requestId) ?? null
+      runtime.requestPass(); return { reviewId }
+    },
+    'POST tickets/:id/resume': ({ params }) => {
+      if (!runtime.engine.releaseTicket) throw new RouteError(503, 'Resource resume is unavailable')
+      if (runtime.remote?.commands(params.id).some(command => command.effectiveState === 'unknown'))
+        throw new RouteError(400, 'Verify unknown remote command outcomes before resuming this task')
+      const value = runtime.engine.releaseTicket(ticket(params.id)); runtime.requestPass()
+      return { resumed: !value.hold }
+    },
+    'GET watchdog/config': () => runtime.supervision?.config() ?? { mode: 'observe' },
+    'POST watchdog/config': async ({ body }) => {
+      if (!runtime.supervision) throw new RouteError(503, 'Semantic supervision is unavailable')
+      return runtime.supervision.config(z.object({ mode: z.enum(['observe', 'advise']) }).strict().parse(await body()))
+    },
+    'GET watchdog/reviews': ({ query }) => runtime.supervision?.history({
+      ...query.ticketId ? { ticketId: query.ticketId } : {}, limit: limit(20, 100).parse(query.limit) }) ?? [],
+    'GET watchdog/reviews/:id': ({ params }) => {
+      const value = runtime.supervision?.get(params.id)
+      if (!value) throw new RouteError(404, 'Supervision review not found')
+      return value
+    },
+    'POST watchdog/assess': async ({ body }) => {
+      if (!runtime.supervision) throw new RouteError(503, 'Semantic supervision is unavailable')
+      return runtime.supervision.review(z.object({ expectedHash: z.string().max(100).optional(), offset: z.number().int().min(0).optional(),
+        maxTickets: z.number().int().min(1).max(20).optional(), candidateAfterMs: z.number().min(60_000).optional() }).strict().parse(await body()))
+    },
+    'POST watchdog/advice': async ({ body }) => {
+      if (!runtime.supervision) throw new RouteError(503, 'Semantic supervision is unavailable')
+      const value = z.object({ reviewId: z.string().min(1), ticketId: z.string().min(1), expectedRevision: z.string().min(1) }).strict().parse(await body())
+      return runtime.supervision.applyAdvice(value)
+    },
+    'GET qq/observations': ({ query }) => {
+      if (!runtime.qq) throw new RouteError(503, 'QQ source is unavailable')
+      return runtime.qq.observations.records({ ...query.groupId ? { groupId: query.groupId } : {}, offset: offset.parse(query.offset), limit: limit(50, 100).parse(query.limit) })
+    },
+    'POST web/tasks/:id/actions': async ({ params, body }) => web().action(params.id, await body()),
     ...personalRoutes(runtime),
     'GET rooms': ({ query }) => {
       const page = z.object({ offset, limit: limit(50, 100) }).parse(query)

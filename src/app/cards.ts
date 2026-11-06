@@ -1,5 +1,5 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { currentVerification, latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
@@ -9,6 +9,8 @@ export function preview(text: string): string { return text.replace(/\s+/g, ' ')
 export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) {
   return { trigger_id: trigger.id, source: trigger.source, ...(trigger.url ? { source_url: trigger.url } : {}), actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), human: trigger.human, at: trigger.at,
     ...trigger.attachments?.length ? { attachments: trigger.attachments } : {},
+    ...trigger.meta.observation && typeof trigger.meta.observation === 'object' ? { observation: trigger.meta.observation,
+      ...typeof trigger.meta.routingInstruction === 'string' ? { routing_instruction: trigger.meta.routingInstruction.slice(0, 1200) } : {} } : {},
     ...Array.isArray(trigger.meta.mentionedWorkers) ? { mentioned_workers: trigger.meta.mentionedWorkers,
       collaboration_route: trigger.meta.router === true ? 'router_coordinates' : 'worker_direct',
       ...typeof trigger.meta.routingInstruction === 'string' ? { routing_instruction: trigger.meta.routingInstruction } : {} } : {},
@@ -30,9 +32,12 @@ function cardState(ticket: Ticket): TicketCardState {
   return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'
 }
 export function ticketCard(ticket: Ticket) {
+  const verification = currentVerification(ticket)
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...ticket.hold ? { hold: ticket.hold } : {}, ...verification ? { verification: { state: verification.state,
+      at: verification.at, summary: verification.summary.slice(0, 600), read: `ticket/${ticket.id}/verification` } } : {},
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }

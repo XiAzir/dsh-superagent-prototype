@@ -1,6 +1,6 @@
 /** Durable conversations submitted by the local Web UI and delivered through the regular event pipeline. */
 import { z } from 'zod'
-import { key, latestReport, reasonText, ticketStage, type ReceiveResult, type Trigger } from '../core/index.ts'
+import { key, latestReport, liveTicket, reasonText, ticketStage, type Engine, type ReceiveResult, type TicketStatusSnapshot, type Trigger } from '../core/index.ts'
 import { record } from '../kv.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceKind } from '../sources/kind.ts'
@@ -27,6 +27,8 @@ interface WebTaskHost {
   artifacts?: Pick<ArtifactRegistry, 'verify'>
   attachments?: WebAttachmentStore
   receive(trigger: Trigger): ReceiveResult
+  /** Structured owner actions use this port and retain the same Engine authorization checks. */
+  engine?: Pick<Engine, 'direct' | 'status' | 'stopTicket'>
   requestPass(): void
 }
 const PREFIX = 'web-task:'
@@ -36,6 +38,17 @@ export const WebMessageRequest = z.object({
   requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/),
   attachmentIds: WebImageIds,
 }).strict().refine(value => !!value.text || value.attachmentIds.length > 0, { message: '请输入内容或添加图片。' })
+export const WebTaskActionRequest = z.object({
+  kind: z.enum(['status', 'stop', 'supplement']), ticketId: z.string().trim().min(1).max(200),
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/), text: z.string().trim().max(16000).default(''), attachmentIds: WebImageIds,
+}).strict().superRefine((value, context) => {
+  if (value.kind === 'supplement' && !value.text && !value.attachmentIds.length) context.addIssue({ code: 'custom', message: '请输入补充内容或添加图片。' })
+  if (value.kind !== 'supplement' && value.attachmentIds.length) context.addIssue({ code: 'custom', message: '状态与停止操作请单独发送。' })
+})
+export type WebTaskActionInput = z.infer<typeof WebTaskActionRequest>
+export interface WebTaskActionResult {
+  kind: 'status' | 'stop' | 'supplement'; ticketId: string; task: WebTaskView; snapshot?: TicketStatusSnapshot
+}
 /** A user-facing Web task refusal with the HTTP status its route should return. */
 export class WebTaskError extends Error {
   constructor(readonly status: 400 | 404 | 409 | 503, message: string) { super(message) }
@@ -104,6 +117,53 @@ export class WebTasks {
     const { text, requestId, attachmentIds } = WebMessageRequest.parse(input)
     this.append(task, text, requestId, attachmentIds)
     return this.get(id)
+  }
+  /** Explicit controls bypass semantic routing; arbitrary natural language continues through followup(). */
+  action(conversation: string, input: unknown): WebTaskActionResult {
+    this.requireWritable()
+    const request = WebTaskActionRequest.parse(input), task = this.record(conversation), store = this.host.store
+    const thread = store.threads.get(`web:${conversation}`), ticket = store.tickets.get(request.ticketId)
+    if (!ticket || !thread?.subscriptions.includes(ticket.id)) throw new WebTaskError(404, '该工单不属于当前任务对话。')
+    if (!this.host.engine) throw new WebTaskError(503, '工单操作正在初始化。')
+    const id = `web-action-${key(conversation, request.requestId)}`
+    const requestKey = record<{ request: typeof request; snapshot?: TicketStatusSnapshot }>(`web-action-request:${id}`)
+    const saved = store.get(requestKey)
+    if (saved) {
+      if (JSON.stringify(saved.request) !== JSON.stringify(request)) throw new WebTaskError(409, '操作编号已经用于另一项操作，请重新发送。')
+      return { kind: request.kind, ticketId: ticket.id, task: this.get(conversation), ...saved.snapshot ? { snapshot: saved.snapshot } : {} }
+    }
+    if (request.kind === 'supplement' && !liveTicket(ticket)) throw new WebTaskError(409, '该工单已结束，请交给 Router 继续安排。')
+    if (request.kind === 'supplement' && store.settings().paused) throw new WebTaskError(409, '任务处理已暂停，请恢复后再发送。')
+    if (request.attachmentIds.length && !this.host.attachments) throw new WebTaskError(503, '图片服务正在初始化，请稍后重试。')
+    const attachments = this.host.attachments?.descriptions(request.attachmentIds) ?? [], at = new Date().toISOString()
+    const text = request.text || (request.kind === 'status' ? '查看工单进度' : '停止工单')
+    const trigger: Trigger = { id, source: 'web', routing: 'router', threads: [{ source: 'web', id: conversation }],
+      actor: { source: 'web', id: 'owner' }, human: true, addressed: 'direct', text, at,
+      ...attachments.length ? { attachments: this.host.attachments!.references(id, request.attachmentIds) } : {},
+      channel: { source: 'web', thread: `web:${conversation}`, address: { conversation } },
+      meta: { conversation, action: request.kind, ticketId: ticket.id, attachmentIds: request.attachmentIds } }
+    let snapshot: TicketStatusSnapshot | undefined
+    store.atomic(() => {
+      if (request.kind === 'supplement') {
+        this.host.engine!.direct(ticket.id, trigger)
+        task.messages.push({ id, role: 'user', text, at, ...attachments.length ? { attachments } : {} })
+        task.updatedAt = at
+        store.set(taskKey(task.id), task)
+        store.webTasks.save({ id: task.id, title: task.title, createdAt: task.createdAt, updatedAt: at, lastUserAt: at })
+      } else {
+        // Store an audit event without creating Eval or delivering an execution Input.
+        store.triggers.save(trigger)
+        store.triggers.saveDisposition(id, { fanout: [], matched: [ticket.id], routing: 'handled', at })
+        snapshot = this.host.engine!.status(ticket.id, id)
+        if (request.kind === 'stop') {
+          this.host.engine!.stopTicket(ticket.id, request.text || 'Stopped through the task control.')
+          snapshot = this.host.engine!.status(ticket.id, id)
+        }
+      }
+      store.set(requestKey, { request, ...snapshot ? { snapshot } : {} })
+    })
+    if (request.kind !== 'status') this.host.requestPass()
+    return { kind: request.kind, ticketId: ticket.id, task: this.get(conversation), ...snapshot ? { snapshot } : {} }
   }
   private append(task: WebTaskRecord, text: string, requestId: string, attachmentIds: string[] = []): void {
     const id = `web-message-${key(task.id, requestId)}`

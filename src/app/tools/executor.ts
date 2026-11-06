@@ -1,5 +1,8 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
+import { join, basename } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { parseRemoteArtifactReference, type RemoteEnvironments } from '../../remote/client.ts'
 import { liveTicket, runningAssignment, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
@@ -11,6 +14,8 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
+  readonly remote?: Pick<RemoteEnvironments, 'hasUnsettled' | 'downloadArtifact' | 'binding'>
+  readonly verification?: Pick<import('../verification.ts').VerificationService, 'enqueue'>
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'cancelFollowup'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
@@ -123,8 +128,16 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           throw new Error('PR reporting requires a configured GitHub Source; omit pr_number when this task has no GitHub PR')
         }
         if (args.artifacts?.length && args.state !== 'ready') throw new Error('Report deliverable artifacts only with state=ready')
+        if (args.state === 'ready' && host.remote?.hasUnsettled(ticketId)) throw new Error('Remote commands are still running or awaiting outcome verification; read their existing command IDs before reporting ready')
         const artifacts = args.artifacts?.length ? await Promise.all(args.artifacts.map(async item => {
           if (!host.resources.artifacts || !current.execution?.directory) throw new Error('Task artifact storage is unavailable')
+          const remote = parseRemoteArtifactReference(item.path)
+          if (remote) {
+            if (!host.remote || host.remote.binding(ticketId) !== remote.deviceId) throw new Error('Artifact environment does not match this task')
+            const destination = join(current.execution.directory, '.remote-artifacts', randomUUID(), basename(remote.path))
+            const downloaded = await host.remote.downloadArtifact(ticketId, remote.deviceId, remote.path, destination)
+            return host.resources.artifacts.stage(ticketId, current.execution.directory, downloaded.path, item.name ?? basename(remote.path), item.kind, signal)
+          }
           return host.resources.artifacts.stage(ticketId, current.execution.directory, item.path, item.name, item.kind, signal)
         })) : []
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
@@ -145,6 +158,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           if (!assignmentId) throw new Error('No running Assignment owns this report')
           const updated = host.engine.report(ticketId, report, assignmentId)
+          host.verification?.enqueue(updated)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'

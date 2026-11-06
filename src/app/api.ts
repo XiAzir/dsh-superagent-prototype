@@ -26,6 +26,34 @@ type Delivery = 'injected' | 'pending'
 export interface CollaborationMessageBody { text: string; requestId: string; recipient?: string; router?: boolean; mentions?: string[]; attachmentIds?: string[] }
 
 export interface Api extends PersonalApi {
+  'GET environments': { response: { items: ReturnType<import('../remote/client.ts').RemoteEnvironments['list']> } }
+  'POST environments': { body: import('../remote/client.ts').RemoteDeviceConfig; response: { registered: true } }
+  'POST environments/:id/probe': { response: ReturnType<import('../remote/client.ts').RemoteEnvironments['list']>[number] }
+  'GET tickets/:id/environment': { response: { deviceId: string | null; commands: ReturnType<import('../remote/client.ts').RemoteEnvironments['commands']> } }
+  'PUT tickets/:id/environment': { body: { deviceId: string }; response: { deviceId: string } }
+  'POST tickets/:id/environment/commands/:commandId/cancel': { response: import('../remote/client.ts').RemoteOperationResult }
+  'POST tickets/:id/environment/commands/:commandId/resolve': { body: { outcome: 'completed' | 'failed' | 'cancelled'; evidence: string; expectedUpdatedAt?: string };
+    response: import('../remote/client.ts').RemoteOperationResult }
+  'GET evaluation/summary': { response: import('../evaluation/ledger.ts').EvaluationSummary }
+  'POST tickets/:id/feedback': { body: { requestId: string; accepted?: boolean; correct?: boolean; routingCorrection?: boolean }; response: { recorded: true } }
+  'GET verification/config': { response: import('./verification.ts').VerificationConfig }
+  'PUT verification/config': { body: import('./verification.ts').VerificationConfig; response: import('./verification.ts').VerificationConfig }
+  'GET tickets/:id/verification': { response: { acceptance: import('../core/verification.ts').AcceptancePlan | null;
+    verification: import('../core/verification.ts').CompletionVerification | null; history: import('./verification.ts').VerificationRecord[] } }
+  'PUT tickets/:id/acceptance': { body: { expectedRevision: number; criteria: import('../core/verification.ts').AcceptanceCriterion[] };
+    response: { acceptance: import('../core/verification.ts').AcceptancePlan } }
+  'POST tickets/:id/verify': { body: { requestId: string }; response: { reviewId: string | null } }
+  'POST tickets/:id/resume': { response: { resumed: boolean } }
+  'POST watchdog/assess': { body: { expectedHash?: string; offset?: number; maxTickets?: number; candidateAfterMs?: number };
+    response: import('./supervision.ts').SupervisionAssessment }
+  'GET watchdog/reviews': { query?: { ticketId?: string; limit?: number }; response: ReturnType<import('./supervision.ts').SupervisionService['history']> }
+  'GET watchdog/reviews/:id': { response: import('./supervision.ts').SupervisionReview }
+  'GET watchdog/config': { response: { mode: 'observe' | 'advise' } }
+  'POST watchdog/config': { body: { mode: 'observe' | 'advise' }; response: { mode: 'observe' | 'advise' } }
+  'POST watchdog/advice': { body: { reviewId: string; ticketId: string; expectedRevision: string }; response: import('./supervision.ts').SupervisionAdvice }
+  'GET qq/observations': { query?: { groupId?: string; offset?: number; limit?: number };
+    response: ReturnType<import('./qq-observation.ts').QqObservationBudget['records']> }
+  'POST web/tasks/:id/actions': { body: import('./web-tasks.ts').WebTaskActionInput; response: import('./web-tasks.ts').WebTaskActionResult }
   'GET rooms': { query?: Paged; response: { items: TaskRoomSummary[]; next_offset: number | null } }
   'GET rooms/:key': { query?: { before?: string; limit?: number; workerId?: string }; response: TaskRoomView }
   'POST rooms/:key/messages': { body: CollaborationMessageBody; response: TaskRoomView }

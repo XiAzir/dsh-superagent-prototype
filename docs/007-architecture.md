@@ -309,6 +309,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
 | `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
+| `src/core/verification.ts` | Acceptance criteria and exact completion identity: acceptance revision, current Assignment/report and relevant Input revision; current approval predicates shared by lifecycle, status and reply guards |
 | `src/core/replies.ts` | `Replies`: the Engine's Channel writes |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
@@ -346,6 +347,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/web-attachments.ts` | Authorized immutable owner image uploads and source attachment references with visual reads |
 | `src/app/worker-progress.ts` | Persisted randomized 5–15 minute progress reminders, stage-report resets and lifecycle guards |
 | `src/app/memory.ts` | Main-Session long-term memory: bounded topic index, paginated disclosure, immutable versions, revision checks and archival |
+| `src/app/memory-retrieval.ts` | Scope-aware ranking, effective dates and Unicode/Chinese query terms over metadata and lazily indexed content |
+| `src/app/memory-sources.ts` | Structured/legacy source parsing, quoted provenance and host-backed source resolution |
+| `src/app/memory-experience.ts` | Durable, bounded extraction of reusable inferred candidates from current accepted evidence, with report identity checks, retry limits and restart recovery |
 | `src/app/session-failures.ts` | Projects durable `turn/start` and `turn/end` events into one recoverable latest failure per managed Session; sanitizes exposed messages |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
@@ -365,9 +369,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/qq-attachment-store.ts` | Stable authorized QQ attachment references, fetch coalescing and cache |
 | `src/app/artifacts.ts` | Immutable ticket-scoped deliverable snapshots and digest verification |
 | `src/app/watchdog.ts` | Bounded task and infrastructure snapshots for an independent external control loop |
+| `src/app/supervision.ts` | Isolated tool-free semantic assessments, durable findings and explicit revision-bound advice; observe is the default, with cooldown, attempt and lifecycle guards on advice |
+| `src/app/verification.ts` | Durable independent result reviews through Effects, source-bound criterion CAS, actual artifact/execution evidence, current-generation ownership and bounded repair notes to the original Worker |
+| `src/app/execution-evidence.ts` | Bounded durable projection of host-observed tool calls/results, bound to Assignment and turn; replays Session events and exposes current execution evidence for review |
+| `src/app/runtime-manifest.ts` | Actual source/build fingerprints, non-secret configuration digest, startup/last-good manifests, read-only schema preflight and explicit SQLite-only snapshot export |
 | `src/app/schedules.ts` | Persistent local command schedules, revision guards, coalesced timer occurrences and Runtime-owned cancellation |
 | `src/client/artifacts.tsx` | Authorized personal-task file downloads with busy state and retryable errors |
 | `src/app/qq-threads.ts` | Persistent QQ reply-to-Thread correlations |
+| `src/app/qq-observation.ts` | Per-group durable observation admission, launch reservations, concurrency/runtime/usage budgets, deduplicated measured usage and paginated audit records |
 | `src/app/web-tasks.ts` | Durable Web task conversations: personal-mode admission, message idempotency, Engine intake, task views and Web channel replies |
 | `src/app/task-rooms.ts` | Owner-visible task-room projections, targeted human input and paginated execution details |
 | `src/app/room-journal.ts` | Transactional indexed room history, report revisions and current/historical membership |
@@ -381,6 +390,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/remote/protocol.ts` | Versioned environment wire types, command payload identities, digest helpers, endpoint validation and bounded redacted output |
+| `src/remote/store.ts` | Daemon SQLite command receipts, payload conflicts, persistent identity, crash-to-unknown recovery, state checks and backup |
+| `src/remote/files.ts` | Task-local byte transfer with path/no-follow checks, size and SHA-256 validation and identical-write replay |
+| `src/remote/daemon.ts` | Independent authenticated HTTP command/file daemon and CLI, single-instance ownership, bounded processes, cancellation and environment checks |
+| `src/remote/client.ts` | Host device registry, ticket binding, durable command intents, original-ID reconnect, offline cancellation, owner resolution and artifact transfer |
+| `src/remote/tools.ts` | Worker-facing operations for the selected device, preserving task identity and host authorization checks |
+| `src/evaluation/ledger.ts` | Transactional replay-safe evaluation events and metrics with explicit unknown values and measurement coverage |
+| `src/evaluation/fixtures.ts` | Versioned fixed event scenarios, task inputs and independently scored expectations |
+| `src/evaluation/provider.ts` | Optional bounded CLI JSON provider adapter with reduced environment, measured usage and sanitized failures |
+| `src/evaluation/runner.ts` | Isolated Engine/SQLite replay across four routing/concurrency modes, actual file/child-process tasks, independent checks and retained evidence |
+| `src/evaluation/index.ts` | Built evaluation entry and CLI exports consumed by the standalone evaluation launcher |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -435,6 +455,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/deployment.tsx` | The Deployment settings, also shown in DeepSeek Harness's Plugin Manager |
 | `src/client/draft.tsx` | Settings drafts: `draftReducer`, their states and their merge with a newer saved revision, `saveBarText`, the save bar's line, and the save bar |
 | `src/client/controls.tsx` | Local copies of DeepSeek Harness's controls, which follow its markup, keyboard behaviour and design tokens, since the bundle does not import `@deepseek-ai/dsh-client-ui-primitives`; they read no context |
+| `src/client/verification.tsx`, `verification.css` | Acceptance badges, lazy current/history evidence, explicit re-review/resume and independent verification/supervision settings within the existing task controls |
+| `src/client/remote-environments.tsx` | Owner device registration/probe, task binding, command history/cancellation and evidence-bound unknown-result resolution in the existing panel |
 | `src/client/widgets.tsx` | The small components the pages share, which read the panel's context: sections, page heads, load states, times, links, confirmed actions, the setup check and Markdown |
 | `src/client/rows.tsx` | The rows the pages share: a Ticket, a Thread and a Decision, a Thread's chip, and the folding of runs of automated messages |
 | `src/client/markdown.ts` | The Markdown subset of reports and questions, and the bare addresses in messages, as blocks and inline parts |
@@ -446,6 +468,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
 
 The personal assistant stores structured records in the same transactional SQLite database as Tickets. `PersonalCoordinator` validates owner Triggers, keeps inferred facts pending confirmation, and supplies workers with effective context linked to their owner Ticket. Authorizations bind an exact action request hash; `PersonalRuntime` rechecks grants and Tickets at Outbox delivery and reconciles replies and reminders from durable receipts. Owner settings and record changes use revision compare-and-swap. Forgetting a fact removes its content from history while retaining a minimal tombstone.
+
+The autonomy additions are composed by the same Runtime, Engine, Store and Effects. Runtime supplies independent supervision and result verification with a separate tool-free model request and host-observed evidence. Observe-mode verification stores its own history without waking the Router; enforce-mode verification gates completion and final result delivery on the current passing proof. A human correction, Assignment/report change or later review generation invalidates earlier authority to publish. Outbox rechecks the saved completion/proof identity immediately before sending.
+
+QQ observation enters the existing Thread/Eval/Policy flow as inferred input. Runtime connects its durable reservations and usage to the Executor launch guard and recoverable task holds. Explicit Web task actions use the same Engine authorization and stop/input semantics. Remote binding selects the existing Worker's execution tools; model calls and task state remain on the host. Unknown remote outcomes retain their original command identity and await an owner conclusion. Evaluation measures these paths through an isolated runtime and a best-effort production event ledger; fixture routing and provider results carry distinct provenance.
+
+Task rooms, Worker details, execution history, directed input, the Router toggle and stop controls remain available. Verification and remote-environment panels add evidence and explicit owner controls to those surfaces.
 
 ## Tests
 
@@ -464,10 +492,22 @@ The personal assistant stores structured records in the same transactional SQLit
 | `tests/qq-media.spec.ts` | Image input capability and real FFmpeg frame extraction with media limits |
 | `tests/artifacts.spec.ts` | Artifact snapshots, ticket isolation, path containment and integrity |
 | `tests/watchdog.spec.ts` | Independent process monitoring, assessor input, quiet reports and bounded recovery |
+| `tests/supervision.spec.ts` | Redacted semantic snapshots, current revision/generation checks, restart-safe advice, bounded intervention, protected waits and isolated tool-free model failures |
+| `tests/watchdog-model.spec.ts` | Bundled semantic model routes and an independent external Watchdog CLI process, explicit advice and unknown outcomes |
+| `tests/verification.spec.ts` | Exact result/criteria/input/generation ownership, actual artifact checks, unknown failures, observation lifecycle, bounded corrections and review races |
+| `tests/execution-evidence.spec.ts` | Host-observed execution evidence, Assignment/turn ownership and stale-event protection |
+| `tests/runtime-manifest.spec.ts` | Package/source/chunk fingerprints, redacted manifests, last-good revisions, read-only schema checks, SQLite-only export and independent preflight CLI |
+| `tests/autonomy-integration.spec.ts` | Actual Runtime wiring for enforce/observe review, input/CAS invalidation, QQ usage/holds, structured HTTP operations, memory corrections and execution revocation/recovery |
+| `tests/autonomy-runtime.spec.ts` | Runtime owner APIs, real remote daemon/tool binding, offline cancellation, evidence-bound unknown resolution, memory corrections, measured feedback and reviewer fault isolation |
+| `tests/autonomy-evaluation.spec.ts` | Durable metric semantics, fixed and provider event paths, actual output checks, restart/side-effect identity, external waits and four-mode reports |
+| `tests/remote-environments.spec.ts` | Real HTTP/daemon processes, command replay/conflicts, reconnect, cancellation, crash/unknown resolution, byte transfer, digest/path checks and endpoint self-check/backup |
+| `tests/panel-remote-environments.spec.tsx` | Device controls, binding, command state/cancellation, owner outcome confirmation and recoverable panel errors |
+| `tests/panel-verification.spec.tsx` | Current and observed review projections, lazy evidence/history, accessible status, stable retry IDs, re-review/resume and isolated settings errors |
 | `tests/schedules.spec.ts` | Scheduled command validation, persistence, serial execution, timeout, pause, restart and stale-result isolation |
 | `tests/panel-schedules.spec.tsx` | Scheduled-command creation, edits, revision conflicts, execution controls and confirmed deletion |
 | `tests/panel-artifacts.spec.tsx` | Web download authorization header, filename, busy state and refusal feedback |
 | `tests/qq-threads.spec.ts` | Persisted QQ reply-to-Thread correlations |
+| `tests/qq-observation.spec.ts` | SQLite-backed group budgets/reservations, restart, call deduplication, unknown usage, reset periods and runtime hold recommendations |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
@@ -492,6 +532,8 @@ The personal assistant stores structured records in the same transactional SQLit
 | `tests/collaboration-messages.spec.ts` | Cross-room multi-member dispatch, Router-only coordination, scoped history and authorized immutable image uploads |
 | `tests/worker-progress.spec.ts` | Random reminder intervals, report resets, restart recovery, capacity, pause and terminal-state guards |
 | `tests/memory.spec.ts` | Durable memory restoration, bounded index, version conflicts, archival, pagination and input validation |
+| `tests/memory-reliability.spec.ts` | Chinese/content/scope recall, source resolution, validity/candidate/supersession rules and one-time correction delivery across real SQLite/process restart |
+| `tests/memory-experience.spec.ts` | Durable candidate extraction Effects, bounded retries, report/evidence identity, pause/stop/correction races and quiet no-value outcomes across restart |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
@@ -536,11 +578,11 @@ The personal assistant stores structured records in the same transactional SQLit
 | `tests/workspace-sidebar.spec.tsx`, `sidebar-model.spec.ts` | Native sidebar preservation, switching, navigation, DOM lifecycle, task grouping, path identity and worker descendants |
 | `tests/panel-composer.spec.tsx` | Task creation drafts across navigation, successful draft cleanup, starters and keyboard input composition |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `session.ts`, the model and paged durable persistence fixtures; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `session.ts`, the model and paged durable persistence fixtures; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`. `memory-evaluation.ts` contains fixed scoped/Chinese/expiry recall expectations; `memory-restart-child.ts` exercises correction delivery through a real process crash/restart.
 
 ## Persistence
 
-One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
+Application state lives in `<stateDir>/orchestrator.sqlite`. The Store owns application writes; runtime preflight and snapshot export open read-only SQLite connections. A remote environment daemon keeps its own command database alongside its endpoint control data.
 
 | Table | Holds | Written by |
 | --- | --- | --- |
@@ -577,7 +619,7 @@ Read caches use bounded in-memory `TextCache` instances and are lost on restart.
 
 Nothing deletes old records yet, so these grow without bound: the `trigger`, `disposition` and `decision` rows; ended Tickets and their Threads; the outbox's receipts; and in `kv`, every saved settings revision and prompt version, the prompt revisions each Session worked under, and the Sources' records per Thread and per Issue or pull request.
 
-`SCHEMA_VERSION` only increases. A database of a newer version refuses to start. The Store creates current personal tables transactionally and keeps the schema 10 migration step limited to databases that predate schema 11.
+`SCHEMA_VERSION` only increases. A database of a newer version refuses to start. The Store creates current personal tables transactionally and keeps the schema 10 migration step limited to databases that predate schema 11. Current schema 13 is a downgrade barrier for enforced verification, task holds and remote execution metadata; schema 12 advances transactionally with existing JSON values preserved. Rollback pairs the earlier binary with its earlier state backup.
 
 ## Model-facing interfaces
 

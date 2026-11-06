@@ -6,6 +6,7 @@ import type { ChannelRef, Ticket, TicketOutcome, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
 import { ticketStage } from './stage.ts'
+import { completionApproved, completionKey, currentVerification } from './verification.ts'
 
 /**
  * A message for a Channel, by purpose: an Executor's acknowledgement of a person's request it works on, the answer to a
@@ -22,6 +23,9 @@ type StoredReport = NonNullable<Ticket['assignments'][number]['report']>
 interface SnapshotReport { state: StoredReport['state']; at: string; summary: string; chars: number; read: string }
 /** Read-only facts available to the Router when it replies to a person's status question. */
 export interface TicketStatusSnapshot {
+  acceptance?: { mode: 'observe' | 'enforce'; revision: number }
+  verification?: { state: string; summary: string; read: string }
+  hold?: Ticket['hold']
   ticket_id: string
   title: string
   stage: ReturnType<typeof ticketStage>
@@ -102,7 +106,7 @@ export class Replies extends EnginePart {
       const outcome = ticket && ticketOutcome(ticket)
       const reported = !!ticket && liveTicket(ticket) && latestAssignment(ticket)?.report?.state === 'ready'
       const ready = outcome === 'merged' || outcome === 'completed' || outcome === 'dropped' || reported
-      if (!ticket || !ready) throw new UserError('notReady')
+      if (!ticket || !ready || !completionApproved(ticket)) throw new UserError('notReady')
     }
     const attention = request.purpose === 'attention' ? ticket?.attention : undefined
     // Attention replies must match the ticket's currently open question text.
@@ -113,9 +117,11 @@ export class Replies extends EnginePart {
     if (artifacts.length && (request.purpose !== 'result' || !ticket || artifacts.some(id => !reported.includes(id)))) {
       throw new Error('Choose only artifacts in this ticket\'s ready report for a result reply')
     }
+    const proof = request.purpose === 'result' && ticket?.acceptance?.mode === 'enforce' ? completionKey(ticket) : undefined
+    const proofId = proof ? [proof] : []
     const id = attention ? key('attention-reply', attention.id) : artifacts.length
-      ? key('reply', trigger?.id ?? ticket?.id ?? '', request.text, ...artifacts)
-      : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
+      ? key('reply', trigger?.id ?? ticket?.id ?? '', request.text, ...artifacts, ...proofId)
+      : key('reply', trigger?.id ?? ticket?.id ?? '', request.text, ...proofId)
     const existing = this.options.outbox.status(id)
     const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')
@@ -123,6 +129,7 @@ export class Replies extends EnginePart {
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
     if (!channel) throw new UserError('noChannel')
     this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {},
+      ...ticket?.acceptance ? { purpose: request.purpose as 'answer' | 'result' | 'attention' } : {}, ...proof ? { completionKey: proof } : {},
       ...artifacts.length ? { artifacts } : {} })
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
@@ -158,6 +165,10 @@ export class Replies extends EnginePart {
       title: ticket.title,
       stage: ticketStage(ticket),
       updated_at: ticket.updatedAt,
+      ...ticket.acceptance ? { acceptance: { mode: ticket.acceptance.mode, revision: ticket.acceptance.revision } } : {},
+      ...currentVerification(ticket) ? { verification: { state: currentVerification(ticket)!.state,
+        summary: currentVerification(ticket)!.summary.slice(0, 600), read: `ticket/${ticket.id}/verification` } } : {},
+      ...ticket.hold ? { hold: ticket.hold } : {},
       ...(ticket.ended ? { outcome: ticket.ended.outcome } : {}),
       ...(assignment ? { assignment: { id: assignment.id, state: assignment.state,
         ...(assignment.startedAt ? { started_at: assignment.startedAt } : {}),

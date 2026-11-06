@@ -14,6 +14,7 @@ import { QqAttachmentStore } from './qq-attachment-store.ts'
 import { readQqMedia } from '../sources/qq-media.ts'
 import type { ArtifactRegistry } from './artifacts.ts'
 import type { Store } from './store.ts'
+import { QqObservationBudget } from './qq-observation.ts'
 
 const qqId = z.string().trim().regex(/^[1-9]\d{3,19}$/, '有效的 QQ 号或群号')
 const websocketUrl = z.string().trim().refine(value => {
@@ -26,13 +27,24 @@ export const QqConfigSchema = z.object({
   path: z.string().regex(/^\/[A-Za-z0-9/_-]*$/).max(160).default('/onebot/v11/ws'),
   tokenRef: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('DSH_SUPERAGENT_QQ_TOKEN'),
   privateMessages: z.boolean().default(false),
-  groups: z.array(z.object({ id: qqId, name: z.string().trim().max(100).optional() }).strict()).max(100)
+  groups: z.array(z.object({ id: qqId, name: z.string().trim().max(100).optional(), listen: z.enum(['requests', 'observe']).default('requests') }).strict()).max(100)
     .refine(groups => new Set(groups.map(group => group.id)).size === groups.length, '群号重复').default([]),
   commandPrefix: z.string().trim().min(1).max(30).default('/agent'),
   sessionMinutes: z.number().int().min(1).max(1440).default(30), groupFollowups: z.enum(['reply', 'sender-window']).default('reply'),
   privateFollowups: z.enum(['semantic', 'sender-window']).default('semantic'),
   replyChunkSize: z.number().int().min(200).max(4000).default(1800), maxReplyChunks: z.number().int().min(1).max(50).default(20),
   requestTimeoutMs: z.number().int().min(1000).max(60000).default(15000),
+  observation: z.object({
+    windowMinutes: z.number().int().min(1).max(30).default(5),
+    maxCandidatesPerHour: z.number().int().min(1).max(1000).default(30),
+    maxInputCharsPerHour: z.number().int().min(100).max(1_000_000).default(60000),
+    maxActiveTasks: z.number().int().min(1).max(20).default(1),
+    maxTaskMinutes: z.number().int().min(1).max(1440).default(30),
+    maxModelCallsPerDay: z.number().int().min(1).max(10000).default(200),
+    maxTokensPerDay: z.number().int().min(100).max(100_000_000).default(200000),
+    maxCostPerDay: z.number().positive().max(1_000_000).optional(),
+  }).strict().default(() => ({ windowMinutes: 5, maxCandidatesPerHour: 30, maxInputCharsPerHour: 60000,
+    maxActiveTasks: 1, maxTaskMinutes: 30, maxModelCallsPerDay: 200, maxTokensPerDay: 200000 })),
 }).strict()
 export type QqConfig = z.infer<typeof QqConfigSchema>
 export interface QqStatus {
@@ -87,7 +99,11 @@ export class QqBridge {
   private selfId?: string
   private downloads = new AbortController()
   readonly attachments: QqAttachmentStore
+  readonly observations: QqObservationBudget
   constructor(private readonly host: QqHost) {
+    this.observations = new QqObservationBudget({ store: host.store, limits: () => this.config().observation,
+      allowed: groupId => this.enabled() && this.host.configured() && this.config().groups.find(group => group.id === groupId)?.listen === 'observe'
+        && this.host.store.settings().eval.mode !== 'off' })
     this.attachments = new QqAttachmentStore({ store: host.store, stateDir: host.stateDir, signal: () => this.downloads.signal,
       allowed: trigger => trigger.source === 'qq' && !!trigger.channel && this.canSend(trigger.channel.address)
         && (!this.selfId || trigger.meta.selfId === this.selfId),
@@ -238,17 +254,23 @@ export class QqBridge {
     }
     if (!text || text.length > 16000) return
     const addressed = message.messageType === 'private' || message.mentions.includes(message.selfId) || prefixed || forceNew
+    const observing = message.messageType === 'group' && config.groups.find(group => group.id === message.groupId)?.listen === 'observe'
     const resolved = this.threads.resolve(message, { sessionMinutes: config.sessionMinutes, groupFollowups: config.groupFollowups,
-      privateFollowups: config.privateFollowups, forceNew, addressed })
+      privateFollowups: config.privateFollowups, forceNew, addressed,
+      ...observing ? { observationWindowMinutes: config.observation.windowMinutes } : {} })
     if (!resolved) return
+    const observation = observing && !addressed && (!resolved.replyKnown || resolved.threadId.startsWith('o:'))
+    if (observation && !this.observations.admit(chat, eventId, text.length).allowed) return 'filtered'
     const channel = { source: 'qq', thread: `qq:${resolved.threadId}`, address: { self_id: message.selfId, message_type: message.messageType,
       recipient_id: chat, user_id: message.userId, message_id: message.id, thread_id: resolved.threadId } }
     const trigger: Trigger = { id: eventId, source: 'qq', threads: [{ source: 'qq', id: resolved.threadId }],
       actor: { source: 'qq', id: message.userId }, human: true, routing: 'router',
-      ...message.messageType === 'private' ? { addressed: 'direct' as const } : addressed || resolved.replyKnown ? { addressed: 'mention' as const } : {},
+      ...message.messageType === 'private' ? { addressed: 'direct' as const } : addressed || resolved.replyKnown && !observation ? { addressed: 'mention' as const } : {},
       at: message.at, text, channel, meta: { selfId: message.selfId, userId: message.userId, groupId: message.groupId,
         messageType: message.messageType, messageId: message.id, threadId: resolved.threadId, replyTo: message.replyTo,
-        senderName: message.senderName, attachments: message.attachments } }
+        senderName: message.senderName, attachments: message.attachments,
+        ...observation ? { observation: { groupId: chat, windowId: resolved.threadId },
+          routingInstruction: 'Unaddressed QQ observation; no Worker has received this message. In auto mode, attach relevant context to an existing authorized ticket instead of creating duplicate work. In observe mode, record the assessment only; do not attach or dispatch. Keep background attempts silent and deliver useful results only. Preserve the original discussion and current policy.' } : {} } }
     const attachments = this.attachments.references(trigger)
     if (attachments.length) trigger.attachments = attachments
     if (!forceNew && !resolved.replyKnown) {
@@ -334,11 +356,18 @@ export class QqBridge {
           const result = await this.attachments.read(trigger, id, signal)
           return agent && (result.type === 'image' || result.type === 'video') ? readQqMedia(agent, result, signal) : result
         } },
-      scope: ({ meta }, config) => (meta.messageType === 'private' ? config.privateMessages : config.groups.some(group => group.id === meta.groupId))
-        ? { listened: true, observed: false } : { listened: false, reason: 'source_disabled' },
+      scope: ({ meta }, config) => {
+        if (meta.messageType === 'private') return config.privateMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'source_disabled' }
+        const group = config.groups.find(group => group.id === meta.groupId)
+        return group ? { listened: true, observed: group.listen === 'observe', row: group.id } : { listened: false, reason: 'source_disabled' }
+      },
       channel: { artifacts: true, allowed: address => this.canSend(address), send: (_host, message) => this.send(message), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },
       policy: { schema: SourcePolicySchema, fields: [{ key: 'allowed', type: 'rows', label: { zh: '允许交办任务的 QQ 账号', en: 'Allowed QQ senders' },
         columns: [{ key: 'id', type: 'text', pattern: '[1-9][0-9]{3,19}', label: { zh: 'QQ 号', en: 'QQ ID' } }, { key: 'name', type: 'text', optional: true, label: { zh: '名称', en: 'Name' } }] }],
+        rows: value => QqConfigSchema.parse(value).groups.map(group => ({ id: group.id, label: group.name ?? `QQ ${group.id}`,
+          note: group.listen === 'observe' ? { zh: '接收已授权账号的群内讨论，沿用 observe/auto 策略和观察预算。', en: 'Observe authorized senders with observe/auto policy and budgets.' }
+            : { zh: '接收明确交办与已知任务回复。', en: 'Receive addressed requests and known task replies.' },
+          cells: { listedUnaddressed: group.listen === 'observe', unlistedAddressed: false, unlistedUnaddressed: false } })),
         explicit: { zh: '已授权的私聊、群内 @ 机器人、命令前缀和引用已知任务消息可直接交办。', en: 'Authorized private messages, mentions, command prefixes and quoted task replies are direct requests.' } },
       threadContext: { messageId: trigger => String(trigger.meta.messageId), read: async (_commands, trigger, part, cursor) =>
         this.threads.context(String(trigger.meta.threadId), part, cursor, typeof trigger.meta.replyTo === 'string' ? trigger.meta.replyTo : undefined) },
@@ -357,7 +386,10 @@ function qqFields(): FieldSpec[] {
     { key: 'url', type: 'text', label: label('OneBot WebSocket 地址', 'OneBot WebSocket URL'), hint: label('正向模式使用，例如 ws://127.0.0.1:3001；同一 Docker 网络可用 ws://snowluma:3001/。', 'For forward mode, for example ws://127.0.0.1:3001; use ws://snowluma:3001/ on the same Docker network.') },
     { key: 'privateMessages', type: 'switch', label: label('接收已授权账号的私聊', 'Receive authorized private messages') },
     { key: 'groups', type: 'rows', label: label('接收的 QQ 群', 'Allowed groups'), hint: label('空列表接收 0 个群，群内发送者另需账号授权。', 'An empty list receives no groups; senders also need authorization.'), columns: [
-      { key: 'id', type: 'text', label: label('群号', 'Group ID'), pattern: '[1-9][0-9]{3,19}' }, { key: 'name', type: 'text', optional: true, label: label('名称', 'Name') }] },
+      { key: 'id', type: 'text', label: label('群号', 'Group ID'), pattern: '[1-9][0-9]{3,19}' }, { key: 'name', type: 'text', optional: true, label: label('名称', 'Name') },
+      { key: 'listen', type: 'select', label: label('接收范围', 'Listen scope'), options: [
+        { value: 'requests', label: label('交办与任务回复', 'Requests and task replies') },
+        { value: 'observe', label: label('观察群内讨论', 'Observe group discussion') }] }] },
     { key: 'commandPrefix', type: 'text', label: label('交办命令前缀', 'Command prefix') },
     { key: 'groupFollowups', type: 'select', label: label('群聊追问关联', 'Group follow-ups'), options: [
       { value: 'reply', label: label('引用回复原消息', 'Quoted replies') }, { value: 'sender-window', label: label('同一发送者的会话窗口', 'Sender session window') }] },

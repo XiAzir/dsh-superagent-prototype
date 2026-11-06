@@ -22,10 +22,13 @@ import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
 import { readLatestTurnEvents } from '../infra/session-history.ts'
 import { SESSION_CONVERSATION_PROMPT, type SessionConversations } from './session-conversations.ts'
-import { MEMORY_GUIDANCE, type Memory } from './memory.ts'
+import { MEMORY_GUIDANCE, type Memory, type MemoryContext } from './memory.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
+  mayExecute?(ticket: Ticket): boolean
+  remoteBinding?(ticketId: string): string | undefined
+  remoteTools?(ticketId: string): Tool[]
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
@@ -37,6 +40,7 @@ export interface SessionsHost {
   readonly lifetime: AbortSignal
   readonly conversations?: SessionConversations
   readonly memory?: Pick<Memory, 'index'>
+  memoryContext?(): MemoryContext
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
@@ -48,7 +52,7 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; roleModel?: RoleModelBinding; subagent?: true; conversation?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; roleModel?: RoleModelBinding; subagent?: true; conversation?: true; remoteTools?: Set<string> }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -199,6 +203,21 @@ export class Sessions {
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
+  /** Install task-bound remote tools on already loaded workers and their children after an owner binding change. */
+  refreshEnvironmentTools(ticketId: string): void {
+    if (!this.host.remoteBinding?.(ticketId)) return
+    for (const [agent, binding] of this.bindings) {
+      let owner: string | undefined
+      try { owner = this.workerAncestor(agent) } catch { continue }
+      if (owner !== ticketId) continue
+      const register = this.registerTool(agent, binding)
+      for (const tool of this.host.remoteTools?.(ticketId) ?? []) {
+        binding.remoteTools ??= new Set()
+        if (binding.remoteTools.has(tool.name)) continue
+        register(tool.name, tool.description, tool.schema, tool.execute); binding.remoteTools.add(tool.name)
+      }
+    }
+  }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
@@ -297,8 +316,10 @@ export class Sessions {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      const memory = master && host.memory ? `\n<superagent-memory>\n${MEMORY_GUIDANCE}\n${host.memory.index()}\n</superagent-memory>\n` : ''
-      return `[dsh-superagent prompt revision ${version.revision}]\n${memory}${master ? `${SESSION_ROUTING_GUIDANCE}\n` : ''}${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      const memory = master && host.memory ? `\n<superagent-memory>\n${MEMORY_GUIDANCE}\n${host.memory.index(host.memoryContext?.())}\n</superagent-memory>\n` : ''
+      const remote = current && host.remoteBinding?.(current.id)
+      const execution = remote ? `\nExecute this task in its bound environment ${remote} through orchestrator_environment tools. The host task directory stores deliveries only. Start long commands once, keep command_id, then wait for completion events. Query existing IDs after reconnect; preserve unknown outcomes for owner review. Report output files as remote://device/relative-path.\n` : ''
+      return `[dsh-superagent prompt revision ${version.revision}]\n${memory}${master ? `${SESSION_ROUTING_GUIDANCE}\n` : ''}${composed}\n${current ? mandateInstructions(current.mandate) : ''}${execution}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
@@ -312,6 +333,7 @@ export class Sessions {
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
+    if (ticket) this.refreshEnvironmentTools(ticket.id)
     if (master) {
       const parent = scopeParentOf(agent)
       const allow = ['skill'].filter(name => agent.ctx.tools.get(name, parent))
@@ -332,9 +354,15 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(execution => {
+      const name = execution?.name ?? ''
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
+      if (current.hold) return `Task is held: ${current.hold.reason}`
+      if (this.host.mayExecute?.(current) === false) return 'Current task authority changed; execution is paused for owner review.'
+      if (this.host.remoteBinding?.(ticketId) && ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill'].includes(name))
+        return 'This task executes in its bound remote environment; use orchestrator_environment tools.'
+      return undefined
     })]
   }
   /**
@@ -343,14 +371,31 @@ export class Sessions {
    * it is.
    */
   private limitSubagent(agent: Agent): void {
-    let parent = agent.session.header.parentSession
-    // Up the subagents' parents to the worker, which are loaded while their subagents run.
-    for (let depth = 0; parent !== undefined && ticketOfSession(parent) === undefined && depth < 8; depth++) {
-      parent = this.ctx.agents.get(parent)?.session.header.parentSession
+    let ticketId: string | undefined
+    try { ticketId = this.workerAncestor(agent) }
+    catch {
+      this.bindings.set(agent, { subagent: true, disposers: [agent.ctx.tools.restrict({ allow: [] }),
+        agent.ctx.tools.guard(() => 'Session ancestry is unresolved; restore its parent before executing task tools.')] })
+      return
     }
-    const ticketId = parent === undefined ? undefined : ticketOfSession(parent)
     if (ticketId === undefined || !this.host.store.tickets.get(ticketId)) return
     this.bindings.set(agent, { disposers: this.workOnly(agent, ticketId), subagent: true })
+    this.refreshEnvironmentTools(ticketId)
+  }
+  /** Follow actual ancestry with cycle detection, including deeply nested workers. */
+  private workerAncestor(agent: Agent): string | undefined {
+    let id: string | undefined = agent.id
+    const visited = new Set<string>()
+    while (id) {
+      if (visited.has(id)) throw new Error('Cyclic session ancestry')
+      visited.add(id)
+      const ticketId = ticketOfSession(id)
+      if (ticketId) return ticketId
+      const current: Agent | undefined = id === agent.id ? agent : this.ctx.agents.get(id as SessionId)
+      if (!current) throw new Error('Missing parent session')
+      id = current.session.header.parentSession
+    }
+    return undefined
   }
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {

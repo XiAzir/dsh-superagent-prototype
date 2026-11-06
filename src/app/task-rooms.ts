@@ -1,7 +1,7 @@
 /** Task-room projections: owner-visible collaboration history, targeted input, and on-demand execution details. */
 import { z } from 'zod'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import { key, latestReport, liveTicket, ticketStage, type Engine, type Thread, type Ticket, type Trigger } from '../core/index.ts'
+import { currentVerification, key, latestReport, liveTicket, ticketStage, type Engine, type Thread, type Ticket, type Trigger } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
@@ -12,6 +12,7 @@ import type { ArtifactRegistry, TaskArtifact } from './artifacts.ts'
 import { record } from '../kv.ts'
 import { WebImageIds, type WebAttachmentStore, type WebImage } from './web-attachments.ts'
 export interface RoomWorker {
+  acceptance?: Ticket['acceptance']; verification?: Ticket['verification']; hold?: Ticket['hold']
   id: string; title: string; stage: string; summary: string; sessionId: string
   active: boolean; subscribed: boolean
 }
@@ -86,6 +87,8 @@ export class TaskRooms {
   }
   private summary(thread: Thread, tickets = this.tickets(thread)): TaskRoomSummary {
     const workers = tickets.map(ticket => ({ id: ticket.id, title: ticket.title, stage: ticketStage(ticket).stage,
+      ...ticket.acceptance ? { acceptance: ticket.acceptance } : {}, ...currentVerification(ticket) ? { verification: currentVerification(ticket) } : {},
+      ...ticket.hold ? { hold: ticket.hold } : {},
       summary: bounded(latestReport(ticket)?.summary ?? '', 600), sessionId: ticket.assignments.some(item => item.startedAt) ? workerSessionId(ticket.id) : '',
       active: liveTicket(ticket), subscribed: thread.subscriptions.includes(ticket.id) }))
     const last = this.host.store.rooms.page(thread.key, 1)[0]?.at ?? ''

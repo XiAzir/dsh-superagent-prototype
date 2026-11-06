@@ -1,11 +1,14 @@
 /** Bounded, owner-visible worker and collaboration projection for the active Superagent conversation. */
-import { latestAssignment, latestReport, ticketStage, type Ticket } from '../core/index.ts'
+import { currentVerification, latestAssignment, latestReport, ticketStage, type Ticket } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { record } from '../kv.ts'
 import type { RoomMessage, RoomWorker, TaskRoomSummary, TaskRooms } from './task-rooms.ts'
 import type { Store } from './store.ts'
 
 export interface WorkerPanelWorker extends RoomWorker {
+  acceptance?: Ticket['acceptance']
+  verification?: Ticket['verification']
+  hold?: Ticket['hold']
   action?: string
   updatedAt: string
   completed: string[]
@@ -40,6 +43,8 @@ const list = (values: string[] | undefined): string[] => (values ?? []).slice(0,
 function workerView(ticket: Ticket, summary: TaskRoomSummary['workers'][number], roomKey: string): WorkerPanelWorker {
   const assignment = latestAssignment(ticket), report = latestReport(ticket), stage = ticketStage(ticket)
   return { ...summary, ...('action' in stage ? { action: stage.action } : {}), updatedAt: report?.at ?? ticket.updatedAt,
+    ...ticket.acceptance ? { acceptance: ticket.acceptance } : {}, ...currentVerification(ticket) ? { verification: currentVerification(ticket) } : {},
+    ...ticket.hold ? { hold: ticket.hold } : {},
     completed: list(report?.completed), pending: list(report?.pending),
     ...(report?.waitingFor ? { waitingFor: short(report.waitingFor.subject, 240) } : {}),
     ...(ticket.attention?.question ? { attention: short(ticket.attention.question, 500) } : {}),

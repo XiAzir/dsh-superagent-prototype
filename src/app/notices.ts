@@ -123,6 +123,7 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
  * @returns The steering `Relay`, or `undefined` when the report is not relayed to the main Session.
  */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
+  if (report.state === 'ready' && ticket.acceptance?.mode === 'enforce' && ticket.verification?.state !== 'passed') return undefined
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,

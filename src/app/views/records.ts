@@ -108,6 +108,7 @@ export function triggerView(view: Snapshot, trigger: Trigger, threadDecisions?: 
 export type TriggerView = ReturnType<typeof triggerView>
 /** Single-line summary of why a ticket in the `person` stage is waiting on human action (omitted once answered and back with the Executor). */
 function ticketNote(ticket: Ticket, stage: TicketStage): { text: string; error: boolean } | undefined {
+  if (ticket.hold) return { text: preview(ticket.hold.reason), error: false }
   if (stage.stage !== 'person') return undefined
   if (stage.action === 'answer' && ticket.attention) return { text: preview(ticket.attention.question), error: false }
   if (stage.action === 'delivery' && ticket.delivery) return { text: preview(ticket.delivery.error), error: true }

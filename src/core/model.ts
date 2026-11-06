@@ -256,7 +256,7 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string; artifacts?: string[] } & StructuredWorkerReport
+  report?: { state: ReportState; summary: string; at: string; artifacts?: string[]; inputRevision?: string } & StructuredWorkerReport
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -309,6 +309,11 @@ export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'sto
 export interface Attention { id: string; question: string; triggerId?: string }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
+  /** A resumable resource/environment pause preserves the original mandate and task history. */
+  hold?: { kind: 'budget' | 'environment' | 'operator'; reason: string; at: string; resumeAt?: string }
+  /** New tickets may opt into independent evidence review; older tickets retain their lifecycle. */
+  acceptance?: import('./verification.ts').AcceptancePlan
+  verification?: import('./verification.ts').CompletionVerification
   id: string
   title: string
   decisionId: string

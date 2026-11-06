@@ -362,7 +362,7 @@ export class Engine {
    * A fact the main Session gives an open ticket's Executor: see `Tickets.note`.
    * @throws UserError when the ticket is unknown or has ended.
    */
-  note(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.note(ticketId, text)) }
+  note(ticketId: string, text: string, requestId?: string): Ticket { return this.repo.atomic(() => this.tickets.note(ticketId, text, requestId)) }
   /**
    * An Executor's hand-back of a message that reached its ticket but asks for more than it: see `Evals.handback`.
    * @returns whether it was queued for Eval: false while another ticket still decides it, and for one this ticket did not decide (see `Evals.handback`).
@@ -384,6 +384,13 @@ export class Engine {
   report(ticketId: string, report: WorkerReport, expectedAssignmentId?: string): Ticket {
     return this.repo.atomic(() => this.assignments.report(ticketId, report, expectedAssignmentId))
   }
+  verify(ticketId: string, review: import('./verification.ts').CompletionVerification): Ticket {
+    return this.repo.atomic(() => this.assignments.verify(ticketId, review))
+  }
+  holdTicket(ticketId: string, input: NonNullable<Ticket['hold']>): Ticket {
+    return this.repo.atomic(() => this.tickets.hold(ticketId, input))
+  }
+  releaseTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.release(ticketId)) }
   /** Schedule a durable check under the ticket's existing Mandate. Worker callers bind it to their current Assignment. */
   scheduleFollowup(ticketId: string, input: ReportNextCheck, expectedAssignmentId?: string): Ticket {
     return this.repo.atomic(() => {

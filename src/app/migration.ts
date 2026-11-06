@@ -17,7 +17,9 @@ import type { SettingsVersion, Store } from './store.ts'
 import { Versions } from './versions.ts'
 import { KV, type Key } from '../kv.ts'
 
-export const SCHEMA_VERSION = 12
+// Schema 13 is the downgrade barrier for enforced verification, task holds and remote execution metadata.
+// Existing schema 12 records already have compatible JSON/SQLite storage and require no destructive rewrite.
+export const SCHEMA_VERSION = 13
 /** The oldest database schema version this build can open and migrate directly. */
 export const OLDEST_SCHEMA = 10
 /** Returns an error message explaining why `version` cannot be opened: older schemas need a new state directory. */

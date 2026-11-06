@@ -24,6 +24,8 @@ export interface QqThreadOptions {
   privateFollowups?: 'semantic' | 'sender-window'
   forceNew?: boolean
   addressed: boolean
+  /** Opt-in unaddressed group observations share only a bounded time window. Native replies retain their root. */
+  observationWindowMinutes?: number
 }
 
 /** Persists QQ message-to-thread links, sender session windows and bounded source context. */
@@ -58,6 +60,10 @@ export class QqThreads {
       if (active && sameChat(active, identity) && active.userId === message.userId && withinWindow(message.at, active.lastAt, options.sessionMinutes)) {
         return { threadId: active.threadId, replyKnown: false }
       }
+    }
+    if (options.observationWindowMinutes && options.observationWindowMinutes > 0) {
+      const window = Math.floor(Date.parse(message.at) / (options.observationWindowMinutes * 60_000))
+      return { threadId: `o:${identity.selfId}:${identity.chatId}:${window}`, replyKnown: false }
     }
     return undefined
   }

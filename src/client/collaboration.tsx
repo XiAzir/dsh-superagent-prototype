@@ -8,6 +8,7 @@ import { MessageComposer, MessageImages } from './message-composer.tsx'
 import { errorText, type T } from './text.ts'
 import { inlines, markdownBlocks } from './markdown.ts'
 import CSS from './worker-panel.css?raw'
+import { TicketVerification, VerificationBadge, VERIFICATION_CSS } from './verification.tsx'
 
 type Message = RoomMessage & { roomKey?: string }
 type ReadingTab = 'progress' | 'conversation' | 'execution'
@@ -44,6 +45,7 @@ function MemberCard({ worker, number, selected, t, onSelect }: { worker: WorkerP
       <span className={`sa-state sa-state-${state}`} title={t(`workerPanel.state.${state}`)}><i aria-hidden="true" /><span>{t(`workerPanel.state.${state}`)}</span></span></span>
     <span className="sa-worker-title" title={worker.title}>{worker.title}</span>
     <span className="sa-worker-summary">{summary.replace(/^#+\s*/gm, '').replace(/\*\*|`/g, '')}</span>
+    <VerificationBadge acceptance={worker.acceptance} verification={worker.verification} t={t} />
     <time dateTime={worker.updatedAt}>{clock(worker.updatedAt, t)}</time>
   </button>
 }
@@ -191,7 +193,7 @@ export function WorkerPanel({ sessionId, call, t, openSession }: { sessionId: st
   const visibleWorkers = workers.filter(item => `${memberName(t, numberOf(item.id))} ${item.title} ${item.summary}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
   const choose = (id: string) => { setSelected(id); save(`${selectionKey}/member`, id); setNavigationError('') }
   return <aside className="sa-panel" aria-label={t('workerPanel.title')}>
-    <style>{CSS}</style><header className="sa-panel-head"><div><span className="sa-eyebrow">SUPERAGENT</span><h2>{t('workerPanel.title')}</h2></div>
+    <style>{CSS}{VERIFICATION_CSS}</style><header className="sa-panel-head"><div><span className="sa-eyebrow">SUPERAGENT</span><h2>{t('workerPanel.title')}</h2></div>
       <button type="button" className="sa-icon-button" aria-label={t('workerPanel.refresh')} title={t('workerPanel.refresh')} onClick={() => { void reload() }}><Icon name="refresh" size={16} /></button></header>
     {error && <div className="sa-panel-warning" role="alert">{error.message}<button onClick={() => { void reload() }}>{t('retry')}</button></div>}
     {!data && !error && <p className="sa-empty">{t('loading')}</p>}
@@ -211,6 +213,8 @@ export function WorkerPanel({ sessionId, call, t, openSession }: { sessionId: st
           {worker?.sessionId && <button className="sa-icon-button" type="button" title={copy(t, '打开完整会话', 'Open full session')} aria-label={t('workerPanel.openWorker', { number: numberOf(worker.id) })} onClick={() => { void openSession(worker.sessionId).catch(failure => setNavigationError(errorText(failure))) }}><Icon name="external" size={15} /></button>}</header>
         {navigationError && <p className="sa-panel-warning" role="alert">{navigationError}</p>}
         {worker?.attention && <div className="sa-attention-banner"><Icon name="ask" size={15} /><span>{worker.attention}</span></div>}
+        {worker && <TicketVerification key={`verification-${worker.id}`} id={worker.id} acceptance={worker.acceptance} verification={worker.verification}
+          hold={worker.hold} call={call} t={t} onChanged={reload} />}
         <MemberReading key={scope} worker={worker} initial={data.messages.filter(message => !worker || message.ticketId === worker.id || message.actor.ticketId === worker.id || message.recipient === worker.id)}
           call={call} t={t} numberOf={numberOf} readingKey={`${selectionKey}/${scope}`} />
       </section></div>

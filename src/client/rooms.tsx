@@ -10,6 +10,8 @@ import { Hint, LoadState, MarkdownLite, PageHead, Section, SessionButton } from 
 import { useSessionDraft } from './session-draft.ts'
 import { roomStatus, roomTitle, sourceLabel } from './task-ui.ts'
 import { MessageComposer, MessageImages } from './message-composer.tsx'
+import { TicketVerification, VerificationBadge } from './verification.tsx'
+import { TaskEnvironment, TaskFeedback } from './remote-environments.tsx'
 
 const PAGE = 50
 const shortWorkerId = (id: string, workers: TaskRoomView['workers']) => {
@@ -98,7 +100,7 @@ function ActivityItem({ item }: { item: RoomActivity['items'][number] }) {
 }
 
 function WorkerList({ room }: { room: TaskRoomView }) {
-  const { t } = usePanel()
+  const { t, call } = usePanel()
   const [expanded, setExpanded] = useState<string[]>([])
   return <Section title={t('room.workers')} count={room.workers.length}>
     {!room.workers.length ? <Hint>{t('room.noWorkers')}</Hint> : <ul className="dt-room-workers">{room.workers.map(worker => {
@@ -111,11 +113,14 @@ function WorkerList({ room }: { room: TaskRoomView }) {
               <Tag tone={worker.subscribed ? 'info' : 'neutral'}>{t(worker.subscribed ? 'room.subscribed' : 'room.unsubscribed')}</Tag>
             </div>
             {worker.summary && <MarkdownLite text={worker.summary} />}
+            <VerificationBadge acceptance={worker.acceptance} verification={worker.verification} t={t} />
           </div>
           <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setExpanded(current => open
             ? current.filter(id => id !== worker.id) : [...current, worker.id])}>{t(open ? 'room.hideActivity' : 'room.showActivity')}</Button>
         </div>
         {worker.sessionId && <SessionButton sessionId={worker.sessionId} label={t('lang') === 'zh' ? '打开完整执行会话' : 'Open full execution chat'} />}
+        <TaskEnvironment id={worker.id} call={call} t={t} />
+        <TaskFeedback id={worker.id} call={call} t={t} />
         {open && <Activity key={worker.id} room={room.key} workerId={worker.id} />}
       </li>
     })}</ul>}
@@ -181,7 +186,7 @@ function Composer({ room, onSent }: { room: TaskRoomView; onSent: () => void }) 
 }
 
 function Room({ id }: { id: string }) {
-  const { t, navigate } = usePanel()
+  const { t, navigate, call } = usePanel()
   const chinese = t('lang') === 'zh'
   const copy = (zh: string, en: string) => chinese ? zh : en
   const { data, error, reload, loadEarlier } = useRoom(id)
@@ -229,6 +234,8 @@ function Room({ id }: { id: string }) {
         : copy('任务动态会集中显示在这里，继续发送消息即可补充要求。', 'Updates will appear here. Send a message to add requirements.')}</p>}
       {!!artifacts.length && <div className="sa-brief-artifacts">{artifacts.map(artifact => <ArtifactDownload key={artifact.id} room={data.key} artifact={artifact} />)}</div>}
     </section>
+    {data.workers.map(worker => <TicketVerification key={worker.id} id={worker.id} taskTitle={worker.title}
+      acceptance={worker.acceptance} verification={worker.verification} hold={worker.hold} call={call} t={t} onChanged={reload} />)}
     <div className="sa-detail-tabs" role="tablist" aria-label={copy('任务详情', 'Task details')} onKeyDown={event => {
       const tabs = ['conversation', 'collaboration', 'artifacts', 'execution'] as const
       if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return

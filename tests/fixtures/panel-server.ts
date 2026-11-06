@@ -28,7 +28,7 @@ import { QqConfigSchema } from '../../src/app/qq-source.ts'
 import { testDeployment } from './deployment.ts'
 import { key } from '../../src/core/ids.ts'
 import { RoomMessageRequest } from '../../src/app/task-rooms.ts'
-import { WebMessageRequest } from '../../src/app/web-tasks.ts'
+import { WebMessageRequest, WebTaskActionRequest } from '../../src/app/web-tasks.ts'
 
 export const MEMBER = 'ou_alice'
 const ALLOWED: Record<string, { id: string; name?: string }[]> = { feishu: [{ id: MEMBER, name: 'Alice' }], github: [{ id: 'alice' }] }
@@ -148,6 +148,25 @@ export interface PanelServer {
   qqTokenError?: string
   personal: PersonalDashboard
   personalRecords: { [K in PersonalKind]: PersonalRecordMap[K][] }
+  verificationConfig: ApiResponse<'GET verification/config'>
+  verificationViews: Record<string, ApiResponse<'GET tickets/:id/verification'>>
+  verificationRequests: Record<string, string>
+  verificationError?: string
+  verificationRequestError?: string
+  verificationConfigError?: string
+  supervisionConfig: ApiResponse<'GET watchdog/config'>
+  supervisionReviews: ApiResponse<'GET watchdog/reviews'>
+  supervisionError?: string
+  qqObservations: ApiResponse<'GET qq/observations'>
+  environments: ApiResponse<'GET environments'>
+  environmentRegistrations: Api['POST environments']['body'][]
+  environmentViews: Record<string, ApiResponse<'GET tickets/:id/environment'>>
+  environmentProbeErrors: Record<string, string>
+  environmentBindError?: string
+  environmentResolveError?: string
+  evaluationSummary: ApiResponse<'GET evaluation/summary'>
+  feedbackRecords: { ticketId: string; body: Api['POST tickets/:id/feedback']['body'] }[]
+  feedbackError?: string
 }
 export let server: PanelServer
 
@@ -288,6 +307,16 @@ function initial(): PanelServer {
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
     health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
+    verificationConfig: { mode: 'observe', maxRepairs: 2 }, verificationViews: {}, verificationRequests: {},
+    supervisionConfig: { mode: 'observe' }, supervisionReviews: [], qqObservations: { items: [], nextOffset: null },
+    environments: { items: [] }, environmentRegistrations: [], environmentViews: {}, environmentProbeErrors: {}, feedbackRecords: [],
+    evaluationSummary: { runId: 'runtime', events: 0, counts: { request: 0, route: 0, usage: 0, completion: 0, verification: 0,
+      intervention: 0, adoption: 0, recovery: 0, side_effect: 0 }, metrics: { routerDecisions: 0, wrongRoutes: null, falseCompletions: null,
+      preventedFalseCompletions: 0, duplicateSideEffects: null, unexpectedSideEffects: null, humanInterventions: 0, routingCorrections: 0,
+      adoptionRate: null, tokens: null, cost: null, completionLatencyMs: { count: 0, p50: null, p95: null },
+      responseLatencyMs: { count: 0, p50: null, p95: null }, recoveryLatencyMs: { count: 0, p50: null, p95: null } },
+      knownUsage: { tokens: 0, cost: 0, calls: 0, unknownTokens: 0, unknownCost: 0 },
+      coverage: { routeJudgments: 0, completionJudgments: 0, sideEffectChecks: 0, adoptionJudgments: 0, interventionEvents: 0 } },
     models: { default: { provider: 'host', model: 'default' }, routableProviders: ['worker-provider'], failures: [],
       groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
         reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] },
@@ -363,7 +392,7 @@ function initial(): PanelServer {
 }
 
 /** A refusal response carrying the host's HTTP status code and JSON error body. Returned by route handlers when a request is rejected. */
-class Refusal { constructor(readonly status: 400 | 404 | 409 | 500, readonly body: Record<string, unknown>) {} }
+class Refusal { constructor(readonly status: 400 | 404 | 409 | 500 | 503, readonly body: Record<string, unknown>) {} }
 const refuse = (status: Refusal['status'], error: string, more: Record<string, unknown> = {}) => new Refusal(status, { error, ...more })
 type Query<K extends keyof Api> = Api[K] extends { query?: infer Q } ? keyof NonNullable<Q> & string : never
 type Body<K extends keyof Api> = Api[K] extends { body: infer B } ? B : undefined
@@ -376,8 +405,140 @@ const page = <T>(items: T[], offset = 0, limit = 50) => ({ items: items.slice(of
 const ticketOf = (id: string) =>
   [...server.tickets.open, ...server.person, ...server.tickets.ended].find(ticket => ticket.id === id) ?? server.ticketDetails[id]
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
+const verificationView = (id: string): ApiResponse<'GET tickets/:id/verification'> => {
+  const view = server.verificationViews[id]
+  if (view) return view
+  const ticket = server.ticketDetails[id] ?? Object.values(server.rooms.views).flatMap(room => room.workers).find(worker => worker.id === id)
+  return { acceptance: ticket?.acceptance ?? null, verification: ticket?.verification ?? null, history: [] }
+}
+const environmentView = (id: string): ApiResponse<'GET tickets/:id/environment'> => server.environmentViews[id] ?? { deviceId: null, commands: [] }
+const operationResult = (command: ApiResponse<'GET tickets/:id/environment'>['commands'][number]): ApiResponse<'POST tickets/:id/environment/commands/:commandId/resolve'> => ({
+  deviceId: command.deviceId, ticketId: command.ticketId, commandId: command.commandId, state: command.ownerResolution?.outcome ?? command.state,
+  updatedAt: command.updatedAt, remote: command.remote, ownerResolution: command.ownerResolution, cancelRequested: command.cancelRequested,
+})
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET environments': { answer: () => server.environments },
+  'POST environments': { body: true, answer: ({ body }) => {
+    const input = z.object({ id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/), label: z.string().min(1).max(100),
+      url: z.string().url(), credentialRef: z.string().min(1).max(500), allowInsecureHttp: z.boolean().optional() }).strict().parse(body)
+    server.environmentRegistrations.push(input)
+    const { credentialRef: _credential, allowInsecureHttp: _http, ...device } = input
+    const row = { ...device, status: 'unprobed' as const }
+    const index = server.environments.items.findIndex(item => item.id === row.id)
+    if (index < 0) server.environments.items.push(row); else server.environments.items[index] = row
+    return { registered: true }
+  } },
+  'POST environments/:id/probe': { answer: ({ params }) => {
+    const device = server.environments.items.find(item => item.id === params.id)
+    if (!device) return refuse(404, '执行设备不存在。')
+    const error = server.environmentProbeErrors[params.id]
+    if (error) { device.status = 'offline'; device.error = error; return refuse(503, error) }
+    device.status = 'online'; device.lastSeenAt = new Date().toISOString(); delete device.error
+    return device
+  } },
+  'GET tickets/:id/environment': { answer: ({ params }) => environmentView(params.id) },
+  'PUT tickets/:id/environment': { body: true, answer: ({ params, body }) => {
+    if (server.environmentBindError) return refuse(409, server.environmentBindError)
+    if (!server.environments.items.some(item => item.id === body.deviceId)) return refuse(404, '执行设备不存在。')
+    const previous = environmentView(params.id)
+    server.environmentViews[params.id] = { ...previous, deviceId: body.deviceId }
+    return { deviceId: body.deviceId }
+  } },
+  'POST tickets/:id/environment/commands/:commandId/cancel': { answer: ({ params }) => {
+    const command = environmentView(params.id).commands.find(item => item.commandId === params.commandId)
+    if (!command) return refuse(404, '命令不存在。')
+    command.cancelRequested = true; command.state = 'cancelled'; command.effectiveState = 'cancelled'; command.updatedAt = new Date().toISOString()
+    return operationResult(command)
+  } },
+  'POST tickets/:id/environment/commands/:commandId/resolve': { body: true, answer: ({ params, body }) => {
+    if (server.environmentResolveError) return refuse(409, server.environmentResolveError)
+    const command = environmentView(params.id).commands.find(item => item.commandId === params.commandId)
+    if (!command || command.state !== 'unknown') return refuse(409, '请选择结果待核实的命令。')
+    if (body.expectedUpdatedAt !== undefined && body.expectedUpdatedAt !== command.updatedAt) return refuse(409, '命令状态已变化，请重新核对。')
+    if (!body.evidence.trim()) return refuse(400, '请填写实际观察到的依据。')
+    command.ownerResolution = { outcome: body.outcome, evidence: body.evidence, at: new Date().toISOString() }
+    command.resolutionHistory = [...command.resolutionHistory ?? [], command.ownerResolution]
+    command.effectiveState = body.outcome; command.updatedAt = command.ownerResolution.at
+    return operationResult(command)
+  } },
+  'GET evaluation/summary': { answer: () => server.evaluationSummary },
+  'POST tickets/:id/feedback': { body: true, answer: ({ params, body }) => {
+    if (server.feedbackError) return refuse(503, server.feedbackError)
+    const previous = server.feedbackRecords.find(item => item.ticketId === params.id && item.body.requestId === body.requestId)
+    if (previous && JSON.stringify(previous.body) !== JSON.stringify(body)) return refuse(409, '反馈编号已用于另一份内容。')
+    if (!previous) server.feedbackRecords.push({ ticketId: params.id, body })
+    return { recorded: true }
+  } },
+  'GET verification/config': { answer: () => server.verificationConfigError ? refuse(503, server.verificationConfigError) : server.verificationConfig },
+  'PUT verification/config': { body: true, answer: ({ body }) => {
+    if (server.verificationConfigError) return refuse(503, server.verificationConfigError)
+    server.verificationConfig = z.object({ mode: z.enum(['off', 'observe', 'enforce']), maxRepairs: z.number().int().min(0).max(3) }).strict().parse(body)
+    return server.verificationConfig
+  } },
+  'GET tickets/:id/verification': { answer: ({ params }) => server.verificationError ? refuse(503, server.verificationError) : verificationView(params.id) },
+  'PUT tickets/:id/acceptance': { body: true, answer: ({ params, body }) => {
+    const view = verificationView(params.id)
+    if ((view.acceptance?.revision ?? 0) !== body.expectedRevision) return refuse(409, '验收条件已更新，请刷新。')
+    const acceptance = { revision: body.expectedRevision + 1, mode: server.verificationConfig.mode === 'enforce' ? 'enforce' as const : 'observe' as const,
+      createdAt: new Date().toISOString(), criteria: body.criteria }
+    server.verificationViews[params.id] = { ...view, acceptance }
+    if (server.ticketDetails[params.id]) server.ticketDetails[params.id]!.acceptance = acceptance
+    return { acceptance }
+  } },
+  'POST tickets/:id/verify': { body: true, answer: ({ params, body }) => {
+    if (server.verificationRequestError) return refuse(503, server.verificationRequestError)
+    const view = verificationView(params.id)
+    if (!view.acceptance) return { reviewId: null }
+    const key = `${params.id}:${body.requestId}`, existing = server.verificationRequests[key]
+    if (existing) return { reviewId: existing }
+    const reviewId = `verification-${body.requestId}`
+    server.verificationRequests[key] = reviewId
+    server.verificationViews[params.id] = { ...view, verification: { state: 'pending', reportKey: view.verification?.reportKey ?? `report-${params.id}`,
+      at: new Date().toISOString(), summary: '正在等待独立验收。', checks: [], attempt: (view.verification?.attempt ?? 0) + 1 } }
+    return { reviewId }
+  } },
+  'POST tickets/:id/resume': { answer: ({ params }) => {
+    const ticket = server.ticketDetails[params.id]
+    if (ticket) delete ticket.hold
+    for (const room of Object.values(server.rooms.views)) for (const worker of room.workers) if (worker.id === params.id) delete worker.hold
+    return { resumed: true }
+  } },
+  'GET watchdog/config': { answer: () => server.supervisionError ? refuse(503, server.supervisionError) : server.supervisionConfig },
+  'POST watchdog/config': { body: true, answer: ({ body }) => {
+    if (server.supervisionError) return refuse(503, server.supervisionError)
+    server.supervisionConfig = z.object({ mode: z.enum(['observe', 'advise']) }).strict().parse(body)
+    return server.supervisionConfig
+  } },
+  'GET watchdog/reviews': { query: ['ticketId', 'limit'], answer: ({ query }) => server.supervisionReviews
+    .filter(review => !query.ticketId || Object.hasOwn(review.ticketRevisions, query.ticketId)).slice(0, Number(query.limit ?? 20)) },
+  'GET watchdog/reviews/:id': { answer: ({ params }) => {
+    const review = server.supervisionReviews.find(item => item.id === params.id)
+    return review ? { ...review, input: '' } : refuse(404, '监督记录不存在。')
+  } },
+  'POST watchdog/assess': { body: true, answer: () => {
+    const at = new Date().toISOString(), id = `review-${server.supervisionReviews.length + 1}`
+    const assessment: ApiResponse<'POST watchdog/assess'> = { status: 'unknown', findings: [], semanticReview: 'configured', semanticStatus: 'unknown',
+      reviewId: id, snapshotHash: 'fixture-snapshot', mode: server.supervisionConfig.mode, nudgeTicketIds: [] }
+    server.supervisionReviews.unshift({ id, createdAt: at, completedAt: at, snapshotHash: assessment.snapshotHash, ticketRevisions: {}, state: 'completed', assessment })
+    return assessment
+  } },
+  'POST watchdog/advice': { body: true, answer: ({ body }) => ({ ...body, requested: false, reason: server.supervisionConfig.mode === 'observe' ? 'observe' : 'no-finding' }) },
+  'GET qq/observations': { query: ['groupId', 'offset', 'limit'], answer: ({ query }) => {
+    const rows = server.qqObservations.items.filter(item => !query.groupId || item.groupId === query.groupId)
+    const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50)
+    return { items: rows.slice(offset, offset + limit), nextOffset: offset + limit < rows.length ? offset + limit : null }
+  } },
+  'POST web/tasks/:id/actions': { body: true, answer: ({ params, body }) => {
+    WebTaskActionRequest.parse(body)
+    const task = server.webTasks.records[params.id]
+    if (!task || !task.tickets.some(ticket => ticket.id === body.ticketId)) return refuse(404, '请选择本对话的工单。')
+    if (body.kind === 'supplement' && !task.messages.some(message => message.id === `web-action-${body.requestId}`)) {
+      task.messages.push({ id: `web-action-${body.requestId}`, role: 'user', text: body.text, at: new Date().toISOString() })
+    }
+    if (body.kind === 'stop') task.tickets = task.tickets.map(ticket => ticket.id === body.ticketId ? { ...ticket, stage: 'ended' } : ticket)
+    return { kind: body.kind, ticketId: body.ticketId, task }
+  } },
   'GET sessions/:id/workers': { answer: ({ params }) => ({ sessionId: params.id, eligible: false, scope: null,
     pending: false, paused: false, workers: [], messages: [], rooms: [] }) },
   'POST sessions/:id/collaboration': { body: true, answer: ({ params }) => ({ sessionId: params.id, eligible: true, scope: 'router',
@@ -580,7 +741,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     return { removed: true }
   } },
   'GET watchdog/snapshot': { answer: () => ({ schema: 1, observedAt: new Date().toISOString(), infrastructure: { configured: true, paused: false, health: {}, setup: [] },
-    executor: { activeWorkers: 0, maxWorkers: 4 }, tickets: [], candidates: [], baseline: { status: 'healthy', findings: [], semanticReview: 'not_configured' } }) },
+    executor: { activeWorkers: 0, maxWorkers: 4 }, tickets: [], candidates: [], baseline: { status: 'healthy', findings: [], semanticReview: 'not_configured', semanticStatus: 'unreviewed' } }) },
   'POST watchdog/tickets/:id/request-status': { answer: () => ({ requested: false }) },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

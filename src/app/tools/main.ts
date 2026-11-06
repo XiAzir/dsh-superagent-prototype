@@ -18,6 +18,7 @@ const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
+  readonly verification?: Pick<import('../verification.ts').VerificationService, 'setCriteria' | 'enqueue'>
   readonly context: Context
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
@@ -158,6 +159,19 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
   return [
+    tool({
+      name: 'orchestrator_acceptance_set',
+      description: 'Refine success criteria from original human trigger references before judging completion; preserve scope.',
+      schema: z.object({ ticket_id: z.string().min(1), expected_revision: z.number().int().min(0),
+        criteria: z.array(z.object({ id: z.string().min(1).max(100), description: z.string().min(1).max(2000),
+          kind: z.enum(['content', 'code', 'artifact', 'source', 'external']), sourceRefs: z.array(z.string()).min(1).max(16) }).strict()).min(1).max(30) }).strict(),
+      execute: async args => {
+        if (!host.verification) throw new Error('Independent verification is unavailable')
+        const ticket = host.verification.setCriteria(args.ticket_id, args.expected_revision, args.criteria)
+        host.requestPass()
+        return { ticket_id: ticket.id, acceptance: ticket.acceptance }
+      },
+    }),
     readTool('Read listed resource pages; follow page links.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),

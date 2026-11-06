@@ -8,9 +8,10 @@ Each open Ticket has one stage, determined by what it is waiting for. Read the t
 
 | Stage | Condition | Panel label |
 | --- | --- | --- |
+| person / blocked | The Ticket has a resource, environment, authority or supervision hold; its Mandate and history remain available, and the owner can resume after checking the cause | Paused with reason |
 | person / delivery | Delivering an Input to the Executor Session failed; it is retried after 2 seconds, then after a delay that doubles up to a minute, and a success, a new Assignment or the Ticket's end clears it | Input undelivered |
 | person / answer | It has an Attention | Awaiting answer |
-| person / review | The latest Report is `ready` | Awaiting review |
+| person / review | The latest Report is `ready` and covers current execution input; enforced independent verification gates completion and result delivery | Awaiting review / verification |
 | person / blocked, failed | The latest Report is `blocked` or `failed`, and no person's message reached the Ticket since | Blocked · Failed |
 | working / queued | No Assignment, or a pending one | Queued |
 | idle | The latest Report is `waiting`, or the Assignment ended | Waiting for a Trigger |
@@ -29,6 +30,10 @@ A human follow-up that asks for the Ticket's status already reaches its worker. 
 Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `<stateDir>/work`.
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
+
+An owner can bind a Ticket to a registered remote environment (operations guide: `docs/remote-environments.md`). That Ticket and its nested subagents use task-bound daemon tools for commands and files; local shell and file tools are guarded. The daemon retains command identity, output and cancellation across reconnects. Local execution retains the OS-user permissions above; the remote deployment recipe uses a dedicated OS account and writable task root.
+
+New Tickets capture the configured result verification policy (`docs/result-verification.md`). Observe mode records an independent opinion; enforce mode requires current source-bound acceptance evidence before completion. Input changes and replacement reports invalidate old verification and queued result messages. Independent supervision (`docs/watchdog.md`) separately checks progress and provides bounded correction or a recoverable hold when enabled.
 
 The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
 

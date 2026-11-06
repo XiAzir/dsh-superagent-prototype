@@ -9,6 +9,8 @@ import { Earlier, ThreadLine, automatedRuns } from './rows.tsx'
 import { actorName, localized, readableMarkers, reasonLabel, valueLabel, when } from './text.ts'
 import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
   StageMark, When } from './widgets.tsx'
+import { TicketVerification } from './verification.tsx'
+import { TaskEnvironment, TaskFeedback } from './remote-environments.tsx'
 
 type Input = TicketPageView['inputs'][number]
 function InputLine({ input, earlier = [] }: { input: Input; earlier?: { id: string; at: string; preview: string }[] }) {
@@ -141,6 +143,9 @@ export function TicketPage({ id }: { id: string }) {
       <LabelValue label={t('ticketUpdatedLabel')} value={when(data.updatedAt, t('lang'))} />
     </div>
     {ended && <Hint>{ended}</Hint>}
+    <TicketVerification key={id} id={id} acceptance={data.acceptance} verification={data.verification} hold={data.hold} call={call} t={t} onChanged={reload} />
+    <TaskEnvironment key={`environment-${id}`} id={id} call={call} t={t} onChanged={reload} />
+    <TaskFeedback key={`feedback-${id}`} id={id} call={call} t={t} />
     {data.attention && <div className="dt-banner"><span className="dt-banner-label">{t('attentionPrefix')}</span><MarkdownLite
       text={data.attention.question} />
       {channel && <div className="dt-banner-actions">

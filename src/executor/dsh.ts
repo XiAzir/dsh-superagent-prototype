@@ -60,6 +60,8 @@ export function transient(error: unknown): boolean {
 const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
 /** Host dependencies used by `DshExecutor`. */
 export interface ExecutorHost {
+  mayExecute?(ticket: Ticket): boolean
+  launchGuard?(ticket: Ticket): { allowed: boolean; reason?: string; retryAt?: string }
   /** DSH Cordis context: agents and their events, and the subprocess service used to run prepare commands. */
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
@@ -284,9 +286,14 @@ export class DshExecutor implements Executor {
   private async launchQueued({ ticketId, assignmentId }: { ticketId: string; assignmentId: string }): Promise<void> {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
-    if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
+    if (!ticket || !liveTicket(ticket) || ticket.hold || assignment?.id !== assignmentId || assignment.state !== 'pending') return
     this.slots.reserve(ticketId, 'launch')
-    try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
+    try {
+      if (this.host.mayExecute?.(ticket) === false) throw new Later('Current task authority no longer permits execution')
+      const guard = this.host.launchGuard?.(ticket)
+      if (guard && !guard.allowed) throw new Later(guard.reason ?? 'Waiting for observation execution capacity', guard.retryAt ? Date.parse(guard.retryAt) : undefined)
+      await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`)
+    }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
       // A failed prepare command is not retried automatically because an existing directory counts as prepared, so retrying
@@ -307,6 +314,7 @@ export class DshExecutor implements Executor {
     const first = this.host.store.tickets.get(ticketId)
     const target = first && liveTicket(first) ? runningAssignment(first) : undefined
     if (!first || !target || !first.undelivered.length) return
+    if (this.host.mayExecute?.(first) === false) throw new Later('Current task authority no longer permits delivery')
     let woken = false
     try {
       for (;;) {
@@ -314,6 +322,7 @@ export class DshExecutor implements Executor {
         const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
         const inputId = ticket?.undelivered[0]
         if (!ticket || !assignment || inputId === undefined) return
+        if (this.host.mayExecute?.(ticket) === false) throw new Later('Task authority changed before delivery')
         // Waking an idle worker reserves a slot (including the extra slot reserved for human follow-ups).
         const sessionId = workerSessionId(ticketId)
         if (!woken && !this.running(ticket)) {

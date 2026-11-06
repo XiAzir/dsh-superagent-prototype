@@ -8,6 +8,7 @@ import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
+import { completionApproved } from './verification.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
@@ -51,7 +52,7 @@ export class Tickets extends EnginePart {
     const assignment = this.newAssignment(ticket)
     this.repo.tickets.save(ticket)
     for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref)
-    if (outcome.acknowledgement && primary) this.replies.acknowledgeAccepted(id, primary, outcome.acknowledgement)
+    if (outcome.acknowledgement && primary && !(mandate.strength === 'inferred' && primary.meta.observation)) this.replies.acknowledgeAccepted(id, primary, outcome.acknowledgement)
     this.options.executor.start(this.require(id), assignment)
     this.emit('ticket.created', { ticketId: id, decisionId, strength: mandate.strength })
   }
@@ -153,6 +154,12 @@ export class Tickets extends EnginePart {
   attachable(ticketId: string, triggerId: string): Trigger {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
+    if (trigger.source === 'qq' && trigger.meta.observation) {
+      const policy = this.policy(), target = this.require(ticketId)
+      const thread = this.thread(trigger.threads[0]!)
+      if (!policy.observedRouting || !policy.gate(trigger, thread, this.ticketsOnThread(thread)).admissible
+        || !policy.revalidate(target.mandate)) throw new UserError('notAdmissible', { reason: 'Observed context requires auto mode and current source/task authority' })
+    }
     // An owner can explicitly ask Router to coordinate several named workers. Router may distribute that one
     // request to each named ticket once; ordinary follow-ups keep their existing worker ownership protection.
     const coordinated = trigger.source === 'web' && trigger.actor.source === 'web' && trigger.actor.id === 'owner'
@@ -348,6 +355,18 @@ export class Tickets extends EnginePart {
    */
   addInput(ticket: Ticket, input: TicketInput): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
+    if (ticket.acceptance && input.kind === 'trigger' && input.human && !input.context
+      && !ticket.inputs.some(existing => existing.kind === 'trigger' && existing.triggerId === input.triggerId)) {
+      const source = this.repo.triggers.get(input.triggerId), thread = source && this.thread(source.threads[0]!)
+      const gate = source && thread && this.policy().gate(source, thread, this.ticketsOnThread(thread))
+      if (source && !source.meta.observation && gate?.admissible && gate.strength === 'explicit') {
+        const criteria = ticket.acceptance.criteria
+        ticket.acceptance = { ...ticket.acceptance, revision: ticket.acceptance.revision + 1,
+          criteria: [...criteria.slice(0, 1), ...criteria.slice(1).slice(-28), { id: `update-${key(source.id)}`,
+            kind: 'content', description: source.text.slice(0, 2000), sourceRefs: [`trigger/${source.id}`] }] }
+        delete ticket.verification
+      }
+    }
     ticket.inputs.push(input); ticket.updatedAt = this.now()
     // Hold back automated inputs while the worker is waiting on a person.
     const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
@@ -473,7 +492,15 @@ export class Tickets extends EnginePart {
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
-    this.letGo(ticketId, waiting, left)
+    // A directed supplement belongs to this task; an owner stop also cancels its unread instructions.
+    const cancelled = by === 'human' ? new Set([...waiting, ...left].filter(trigger =>
+      this.repo.triggers.disposition(trigger.id)?.directTicketId === ticketId).map(trigger => trigger.id)) : new Set<string>()
+    for (const id of cancelled) {
+      const disposition = this.repo.triggers.disposition(id)!
+      this.repo.triggers.saveDisposition(id, { ...disposition, routing: 'handled',
+        handbacks: [...disposition.handbacks ?? [], { ticketId, reason: 'The person stopped the explicitly targeted task.', at }] })
+    }
+    this.letGo(ticketId, waiting, left.filter(trigger => !cancelled.has(trigger.id)))
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
   }
@@ -484,6 +511,7 @@ export class Tickets extends EnginePart {
    * change asks for no work.
    */
   private unfinished(ticket: Ticket, at: string): boolean {
+    if (!completionApproved(ticket)) return true
     const until = readUntil(ticket, false)
     const taken = this.triggersOf(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger' && !readBefore(input, until) ? [input.id] : []))
       .some(trigger => this.owners(trigger).includes(ticket.id) && this.takenUp(ticket, trigger))
@@ -508,11 +536,39 @@ export class Tickets extends EnginePart {
    * Give an open ticket's Executor a fact as a note Input, such as what another ticket found; it grants nothing (see `TicketInput`).
    * @throws UserError when the ticket is unknown or has ended.
    */
-  note(ticketId: string, text: string): Ticket {
+  note(ticketId: string, text: string, requestId?: string): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     const at = this.now()
-    this.addInput(ticket, { id: key('input', ticketId, 'note', at, text), kind: 'note', text, at })
+    const id = requestId ? key('input', ticketId, 'note-request', requestId) : key('input', ticketId, 'note', at, text)
+    const prior = ticket.inputs.find(item => item.id === id)
+    if (prior && (prior.kind !== 'note' || prior.text !== text)) throw new UserError('notAdmissible', { reason: 'Note requestId was reused with different content' })
+    if (!prior) this.addInput(ticket, { id, kind: 'note', text, at })
+    return this.require(ticketId)
+  }
+  /** Pause compute without withdrawing the mandate; a late result from the old assignment is refused. */
+  hold(ticketId: string, input: NonNullable<Ticket['hold']>): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket) || ticket.hold) return ticket
+    ticket.hold = input
+    const assignment = runningAssignment(ticket) ?? latestAssignment(ticket)
+    if (assignment) { assignment.state = 'ended'; assignment.endedAt = input.at; assignment.endedReason = `resourceHold:${input.kind}` }
+    ticket.updatedAt = input.at
+    this.repo.tickets.save(ticket)
+    if (assignment) this.options.executor.stop(ticket, assignment, input.reason)
+    return this.require(ticketId)
+  }
+  release(ticketId: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!ticket.hold) return ticket
+    if (this.policy().paused || !this.policy().revalidate(ticket.mandate)) throw new UserError('notAdmissible', { reason: 'Task authority is paused or no longer valid' })
+    delete ticket.hold
+    const assignment = this.newAssignment(ticket)
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    this.note(ticketId, 'Execution resumes after a resource/environment pause. Recheck actual command and external operation state before retrying; preserve prior completed work.', `resource-resume:${assignment.id}`)
+    this.options.executor.start(this.require(ticketId), assignment)
     return this.require(ticketId)
   }
   /**

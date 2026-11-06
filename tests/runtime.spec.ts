@@ -474,7 +474,7 @@ it('stops a ticket on a person\'s instruction for good, and resumes an ended one
   expect(resumed.inputs.map(input => input.kind)).toContain('resumed')
 })
 
-it('tells live workers about policy changes instead of revoking them and restarts in-flight assessments', async () => {
+it('retains policy-change context, holds revoked execution and restarts in-flight assessments', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   const pending = feishu('8', '新观察', { mentions: [], sender_id: MEMBER, root_id: undefined })
   await receive(pending)
@@ -487,7 +487,7 @@ it('tells live workers about policy changes instead of revoking them and restart
   // The rules changed, but not as they bear on this explicit ticket, whose requester is still allowed: its worker is not woken.
   expect(runtime.store.tickets.get(ticket.id)!.inputs).toEqual([])
   expect(relays(sessionId)).toEqual([])
-  // Its requester comes off the allowed list: the worker is told so, inline, and the ticket goes on.
+  // Removing its requester retains the policy input and mandate while holding further computation.
   const current = runtime.store.settings().policy
   await runtime.settings.save('policy', { ...current, sources: { ...current.sources, feishu: { ...current.sources.feishu!, allowed: [] } } },
     runtime.store.blockRevision('policy'), 'panel')
@@ -495,7 +495,8 @@ it('tells live workers about policy changes instead of revoking them and restart
   expect(runtime.store.tickets.get(ticket.id)!.inputs).toEqual([expect.objectContaining({ kind: 'policy-changed',
     effect: { requesterAllowed: false, requester: { source: 'feishu', id: MEMBER } } })])
   expect(runtime.store.tickets.get(ticket.id)!.ended).toBeUndefined()
-  expect(relays(sessionId)).toEqual([{ text: expect.stringContaining('may no longer start work') }])
+  expect(relays(sessionId)).toEqual([])
+  expect(runtime.store.tickets.get(ticket.id)!.hold).toMatchObject({ kind: 'operator', reason: expect.stringContaining('authority changed') })
   expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_8`)[0]).toMatchObject({ kind: 'unavailable', reason: [{ code: 'policyChanged' }] })
   expect(relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === pending.id)).toHaveLength(1)
 })
@@ -1777,7 +1778,8 @@ it('gives a subagent of a worker only the worker\'s work tools, and none once th
   const other = agents.get('child-2')! as unknown as { session: { header: { parentSession?: string } } }
   other.session.header = { parentSession: 'someone-else' }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: other } as never)
-  expect(restricts.get('child-2')).toBeUndefined()
+  expect(restricts.get('child-2')).toEqual([{ allow: [] }])
+  expect(guards.get('child-2')?.()).toContain('ancestry is unresolved')
 })
 
 it('gives a subagent of a worker\'s subagent the same work tools and guard', async () => {
@@ -1796,6 +1798,49 @@ it('gives a subagent of a worker\'s subagent the same work tools and guard', asy
   expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })
 
+it('guards local shell and files through twelve remote-bound worker descendant levels', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  expect(guards.get(sessionId)!({ name: 'bash', arguments: {} })).toBeUndefined()
+  runtime.remote.register({ id: 'ancestry-device', label: 'Ancestry regression', url: 'https://ancestry.example.invalid', credentialRef: 'test-credential-reference' })
+  runtime.remote.bind(ticket.id, 'ancestry-device')
+  runtime.sessions.refreshEnvironmentTools(ticket.id)
+  const assertRemote = (id: string) => {
+    for (const name of ['bash', 'pwsh', 'read', 'write']) {
+      expect(guards.get(id)?.({ name, arguments: {} }), `${id}: ${name}`).toContain('bound remote environment')
+    }
+    expect(guards.get(id)?.({ name: 'web_search', arguments: {} })).toBeUndefined()
+    expect(tools.get(id)?.has('orchestrator_environment_start')).toBe(true)
+  }
+  assertRemote(sessionId)
+  let parent = sessionId
+  for (let depth = 1; depth <= 12; depth++) {
+    const id = `remote-descendant-${depth}`
+    await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: id })
+    const child = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
+    child.session.header = { parentSession: parent }
+    await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+    assertRemote(id)
+    parent = id
+  }
+})
+
+it.each(['missing', 'cyclic'] as const)('denies all work tools for a subagent with a %s parent chain', async shape => {
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  const headers = [['unresolved-child', 'unresolved-parent'], ['unresolved-parent', shape === 'missing' ? 'missing-parent' : 'unresolved-child']] as const
+  for (const [id, parent] of headers) {
+    await create({ sessionId: id })
+    const agent = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
+    agent.session.header = { parentSession: parent }
+  }
+  for (const [id] of headers) {
+    const agent = agents.get(id)!
+    await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent } as never)
+    expect(restricts.get(id)).toEqual([{ allow: [] }])
+    for (const name of ['bash', 'pwsh', 'read', 'write']) expect(guards.get(id)?.({ name, arguments: {} })).toContain('ancestry is unresolved')
+    expect(tools.get(id)?.has('orchestrator_environment_start')).toBe(false)
+  }
+})
+
 it('gives the Assignment a restart starts the messages the replaced one had delivered but no step took, once', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   // A follow-up reaches the worker mid-turn, and the process stops before a step took it: DSH disposes the worker's agent
@@ -1807,6 +1852,10 @@ it('gives the Assignment a restart starts the messages the replaced one had deli
   inbox.nextTurn.length = 0; inbox.nextStep.length = 0
   const next = await restart()
   await next.ready; await next.idle()
+  // A restored assignment waits for its source plugin to register before its authority can be checked.
+  expect(next.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+  next.sources.register(feishuKind)
+  await next.idle()
   expect(next.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'running'])
   expect(sent()).toBe(2)
 })

@@ -176,3 +176,22 @@ it('leaves the collaboration tab available for manual opening on a laptop-width 
   expect(register).toHaveBeenCalled(); expect(openTab).not.toHaveBeenCalled(); expect(fetch).not.toHaveBeenCalled()
   disposers.reverse().forEach(dispose => dispose())
 })
+
+it('updates a member verification badge while keeping direct messaging and full-session controls available', async () => {
+  let snapshot = data()
+  snapshot.workers[0]!.acceptance = { revision: 1, mode: 'enforce', createdAt: at,
+    criteria: [{ id: 'replay', description: '重放请求并核对过滤结果。', kind: 'code', sourceRefs: ['trigger/request'] }] }
+  snapshot.workers[0]!.verification = { state: 'pending', reportKey: 'report-1', at, summary: '等待独立验收', checks: [], attempt: 1 }
+  const call = fakeCall(() => snapshot) as unknown as Call
+  await render(call)
+  expect(container.querySelector('.sa-worker .sa-verification-badge')?.textContent).toContain(zh['verification.state.pending'])
+  await click('.sa-worker[aria-label^="查看执行成员 1"]')
+  expect(container.querySelector('.sa-member-detail .sa-verification')?.textContent).toContain('等待独立验收')
+  snapshot = { ...snapshot, workers: snapshot.workers.map(worker => worker.id === 'w1'
+    ? { ...worker, verification: { ...worker.verification!, state: 'passed', summary: '请求重放与过滤结果已核验。' } } : worker) }
+  await click('[aria-label="刷新协作进度"]')
+  expect(container.querySelector('.sa-worker .sa-verification-badge')?.textContent).toContain(zh['verification.state.passed'])
+  expect(container.querySelector('[aria-label="打开 Worker 1 会话"]')).not.toBeNull()
+  expect(container.querySelector('[aria-label="交给调度助手"]')).not.toBeNull()
+  expect(container.querySelector('textarea')).not.toBeNull()
+})

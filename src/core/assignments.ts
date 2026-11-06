@@ -6,6 +6,7 @@ import type { ReportEvidence, ReportNextCheck, ReportState, ReportWaitingFor, Ti
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
+import { completionApproved, completionInputRevision, completionKey, completionReady, type CompletionVerification } from './verification.ts'
 
 /** What an Assignment reports: a worker's report, or the Executor's own (`waiting` after an idle turn, `failed` after an error). */
 export interface WorkerReport {
@@ -106,6 +107,7 @@ export class Assignments extends EnginePart {
   report(ticketId: string, report: WorkerReport, expectedAssignmentId?: string): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (ticket.hold) throw new UserError('notAdmissible', { reason: 'Task execution is held for a resource or environment condition' })
     // Executor reports may finish after an asynchronous artifact snapshot. Bind those reports to the Assignment
     // that created the tool call, and reject them before any attention, reply, or ticket state is changed.
     if (expectedAssignmentId !== undefined && latestAssignment(ticket)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
@@ -138,9 +140,14 @@ export class Assignments extends EnginePart {
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
     assignment.report = { state: report.state, summary: report.summary, at,
+      ...ticket.acceptance && report.state === 'ready' ? { inputRevision: completionInputRevision(ticket) } : {},
       ...report.completed ? { completed: report.completed } : {}, ...report.pending ? { pending: report.pending } : {},
       ...report.waitingFor ? { waitingFor: report.waitingFor } : {}, ...report.evidence ? { evidence: report.evidence } : {},
       ...report.nextCheck ? { nextCheck: report.nextCheck } : {}, ...report.artifacts?.length ? { artifacts: report.artifacts } : {} }
+    if (report.state === 'ready' && ticket.acceptance?.mode === 'enforce') {
+      ticket.verification = { reportKey: completionKey(ticket), state: 'pending', at,
+        summary: 'Execution is ready; independent evidence review is pending.', checks: [], attempt: 0 }
+    } else if (ticket.verification) delete ticket.verification
     if (report.nextCheck) this.tickets.scheduleFollowup(ticket, report.nextCheck)
     if (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) || report.waitingFor?.kind === 'human') {
       this.tickets.cancelPendingFollowups(ticket)
@@ -154,7 +161,23 @@ export class Assignments extends EnginePart {
     const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
     // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.
     const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
-    if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
+    if (outcome && (report.state !== 'ready' || completionApproved(ticket))) this.tickets.end(ticketId, 'executor', outcome, at)
+    return this.require(ticketId)
+  }
+  /** Apply a review only to the exact ready result; stale reviews cannot approve newer work. */
+  verify(ticketId: string, review: CompletionVerification): Ticket {
+    const ticket = this.require(ticketId), assignment = latestAssignment(ticket)
+    if (!ticket.acceptance || !completionReady(ticket) || assignment?.report?.state !== 'ready' || completionKey(ticket) !== review.reportKey
+      || ticket.ended?.by === 'human') throw new UserError('notAdmissible', { reason: 'Verification no longer matches the current ready report' })
+    if (ticket.verification?.reportKey === review.reportKey && ticket.verification.attempt > review.attempt)
+      throw new UserError('notAdmissible', { reason: 'A newer verification generation already owns this ready result' })
+    ticket.verification = { reportKey: review.reportKey, state: review.state, at: review.at, summary: review.summary,
+      checks: review.checks, attempt: review.attempt }
+    this.repo.tickets.save(ticket)
+    if (liveTicket(ticket) && review.state === 'passed') {
+      const outcome = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
+      if (outcome) this.tickets.end(ticketId, 'executor', outcome, this.now())
+    }
     return this.require(ticketId)
   }
   /** The ticket, while it is open and `assignmentId` runs it. */

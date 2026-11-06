@@ -4,7 +4,7 @@ Use summaries and thread subscriptions.
 Workers investigate and implement; never add implementation plans.
 Messages on a subscribed thread go directly to the workers of its tickets.
 Use thread and ticket snapshots to coordinate peer findings; delegate only within the parent mandate.
-QQ/Web conversational messages first await Router intent selection; pure status queries read saved evidence.
+QQ observations override the subscription rules below: Router selects intent; observe records only, auto continuations require attach before Worker delivery. QQ/Web also await Router selection. Follow observation/routing_instruction; status uses saved evidence.
 
 The host rechecks access.
 

@@ -54,6 +54,15 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [Personal assistant](docs/personal-assistant.md): goals, commitments, confirmed memory, scheduled checks, attention and exact action approval
 - [Task rooms](docs/task-rooms.md): group-style supervision, peer Worker subscriptions and directed owner input
 - [QQ through OneBot v11](docs/qq-napcat.md): QQ Source setup and routing
+- [Result verification](docs/result-verification.md): source-bound success criteria, independent evidence checks and bounded repair
+- [Verification and supervision UI](docs/verification-ui.md): current evidence, re-review and retained Worker controls
+- [Reliable memory](docs/memory.md): scoped recall, provenance, validity, corrections and candidate experience
+- [QQ observation and structured routing](docs/qq-observation-routing.md): discussion windows, budgets and direct owner operations
+- [Independent Watchdog](docs/watchdog.md): semantic observation, explicit advice and bounded external recovery
+- [Remote execution environments](docs/remote-environments.md): device setup, durable commands, reconnect and owner resolution
+- [Runtime operations](docs/runtime-operations.md): version/configuration manifests, read-only preflight and recovery evidence
+- [Autonomy evaluation](docs/autonomy-evaluation.md): isolated event/file tasks, provider adapter and measured coverage
+- [Implementation and acceptance tracker](docs/autonomy-implementation-plan.md): requirement evidence and remaining release checks
 
 ## Development
 

@@ -19,6 +19,7 @@ const ImageUpload = z.object({ name: z.string().trim().min(1).max(240),
   data: z.string().min(1).max(Math.ceil(MAX_WEB_IMAGE_BYTES / 3) * 4),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/) }).strict()
 export const WebImageIds = z.array(z.string().regex(/^[a-f0-9]{32}$/)).max(8).default([])
+/** An owner-visible invalid or unavailable Web image request. */
 export class WebImageError extends Error {
   constructor(readonly status: 400 | 404 | 409, message: string) { super(message) }
 }
@@ -28,6 +29,7 @@ const magic = (type: string, bytes: Buffer): boolean => type === 'image/png'
     : type === 'image/webp' ? bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP'
       : bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))
 
+/** Persistent, owner-authorized image input shared by Web tasks and task rooms. */
 export class WebAttachmentStore {
   constructor(private readonly store: Pick<Store, 'get' | 'set'>, private readonly stateDir: string,
     private readonly authorized: () => boolean) {}

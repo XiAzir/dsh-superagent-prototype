@@ -2,13 +2,19 @@
  * Signals that an effect cannot run right now, such as when processing is paused or all worker slots are full.
  * Effects reschedules the row after the initial retry delay without incrementing its failure count, and DshExecutor throws it from launch and delivery handlers.
  */
-export class Later extends Error {}
+export class Later extends Error {
+  constructor(message?: string, readonly retryAt?: number) { super(message) }
+}
 /** Consecutive failures before an effect kind reports an error, matching the Sources poll failure threshold. */
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
+  /** Extract an optional long-term memory candidate from one accepted result revision. */
+  'memory-experience': { requestId: string }
+  /** Independently inspect one exact ready report. The key is the durable review ID. */
+  verification: { ticketId: string; reportKey: string; attempt: number }
   /** Build an Eval's candidate card and relay it to the main Session; the key is the Eval ID. */
   assessment: { triggerId: string }
   /** Launch a pending Assignment; the key is the Assignment ID. */
@@ -183,7 +189,9 @@ export class Effects {
     // Leave running rows untouched on shutdown so they retry on the next start.
     else if (this.stopped) return
     else if (failure.error instanceof Later) {
-      this.store.db.prepare(`UPDATE effect SET due = ? WHERE ${own}`).run(this.now() + handler.retry[0], ...ownRow)
+      const requested = failure.error.retryAt
+      const due = typeof requested === 'number' && Number.isFinite(requested) ? Math.max(this.now() + handler.retry[0], requested) : this.now() + handler.retry[0]
+      this.store.db.prepare(`UPDATE effect SET due = ? WHERE ${own}`).run(due, ...ownRow)
     } else {
       const delay = Math.min(handler.retry[1], handler.retry[0] * 2 ** Math.min(row.attempts, 16))
       this.store.db.prepare(`UPDATE effect SET attempts = attempts + 1, error = ?, due = ? WHERE ${own}`)

@@ -11,7 +11,7 @@ const MANAGER = resolve(ROOT, 'scripts', 'dsh-superagent')
 const WATCHDOG_STATE = profile => resolve(ROOT, '.artifacts', 'control', 'profiles', profile, 'watchdog.json')
 const STOP_MARKER = profile => resolve(ROOT, '.artifacts', 'control', 'profiles', profile, 'manually-stopped')
 const MAX_OUTPUT = 128 * 1024
-const STATUS = new Set(['healthy', 'waiting', 'stalled', 'diverged'])
+const STATUS = new Set(['healthy', 'waiting', 'stalled', 'diverged', 'unknown'])
 
 export function loopbackUrl(input) {
   let url
@@ -32,11 +32,18 @@ function validateAssessment(value) {
       || typeof item.recommendation !== 'string') throw new Error('Assessor returned an invalid finding')
     return { ...(typeof item.ticketId === 'string' ? { ticketId: item.ticketId.slice(0, 200) } : {}), status: item.status,
       evidence: item.evidence.slice(0, 8).filter(entry => typeof entry === 'string').map(entry => redactText(entry).slice(0, 500)),
+      ...(Array.isArray(item.evidenceRefs) ? { evidenceRefs: item.evidenceRefs.filter(ref => typeof ref === 'string').slice(0, 12).map(ref => redactText(ref).slice(0, 200)) } : {}),
       recommendation: redactText(item.recommendation).slice(0, 500) }
   })
   const nudgeTicketIds = Array.isArray(value.nudgeTicketIds) ? [...new Set(value.nudgeTicketIds.filter(id => typeof id === 'string').slice(0, 10))] : []
   const semanticReview = value.semanticReview === 'configured' ? 'configured' : 'not_configured'
-  return { status: value.status, findings, nudgeTicketIds, semanticReview }
+  const semanticStatus = ['reviewed', 'unknown', 'stale', 'unreviewed'].includes(value.semanticStatus) ? value.semanticStatus
+    : semanticReview === 'configured' ? value.status === 'unknown' ? 'unknown' : 'reviewed' : 'unreviewed'
+  return { status: value.status, findings, nudgeTicketIds, semanticReview, semanticStatus,
+    ...(typeof value.reviewId === 'string' ? { reviewId: value.reviewId.slice(0, 100) } : {}),
+    ...(typeof value.snapshotHash === 'string' ? { snapshotHash: value.snapshotHash.slice(0, 100) } : {}),
+    ...(value.mode === 'observe' || value.mode === 'advise' ? { mode: value.mode } : {}),
+    ...(typeof value.error === 'string' ? { semanticError: redactText(value.error).slice(0, 1000) } : {}) }
 }
 function redactText(value) {
   return value.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[redacted]')
@@ -47,7 +54,7 @@ function redactText(value) {
 
 export function assessorInput(snapshot) {
   return JSON.stringify({ task: 'Review this bounded Superagent operations snapshot.',
-    guidance: 'Return JSON only: {status: healthy|waiting|stalled|diverged, findings:[{ticketId?,status,evidence:string[],recommendation}], nudgeTicketIds?:string[]}. Judge substantive progress from report and execution-trace evidence. Elapsed time only selected review candidates; it is never proof of no progress. A completed ticket, explicit human stop, waiting-person state, paused system, queued work, or active/background execution may be legitimate. Never infer intent from absent evidence. Recommend only a request-status nudge for a live worker whose latest report is waiting. Do not recommend killing work, changing prompts, widening scope, or sending external messages.',
+    guidance: 'Return JSON only: {status: healthy|waiting|stalled|diverged|unknown, findings:[{ticketId?,status,evidence:string[],recommendation}], nudgeTicketIds?:string[]}. Compare the original goal and later corrections with actual tool/artifact evidence. A new input, status update or tool call alone is not substantive progress. Elapsed time only selected review candidates; it is never proof of no progress. A completed ticket, explicit human stop, waiting-person state, paused system, queued work, or active/background execution may be legitimate. Use unknown when evidence is insufficient. Recommend only a request-status nudge for a live worker whose latest report is waiting. Do not recommend killing work, changing prompts, widening scope, or sending external messages.',
     snapshot: redactSnapshot(snapshot) })
 }
 function redactSnapshot(value) {
@@ -116,8 +123,8 @@ export async function runCommand(command, { input = '', timeoutMs = 30_000, maxO
   })
 }
 
-async function getSnapshot(url, timeoutMs, fetchImpl, signal, { offset = 0, candidateAfterMs = 30 * 60_000 } = {}) {
-  const query = new URLSearchParams({ offset: String(offset), limit: '100', candidateAfterMs: String(candidateAfterMs) })
+async function getSnapshot(url, timeoutMs, fetchImpl, signal, { offset = 0, candidateAfterMs = 30 * 60_000, maxTickets = 100 } = {}) {
+  const query = new URLSearchParams({ offset: String(offset), limit: String(maxTickets), candidateAfterMs: String(candidateAfterMs) })
   const response = await fetchImpl(`${url}/orchestrator/api/watchdog/snapshot?${query}`, { headers: { 'x-orchestrator-request': '1' },
     signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]) })
   if (!response.ok) throw new Error(`Snapshot request failed with HTTP ${response.status}`)
@@ -144,7 +151,19 @@ function fallback(snapshot) {
 async function assess(snapshot, command, timeoutMs, commandRunner, signal) {
   if (!command) return fallback(snapshot)
   const result = await commandRunner(command, { input: assessorInput(snapshot), timeoutMs, maxOutput: 64 * 1024, signal, env: assessorEnvironment() })
-  return { ...validateAssessment(JSON.parse(result.stdout)), semanticReview: 'configured' }
+  const assessment = validateAssessment({ ...JSON.parse(result.stdout), semanticReview: 'configured' })
+  return { ...assessment, semanticReview: 'configured' }
+}
+
+/** The bundled model route reuses configured DSH providers while keeping its own read-only context and ledger. */
+async function assessWithHost(snapshot, options) {
+  const response = await options.fetchImpl(`${options.url}/orchestrator/api/watchdog/assess`, { method: 'POST',
+    headers: { 'x-orchestrator-request': '1', 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedHash: snapshot.snapshotHash, offset: snapshot.page?.offset ?? 0,
+      maxTickets: snapshot.page?.limit ?? 20, candidateAfterMs: options.candidateAfterMs }),
+    signal: AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])]) })
+  if (!response.ok) throw new Error(`Semantic review request failed with HTTP ${response.status}`)
+  return validateAssessment({ ...await response.json(), semanticReview: 'configured' })
 }
 
 function assessorEnvironment() {
@@ -237,13 +256,14 @@ export async function watchdogOnce(options) {
   const merged = { profile: 'superagent', url: 'http://127.0.0.1:3082', timeoutMs: 5000, stateFile: WATCHDOG_STATE(options.profile ?? 'superagent'),
     candidateAfterMs: 30 * 60_000, nudgeCooldownMs: 30 * 60_000, recover: false, nudge: false, maxRecoveries: 3, recoveryWindowMs: 6 * 60 * 60_000,
     recoveryBaseDelayMs: 10 * 60_000, recoveryMaxDelayMs: 2 * 60 * 60_000, managerTimeoutMs: 60_000,
-    now: () => Date.now(), fetchImpl: globalThis.fetch, commandRunner: runCommand, emit: async value => process.stdout.write(JSON.stringify(value) + '\n'), ...options }
+    modelAssessor: false, advise: false, now: () => Date.now(), fetchImpl: globalThis.fetch, commandRunner: runCommand,
+    emit: async value => process.stdout.write(JSON.stringify(value) + '\n'), ...options }
   merged.url = loopbackUrl(merged.url)
   const state = await readState(merged.stateFile)
   let snapshot, assessment, error, errorKind
   try {
     snapshot = await getSnapshot(merged.url, merged.timeoutMs, merged.fetchImpl, merged.signal,
-      { offset: state.snapshotOffset ?? 0, candidateAfterMs: merged.candidateAfterMs })
+      { offset: state.snapshotOffset ?? 0, candidateAfterMs: merged.candidateAfterMs, maxTickets: merged.modelAssessor ? 20 : 100 })
     state.snapshotOffset = snapshot.page?.nextOffset ?? 0
   } catch (caught) {
     if (merged.signal?.aborted) return { report: { status: 'waiting', cancelled: true }, changed: false, exitCode: 0 }
@@ -251,14 +271,16 @@ export async function watchdogOnce(options) {
     errorKind = 'snapshot'
   }
   if (snapshot) try {
-    assessment = await assess(snapshot, merged.assessorCommand, merged.timeoutMs, merged.commandRunner, merged.signal)
+    assessment = merged.modelAssessor ? await assessWithHost(snapshot, merged)
+      : await assess(snapshot, merged.assessorCommand, merged.timeoutMs, merged.commandRunner, merged.signal)
   } catch (caught) {
     if (merged.signal?.aborted) return { report: { status: 'waiting', cancelled: true }, changed: false, exitCode: 0 }
     error = redactText(String(caught instanceof Error ? caught.message : caught))
     errorKind = 'assessor'
   }
-  if (error) assessment = { status: 'stalled', semanticReview: merged.assessorCommand ? 'configured' : 'not_configured',
-    findings: [{ status: 'stalled', evidence: [error], recommendation: errorKind === 'assessor' ? 'Repair the assessor command or model service; do not restart the Superagent host for an assessor failure.'
+  if (error) assessment = { status: errorKind === 'assessor' ? 'unknown' : 'stalled',
+    semanticReview: merged.assessorCommand || merged.modelAssessor ? 'configured' : 'not_configured', semanticStatus: 'unknown',
+    findings: [{ status: errorKind === 'assessor' ? 'unknown' : 'stalled', evidence: [error], recommendation: errorKind === 'assessor' ? 'Repair the assessor command or model service; preserve the running Worker.'
       : 'Check the local service health and logs.' }], nudgeTicketIds: [] }
   let recovery = { attempted: false }
   const infrastructure = snapshot?.infrastructure
@@ -266,6 +288,20 @@ export async function watchdogOnce(options) {
   const infrastructureFailure = errorKind === 'snapshot' || (!!infrastructure?.configured && !infrastructure.paused && !infrastructure.setup?.length && runtimeError)
   if (infrastructureFailure && merged.recover) recovery = await recoverIfAllowed(merged, state, merged.commandRunner, merged.emit)
   const nudgeResults = []
+  const adviceResults = []
+  if (merged.advise && merged.modelAssessor && snapshot && !error && assessment.semanticStatus === 'reviewed' && assessment.reviewId) {
+    for (const finding of assessment.findings.filter(item => item.ticketId && ['stalled', 'diverged'].includes(item.status)).slice(0, 5)) {
+      const ticket = snapshot.tickets.find(item => item.id === finding.ticketId)
+      if (!ticket?.revision) continue
+      try {
+        const response = await merged.fetchImpl(`${merged.url}/orchestrator/api/watchdog/advice`, { method: 'POST',
+          headers: { 'x-orchestrator-request': '1', 'content-type': 'application/json' },
+          body: JSON.stringify({ reviewId: assessment.reviewId, ticketId: ticket.id, expectedRevision: ticket.revision }),
+          signal: AbortSignal.any([AbortSignal.timeout(merged.timeoutMs), ...(merged.signal ? [merged.signal] : [])]) })
+        adviceResults.push(redactSnapshot(response.ok ? await response.json() : { ticketId: ticket.id, requested: false, error: `HTTP ${response.status}` }))
+      } catch (caught) { adviceResults.push({ ticketId: ticket.id, requested: false, error: redactText(String(caught)).slice(0, 500) }) }
+    }
+  }
   const eligibleIds = new Set((snapshot?.tickets ?? []).filter(ticket => ticket.status === 'waiting' && ticket.report?.state === 'waiting'
     && ticket.latestAssignment?.state === 'running').map(ticket => ticket.id))
   const sentNudges = state.nudges ?? (state.nudges = {})
@@ -296,7 +332,7 @@ export async function watchdogOnce(options) {
   const recoveryNotice = recovery.skipped ? String(recovery.skipped) : recovery.attempted ? `attempt:${recovery.attempt}` : undefined
   const changed = globalChanged || (pageChanged && pageAlert) || (!!error && state.failureFingerprint !== failureFingerprint) || !!recoveredFrom || recovery.attempted
     || (!!recoveryNotice && state.lastRecoveryNotice !== recoveryNotice)
-    || nudgeResults.some(result => result.requested === true)
+    || nudgeResults.some(result => result.requested === true) || adviceResults.some(result => result.requested === true)
   state.fingerprint = key
   state.globalFingerprint = globalKey
   if (snapshot && !globalProblem) pageFingerprints[pageKey] = pageKeyValue
@@ -304,11 +340,21 @@ export async function watchdogOnce(options) {
   state.failureKind = errorKind
   state.lastRecoveryNotice = recoveryNotice
   state.lastSeenAt = new Date(merged.now()).toISOString()
+  if (snapshot && (merged.assessorCommand || merged.modelAssessor)) {
+    state.reviews = [...Array.isArray(state.reviews) ? state.reviews : [], { at: state.lastSeenAt,
+      snapshotHash: assessment.snapshotHash ?? snapshot.snapshotHash ?? hash(snapshot), reviewId: assessment.reviewId,
+      status: assessment.status, semanticStatus: assessment.semanticStatus, findings: assessment.findings,
+      ...(error ? { errorKind, error } : {}) }].slice(-100)
+  }
   await saveState(merged.stateFile, state)
   const report = redactSnapshot({ profile: merged.profile, status: assessment.status, ...(error ? { error, errorKind } : {}), ...(recoveredFrom ? { recovered: true } : {}),
     ...(snapshot ? { observedAt: snapshot.observedAt, infrastructure: snapshot.infrastructure, executor: snapshot.executor,
       ticketCount: snapshot.tickets.length, candidateCount: snapshot.candidates.length } : {}), findings: assessment.findings,
-    ...(assessment.semanticReview ? { semanticReview: assessment.semanticReview } : {}), ...(recovery.attempted || recovery.skipped ? { recovery } : {}),
+    infrastructureStatus: infrastructure ? fallback(snapshot).status : 'unknown',
+    ...(assessment.semanticReview ? { semanticReview: assessment.semanticReview, semanticStatus: assessment.semanticStatus } : {}),
+    ...(assessment.reviewId ? { reviewId: assessment.reviewId, snapshotHash: assessment.snapshotHash, mode: assessment.mode } : {}),
+    ...(assessment.semanticError ? { semanticError: assessment.semanticError } : {}),
+    ...(recovery.attempted || recovery.skipped ? { recovery } : {}), ...(adviceResults.length ? { advice: adviceResults } : {}),
     ...(nudgeResults.length ? { nudges: nudgeResults } : {}) })
   if (changed) await merged.emit(report)
   return { report, changed, exitCode: assessment.status === 'healthy' ? 0 : assessment.status === 'waiting' ? 2 : 3 }
@@ -322,7 +368,7 @@ const sleep = (ms, signal) => new Promise(resolvePromise => {
 
 function parseArgs(argv) {
   const options = { url: process.env.DSH_SUPERAGENT_URL || 'http://127.0.0.1:3082', profile: process.env.DSH_SUPERAGENT_PROFILE || 'superagent',
-    timeoutMs: 5000, intervalMs: 5 * 60_000, once: false, recover: false, nudge: false, candidateAfterMs: 30 * 60_000 }
+    timeoutMs: 5000, intervalMs: 5 * 60_000, once: false, recover: false, nudge: false, modelAssessor: false, advise: false, candidateAfterMs: 30 * 60_000 }
   const valueFlags = new Map([['--url', 'url'], ['--profile', 'profile'], ['--timeout-ms', 'timeoutMs'], ['--interval-ms', 'intervalMs'],
     ['--candidate-after-ms', 'candidateAfterMs'], ['--assessor-command', 'assessorCommand'], ['--manager-command', 'managerCommand'],
     ['--manager', 'manager'], ['--state-file', 'stateFile'], ['--stop-marker', 'stopMarker'], ['--max-recoveries', 'maxRecoveries'],
@@ -332,6 +378,8 @@ function parseArgs(argv) {
     if (flag === '--once') options.once = true
     else if (flag === '--recover') options.recover = true
     else if (flag === '--nudge') options.nudge = true
+    else if (flag === '--model-assessor') options.modelAssessor = true
+    else if (flag === '--advise') options.advise = true
     else if (valueFlags.has(flag)) {
       const value = argv[++i]
       if (value === undefined) throw new Error(`${flag} needs a value`)
@@ -340,6 +388,7 @@ function parseArgs(argv) {
         : ['timeoutMs', 'intervalMs', 'candidateAfterMs', 'maxRecoveries', 'recoveryWindowMs', 'recoveryBaseDelayMs', 'recoveryMaxDelayMs'].includes(key) ? Number(value) : value
     } else throw new Error(`Unknown option: ${flag}`)
   }
+  if (options.modelAssessor && !argv.includes('--timeout-ms')) options.timeoutMs = 65_000
   if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(options.profile)) throw new Error('Invalid profile name')
   if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 100 || options.timeoutMs > 120_000) throw new Error('--timeout-ms must be between 100 and 120000')
   if (!Number.isFinite(options.intervalMs) || options.intervalMs < 1000) throw new Error('--interval-ms must be at least 1000')
@@ -348,6 +397,8 @@ function parseArgs(argv) {
   }
   for (const key of ['recoveryWindowMs', 'recoveryBaseDelayMs', 'recoveryMaxDelayMs']) if (options[key] !== undefined
     && (!Number.isFinite(options[key]) || options[key] < 1)) throw new Error(`--${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)} must be positive`)
+  if (options.modelAssessor && options.assessorCommand) throw new Error('Choose either --model-assessor or --assessor-command')
+  if (options.advise && !options.modelAssessor) throw new Error('--advise requires --model-assessor')
   options.url = loopbackUrl(options.url)
   options.stateFile ??= WATCHDOG_STATE(options.profile)
   return options

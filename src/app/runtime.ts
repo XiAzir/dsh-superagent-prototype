@@ -2,7 +2,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { readSessionEvents } from '../infra/session-history.ts'
+import { readSessionEvents, readLatestTurnEvents } from '../infra/session-history.ts'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
@@ -12,19 +12,21 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { join, basename } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, completionApproved, completionKey, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId, ticketOfSession } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
-import { KV } from '../kv.ts'
+import { KV, record } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
@@ -56,10 +58,20 @@ import { PersonalRuntime } from './personal-runtime.ts'
 import { SessionConversations } from './session-conversations.ts'
 import { Memory } from './memory.ts'
 import { WorkerProgress } from './worker-progress.ts'
+import { ExecutionEvidence } from './execution-evidence.ts'
+import { VerificationService } from './verification.ts'
+import { SupervisionService, dshSupervisionModel } from './supervision.ts'
+import { watchdogSnapshot, type WatchdogExecutionEvidence } from './watchdog.ts'
+import { EvaluationLedger, type EvaluationEvent } from '../evaluation/ledger.ts'
+import { RemoteEnvironments, type RemoteTransition } from '../remote/client.ts'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { MemoryExperienceService } from './memory-experience.ts'
+import { recordRuntimeManifest, runtimeBuildIdentity, runtimeManifestState } from './runtime-manifest.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+const LOADED_RUNTIME_IDENTITY = runtimeBuildIdentity({ entryPath: fileURLToPath(import.meta.url) })
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -84,6 +96,13 @@ export class Runtime extends Service implements SourceHost {
   readonly personal: PersonalCoordinator
   readonly personalRuntime: PersonalRuntime
   readonly workerProgress: WorkerProgress
+  readonly memory: Memory
+  readonly evidence: ExecutionEvidence
+  readonly verification: VerificationService
+  readonly supervision: SupervisionService
+  readonly evaluation: EvaluationLedger
+  readonly remote: RemoteEnvironments
+  readonly experience: MemoryExperienceService
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
@@ -100,6 +119,9 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
+  private readonly manifestRunId = randomUUID()
+  private manifestPhase: 'starting' | 'ready' | 'failed' = 'starting'
+  private manifestConfig?: string
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
     super(ctx, 'orchestrator')
     const runtime = this
@@ -144,6 +166,14 @@ export class Runtime extends Service implements SourceHost {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync && (machine.mode ?? 'repository') !== 'personal') void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
           .catch(() => { /* sync() records its failure in health. */ })
+        void this.ready?.then(() => {
+          if (this.closing()) return
+          for (const ticket of store.tickets.open()) {
+            const assignment = ticket.assignments.at(-1)
+            if (ticket.mandate.actor.source === kind.kind && !ticket.hold && assignment?.state === 'pending') this.executor.start(ticket, assignment)
+          }
+          this.passes.request()
+        }).catch(error => ctx.logger.warn('Source registration recovery: %s', String(error)))
         return () => {}
       })
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
@@ -151,10 +181,52 @@ export class Runtime extends Service implements SourceHost {
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
         artifacts: this.artifacts, attachmentReferences: trigger => sources.attachmentReferences(trigger),
-        readAttachment: (trigger, id, sessionId, signal) => sources.readAttachment(trigger, id, ctx.agents.get(sessionId as SessionId), signal),
+        readAttachment: async (trigger, id, sessionId, signal) => {
+          const result = await sources.readAttachment(trigger, id, ctx.agents.get(sessionId as SessionId), signal)
+          const ticketId = ticketOfSession(sessionId), deviceId = ticketId && this.remote?.binding(ticketId)
+          if (ticketId && deviceId && result && typeof result === 'object' && 'path' in result && typeof result.path === 'string') {
+            const path = `inputs/${key(trigger.id, id)}/${basename(result.path)}`
+            const saved = await this.remote.importFile(ticketId, deviceId, result.path, path, true)
+            return { ...result, path: saved.path, remote_device: deviceId, remote_directory: saved.directory }
+          }
+          return result
+        },
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const memory = new Memory(store)
+      const memory = this.memory = new Memory(store, { tickets: store.tickets,
+        resolveSource: source => {
+          const id = source.ref.replace(/^(?:trigger|ticket)[:/]/, '')
+          const trigger = source.kind === 'trigger' ? store.triggers.get(id) : undefined
+          const ticket = source.kind === 'ticket' ? store.tickets.get(id) : undefined
+          const human = ticket ? [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' && input.human ? [input.triggerId] : [])]
+            .flatMap(triggerId => { const value = store.triggers.get(triggerId); return value?.human ? [value.text] : [] }).join('\n') : trigger?.text
+          return !!human && !!source.quote && human.includes(source.quote)
+        },
+        notifyCorrection: event => { store.atomic(() => {
+          const ticket = store.tickets.get(event.ticketId)
+          if (!ticket || ticket.ended) return
+          this.engine.note(event.ticketId, `Shared memory ${event.topic} was ${event.kind}; previous revision ${event.previousRevision}, current revision ${event.revision}.\n${event.summary}\nRead the updated context before relying on the old fact.`, event.id)
+        }); this.passes.request() } })
+      const evidence = this.evidence = new ExecutionEvidence(store)
+      const evaluation = this.evaluation = new EvaluationLedger(store, { runId: 'runtime' })
+      const measure = (event: EvaluationEvent) => { try { evaluation.record(event) } catch (error) { ctx.logger.warn('Evaluation measurement: %s', String(error)) } }
+      const remote = this.remote = new RemoteEnvironments({ store,
+        credential: async ref => {
+          const value = (await ctx.get('credentials')?.resolve(credentialRef(ref)))?.value ?? process.env[ref]
+          if (!value) throw new Error('Execution environment credential is unavailable')
+          return value
+        },
+        mayExecute: ticketId => {
+          const ticket = store.tickets.get(ticketId)
+          return !!ticket && !ticket.ended && !this.paused() && (!ticket.hold || ticket.hold.kind === 'environment')
+            && !this.remote?.commands(ticketId).some(command => command.effectiveState === 'unknown')
+            && settingsPolicy(store.settings(), sources).revalidate(ticket.mandate)
+        },
+        onState: transition => {
+          if (this.closing()) return
+          store.set(record<RemoteTransition>(`remote-transition:${transition.ticketId}:${transition.commandId}`), transition)
+          this.passes.request()
+        } })
       const conversations = new SessionConversations({ masterId, stateDir: machine.stateDir, store, artifacts: this.artifacts,
         configured: () => setup.configured(), receive: trigger => this.receive(trigger),
         attachmentPath: block => block.type === 'image' ? ctx.get('attachments')?.imageHostPath(block.attachment)
@@ -162,6 +234,14 @@ export class Runtime extends Service implements SourceHost {
         prompt: (id, requestId, text) => this.sessions.prompt(id, requestId, text, 'queue') })
       this.disposers.push(sources.register(conversations.kind))
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, conversations, memory, health: board.claim('models'), masterId,
+        mayExecute: ticket => settingsPolicy(store.settings(), sources).revalidate(ticket.mandate),
+        memoryContext: () => {
+          const triggers = store.threads.active().flatMap(thread => thread.evaluating?.triggerIds ?? thread.pending).slice(-4)
+            .flatMap(id => store.triggers.get(id) ?? [])
+          return { query: triggers.map(trigger => trigger.text).join(' ').slice(0, 200) || undefined,
+            scopes: ['global', ...new Set(triggers.map(trigger => `source:${trigger.source}`))] }
+        },
+        remoteBinding: ticketId => remote.binding(ticketId), remoteTools: ticketId => remote.tools(ticketId),
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
         tools: (agent, ticket) => [...(ticket ? executorTools(this.toolHost, ticket) : [...mainTools(this.toolHost, agent), ...memory.tools()]),
@@ -171,7 +251,9 @@ export class Runtime extends Service implements SourceHost {
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+        repliedTo: trigger => repliedTo({ store, sources }, trigger),
+        mayExecute: ticket => settingsPolicy(store.settings(), sources).revalidate(ticket.mandate),
+        launchGuard: ticket => this.qq?.observations.launchGuard(ticket) ?? { allowed: true } })
       this.workerProgress = new WorkerProgress({ store, paused: () => this.paused(), closing: () => this.closing(),
         remind: reminder => this.executor.progressReminder(reminder),
         cancel: (ticketId, requestIds) => { this.executor.cancelProgressReminders(ticketId, requestIds) },
@@ -180,13 +262,41 @@ export class Runtime extends Service implements SourceHost {
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
-        allowMessage: message => this.personalRuntime?.maySend(message) ?? !message.id.startsWith('personal-') })
+        allowMessage: message => {
+          if (message.completionKey) {
+            const ticket = message.ticketId && store.tickets.get(message.ticketId)
+            if (!ticket || ticket.ended?.by === 'human' || !completionApproved(ticket) || completionKey(ticket) !== message.completionKey) return false
+          }
+          return this.personalRuntime?.maySend(message) ?? !message.id.startsWith('personal-')
+        } })
       this.personalRuntime = new PersonalRuntime({ store, coordinator: this.personal, outbox, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
         followupsEnabled: () => !personal() || this.personal.enabled(),
-        outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+        outbox, prepareTicket: (ticket, outcome) => this.verification.prepare(executor.prepare(ticket, outcome)), emit: event => {
+          if (event.type === 'trigger.received') {
+            const trigger = store.triggers.get(event.data.triggerId), disposition = store.triggers.disposition(event.data.triggerId)
+            if (trigger?.human) measure({ id: `request:${trigger.id}`, kind: 'request', triggerId: trigger.id, at: trigger.at,
+              data: { source: trigger.source, observation: !!trigger.meta.observation } })
+            if (disposition?.fanout.length) measure({ id: `route:${event.data.triggerId}`, kind: 'route', triggerId: event.data.triggerId,
+              at: event.at, data: { path: disposition.directTicketId ? 'direct' : 'subscription' } })
+          } else if (event.type === 'decision.recorded') {
+            const decision = store.decisions.get(event.data.decisionId)
+            if (decision) measure({ id: `decision:${decision.id}`, kind: 'route', at: decision.at,
+              ...decision.ticketId ? { ticketId: decision.ticketId } : {}, data: { path: 'router', decision: decision.kind } })
+          } else if (event.type === 'ticket.ended') {
+            const ticket = store.tickets.get(event.data.ticketId)
+            if (ticket) measure({ id: `completion:${ticket.id}:${event.at}`, kind: 'completion', ticketId: ticket.id, at: event.at,
+              data: { outcome: ticket.ended?.outcome, durationMs: Math.max(0, Date.parse(event.at) - Date.parse(ticket.createdAt)) } })
+          }
+          if (event.type === 'ticket.created') {
+            const ticket = store.tickets.get(event.data.ticketId)!, source = store.triggers.get(ticket.origin.triggerId)
+            const index = memory.index({ ticketId: ticket.id, query: source?.text.slice(0, 200),
+              scopes: ['global', `source:${source?.source ?? ticket.mandate.actor.source}`, `ticket:${ticket.id}`,
+                ...setup.configured() && setup.deployment.repository ? [`project:${setup.deployment.repository}`] : []] })
+            if (index.includes('\n- ')) engine.note(ticket.id, `Relevant durable memory (context only; source requests govern):\n${index}`, `memory-initial:${ticket.id}`)
+          }
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
@@ -198,6 +308,7 @@ export class Runtime extends Service implements SourceHost {
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended) {
+            void remote.cancelTicket(ended.id).catch(error => ctx.logger.warn('Remote cancellation remains queued: %s', String(error)))
             this.personalRuntime.attention.resolve({ ticketId: ended.id })
             for (const receipt of store.receipts.waiting()) if (receipt.ticketId === ended.id
               && (receipt.id.startsWith('personal-action:') || receipt.id.startsWith('personal-attention:'))) outbox.withdraw(receipt.id)
@@ -209,17 +320,103 @@ export class Runtime extends Service implements SourceHost {
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); this.personalRuntime.tick(); this.workerProgress.tick(); evals.set(evalsHealth(store)) }
+      const callReviewModel = dshSupervisionModel(ctx, () => store.settings().eval.model ?? store.settings().executor.model
+        ?? ctx.agents.get(masterId as SessionId)?.model?.current?.() ?? undefined)
+      let auxiliarySequence = 0
+      const reviewModel: typeof callReviewModel = async (input, signal) => {
+        const id = `aux-usage:${Date.now()}:${++auxiliarySequence}`
+        try {
+          const result = await callReviewModel(input, signal), usage = result.usage
+          measure({ id, kind: 'usage', data: { tokens: usage ? usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) : null, cost: null, auxiliary: true } })
+          return result
+        } catch (error) { measure({ id, kind: 'usage', data: { tokens: null, cost: null, auxiliary: true } }); throw error }
+      }
+      this.experience = new MemoryExperienceService({ store, memory, effects, runModel: reviewModel,
+        paused: () => this.paused(), lifetime: this.lifetime,
+        scopes: ticket => [`source:${store.triggers.get(ticket.origin.triggerId)?.source ?? ticket.mandate.actor.source}`,
+          ...setup.configured() && setup.deployment.repository ? [`project:${setup.deployment.repository}`] : []] })
+      this.verification = new VerificationService({ store, effects, engine, artifacts: this.artifacts,
+        recorded: review => {
+          const mode = store.tickets.get(review.ticketId)?.acceptance?.mode
+          measure({ id: `verification:${review.id}`, kind: 'verification', ticketId: review.ticketId, at: review.at,
+            data: { state: review.state, mode, prevented: !review.superseded && mode === 'enforce' && review.state === 'needs_changes' } })
+          try { this.experience.submit(review) } catch (error) { ctx.logger.warn('Memory experience extraction deferred: %s', String(error)) }
+        },
+        runModel: (input, signal) => reviewModel(input, signal ?? this.lifetime),
+        executionEvidence: async (ticket, signal) => {
+          const events = await readLatestTurnEvents(ctx, workerSessionId(ticket.id) as SessionId, signal)
+          for (const event of events) evidence.capture(ticket.id, event)
+          const assignment = ticket.assignments.at(-1), started = Date.parse(assignment?.startedAt ?? assignment?.createdAt ?? '')
+          const commands = remote.commands(ticket.id).filter(command => Date.parse(command.createdAt) >= started
+            || Date.parse(command.remote?.endedAt ?? '') >= started)
+          return [...evidence.read(ticket.id), ...commands.map(command => ({ ref: `remote-command/${command.commandId}`,
+            kind: 'execution' as const, text: JSON.stringify(command), coverage: command.effectiveState === 'completed' || command.effectiveState === 'failed' ? 'complete' as const : 'unavailable' as const }))]
+        }, relay: (id, text) => sessions.relay(id, text), requestPass: () => this.passes.request(),
+        paused: () => this.paused(), lifetime: this.lifetime })
+      this.supervision = new SupervisionService({ store, runModel: reviewModel, paused: () => this.paused(),
+        snapshot: async options => {
+          const base = watchdogSnapshot(this.httpHost(), options)
+          if (options.includeEvidence) for (const item of base.tickets) {
+            const events = await readLatestTurnEvents(ctx, workerSessionId(item.id) as SessionId, this.lifetime)
+            for (const event of events) evidence.capture(item.id, event)
+          }
+          return watchdogSnapshot({ ...this.httpHost(), executionEvidence: ticket => this.watchdogEvidence(ticket) }, options)
+        },
+        mayAdvise: ticket => !ticket.hold && !this.remote.commands(ticket.id).some(command => command.effectiveState === 'unknown')
+          && !this.watchdogEvidence(ticket).some(item => item.kind === 'background' && item.state === 'running'),
+        currentExecutionEvidence: ticket => this.watchdogEvidence(ticket),
+        advise: (ticketId, text, requestId) => {
+          const ticket = store.tickets.get(ticketId)
+          if (!ticket || ticket.ended || ticket.hold || !policy().revalidate(ticket.mandate)) return false
+          engine.note(ticketId, text, requestId); this.passes.request(); return true
+        },
+        hold: (ticketId, reason) => {
+          const ticket = store.tickets.get(ticketId)
+          if (!ticket || ticket.ended || ticket.hold || !policy().revalidate(ticket.mandate)
+            || this.remote.commands(ticketId).some(command => command.effectiveState === 'unknown')) return false
+          engine.holdTicket(ticketId, { kind: 'operator', at: now(), reason })
+          this.passes.request(); return true
+        } })
+      this.disposers.push(ctx.on('session/event', (session, event) => {
+        const ticketId = ticketOfSession(session.id)
+        if (this.closing()) return
+        if (ticketId) evidence.capture(ticketId, event)
+        if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+          if (event.seq === undefined || !Number.isFinite(event.time)) return
+          const usage = event.type === 'assistant/message' ? event.data.usage : undefined, callId = `${session.id}:${event.seq}`
+          const tokens = usage ? usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) : undefined
+          measure({ id: `usage:${callId}`, kind: 'usage', at: new Date(event.time).toISOString(),
+            ...ticketId ? { ticketId } : {}, data: { tokens: tokens ?? null, cost: null } })
+          if (ticketId) this.qq?.observations.usage(ticketId, { callId, ...tokens !== undefined ? { tokens } : {} })
+          else if (session.id === masterId) this.qq?.observations.assessmentUsage(store.threads.active().flatMap(thread => thread.evaluating?.triggerIds ?? []),
+            { callId, ...tokens !== undefined ? { tokens } : {} })
+          this.passes.request()
+        }
+      }))
+      const evaluateDue = () => {
+        this.recordManifest()
+        for (const ticket of store.tickets.open()) if (!ticket.hold && sources.kind(ticket.mandate.actor.source) && !policy().revalidate(ticket.mandate)) {
+          engine.holdTicket(ticket.id, { kind: 'operator', at: now(), reason: 'Task authority changed; restore the source/requester/rule authorization before resuming.' })
+        }
+        engine.evaluateDue(); this.personalRuntime.tick(); this.workerProgress.tick(); this.verification.tick()
+        void remote.tick().catch(error => ctx.logger.warn('Remote environment reconciliation: %s', String(error)))
+        this.applyRemoteTransitions()
+        void memory.flushCorrections().catch(error => ctx.logger.warn('Memory correction delivery: %s', String(error)))
+        for (const hold of this.qq?.observations.tick() ?? []) engine.holdTicket(hold.ticketId, { kind: 'budget', reason: hold.reason, at: now() })
+        evals.set(evalsHealth(store))
+      }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources, verification: this.verification,
+        remote,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: receiptId => outbox.sent(receiptId),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
-      this.ready = this.initialize()
+      this.recordManifest('starting')
+      this.ready = this.initialize().catch(error => { if (!this.closing()) this.recordManifest('failed'); throw error })
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.
       try { opened?.close() } finally { release() }
@@ -227,6 +424,53 @@ export class Runtime extends Service implements SourceHost {
     }
   }
   get health(): Readonly<Record<string, Health>> { return this.board.all }
+  private recordManifest(phase = this.manifestPhase): void {
+    const config = { mode: this.machine.mode ?? 'repository', settings: this.store.settings(), promptRevision: this.store.get(KV.prompts.revision) ?? 0,
+      verification: this.verification?.config(), supervision: this.supervision?.config(),
+      environments: this.remote?.list().map(({ id, label, url }) => ({ id, label, url })) ?? [] }
+    const serialized = JSON.stringify(config)
+    if (this.manifestConfig === serialized && this.manifestPhase === phase) return
+    recordRuntimeManifest(this.store, { runId: this.manifestRunId, identity: LOADED_RUNTIME_IDENTITY, config, phase })
+    this.manifestConfig = serialized; this.manifestPhase = phase
+  }
+  private watchdogEvidence(ticket: Ticket): WatchdogExecutionEvidence[] {
+    const jobs = this.ctx.get('jobs') as { list(owner: string): { id: string; status: string; label?: string }[] } | undefined
+    const background = jobs?.list(workerSessionId(ticket.id)).filter(job => job.status === 'running' || job.status === 'stopping') ?? []
+    const at = ticket.assignments.at(-1)?.startedAt ?? ticket.createdAt
+    return [...this.evidence.snapshot(ticket.id), ...background.map(job => ({ id: `job/${job.id}`, kind: 'background' as const,
+      state: 'running', at, summary: job.label ?? `Background job ${job.id} is ${job.status}.` })),
+      ...this.remote.commands(ticket.id).filter(command => ['queued', 'waiting_environment', 'accepted', 'running'].includes(command.effectiveState))
+        .map(command => ({ id: `remote-command/${command.commandId}`, kind: 'background' as const, state: 'running', at: command.createdAt,
+          summary: `Remote command ${command.commandId} is ${command.effectiveState}.` }))]
+  }
+  /** Consume durable remote state changes only when the task may act; notes and receipts commit together. */
+  private applyRemoteTransitions(): void {
+    if (this.paused() || this.closing()) return
+    for (const name of this.store.keys('remote-transition:')) this.store.atomic(() => {
+      const transition = this.store.get(record<RemoteTransition>(name))
+      if (!transition) return
+      const ticket = this.store.tickets.get(transition.ticketId)
+      if (!ticket || ticket.ended) { this.store.delete(name); return }
+      if (!settingsPolicy(this.store.settings(), this.sources).revalidate(ticket.mandate)) return
+      if (transition.state === 'waiting_environment' || transition.state === 'unknown') {
+        this.engine.holdTicket(ticket.id, { kind: 'environment', at: now(),
+          reason: transition.state === 'unknown' ? `Remote command ${transition.commandId} has an unknown outcome; owner verification is required.`
+            : `Execution environment ${transition.deviceId} is offline; waiting to reconnect.` })
+      } else {
+        if (ticket.hold && ticket.hold.kind !== 'environment') return
+        if (ticket.hold?.kind === 'environment') {
+          this.engine.releaseTicket(ticket.id)
+          try { this.evaluation.record({ id: `recovery:${transition.commandId}:${ticket.hold.at}`, kind: 'recovery', ticketId: ticket.id,
+            data: { durationMs: Math.max(0, Date.now() - Date.parse(ticket.hold.at)) } }) } catch (error) { this.ctx.logger.warn('Recovery measurement: %s', String(error)) }
+        }
+        if (transition.commandState && ['completed', 'failed', 'cancelled', 'timed_out'].includes(transition.commandState)) {
+          this.engine.note(ticket.id, `Remote command completion event: ${JSON.stringify(this.remote.commandResult(ticket.id, transition.commandId))}. Continue the original task using this observed result; preserve its command_id on retries.`,
+            `remote-result:${transition.commandId}:${transition.commandState}`)
+        }
+      }
+      this.store.delete(name)
+    })
+  }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
   context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }
@@ -278,6 +522,7 @@ export class Runtime extends Service implements SourceHost {
     this.passes.start()
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
+    this.recordManifest('ready')
     this.schedules.start()
   }
   private httpHost(): HttpHost {
@@ -286,6 +531,10 @@ export class Runtime extends Service implements SourceHost {
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, artifacts: this.artifacts, schedules,
       personal: this.personal,
       personalRuntime: this.personalRuntime,
+      verification: this.verification, supervision: this.supervision,
+      evaluation: this.evaluation,
+      remote: this.remote,
+      runtimeManifest: () => runtimeManifestState(store),
       get qq() { return runtime.qq },
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
@@ -297,12 +546,13 @@ export class Runtime extends Service implements SourceHost {
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
     this.closingFlag = true; const schedules = this.schedules.stop(); const passes = this.passes.stop(); this.stopped.abort()
+    const remote = this.remote.close()
     try {
       this.assessor.stop()
       const ids = [this.masterId, ...this.sessions.conversationIds(), ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([schedules, passes, this.personalRuntime.drain(), this.workerProgress.drain(), this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
+      await Promise.allSettled([remote, schedules, passes, this.personalRuntime.drain(), this.workerProgress.drain(), this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()
