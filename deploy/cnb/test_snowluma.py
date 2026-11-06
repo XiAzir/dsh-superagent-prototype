@@ -173,6 +173,7 @@ class SnowLumaTests(unittest.TestCase):
         self.assertIn('--restart', args); self.assertIn('unless-stopped', args)
         self.assertIn('--shm-size=1g', args); self.assertIn('--cap-add=SYS_PTRACE', args)
         self.assertIn('seccomp=unconfined', args)
+        self.assertNotIn('no-new-privileges:true', args)
         self.assertNotIn('supervisor-private-token', str(child_env))
         self.assertNotIn('supervisor-tunnel-private-key', str(child_env))
         self.assertEqual((self.data / 'snowluma' / 'identity' / 'mac-address').stat().st_mode & 0o777, 0o600) if os.name != 'nt' else None

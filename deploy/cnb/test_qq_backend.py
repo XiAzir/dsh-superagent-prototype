@@ -62,7 +62,9 @@ class QQBackendTests(unittest.TestCase):
         self.backend.ensure_started()
         self.events.clear()
         self.snowluma.enabled = False
+        self.assertFalse(self.backend.healthy())
         self.assertFalse(self.backend.ensure_started()['enabled'])
+        self.assertTrue(self.backend.healthy())
         self.assertEqual(self.events, [('stop', 'snowluma')])
 
     def test_stop_attempts_both_enabled_bridges_even_when_one_fails(self):

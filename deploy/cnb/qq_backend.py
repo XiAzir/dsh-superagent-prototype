@@ -40,6 +40,8 @@ class QQBackend:
 
     def healthy(self) -> bool:
         selected = self.selection()
+        if selected != self.active:
+            return False
         return selected is None or bool(self.managers[selected].healthy())
 
     def stop(self, *, timeout: int = 30) -> bool:
