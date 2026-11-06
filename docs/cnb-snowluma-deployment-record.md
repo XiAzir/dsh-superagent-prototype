@@ -27,7 +27,7 @@ CNB Docker service 的 nofile 硬上限为65535，容器使用 `65535:65535`。D
 
 武汉接收端 `archive.py` 已同步 SnowLuma 数据根支持，原代码备份于 `/root/.cnb-superagent/storage-backups/snowluma-20261105T163709`；后续快照修复备份于 `snowluma-cache-20261106T024648`。
 
-QQ Chromium 的 `.config/QQ/Partitions/qqnt_*/SharedStorage` 长期持有独占 SQLite 锁。归档仅排除这组可重建浏览器缓存及其 sidecar，QQ 登录态、账号数据库和其他文件继续保存。回归覆盖持锁期间归档、登录状态文件恢复，以及其他路径同名文件的保留。
+QQ Chromium 的 `.config/QQ/SharedStorage`、`.config/QQ/Partitions/qqnt_*/SharedStorage` 长期持有独占 SQLite 锁。归档仅排除这组可重建浏览器缓存及其 sidecar，QQ 登录态、账号数据库和其他文件继续保存。回归覆盖持锁期间归档、登录状态文件恢复，以及其他路径同名文件的保留。
 
 WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据保存于私有数据根 `snowluma/operator-webui-access.json`；VNC 密码位于 `snowluma/data/config/vnc-password`，随私有快照保存。
 

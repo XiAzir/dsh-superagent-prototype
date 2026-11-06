@@ -214,7 +214,12 @@ class SnapshotTests(unittest.TestCase):
         partition.mkdir(parents=True)
         cache = partition / 'SharedStorage'
         connection = sqlite3.connect(cache)
+        profile_cache = self.data / 'snowluma' / '.config' / 'QQ' / 'SharedStorage'
+        profile_connection = sqlite3.connect(profile_cache)
         try:
+            profile_connection.execute('PRAGMA locking_mode=EXCLUSIVE')
+            profile_connection.execute('CREATE TABLE cache (value TEXT)')
+            profile_connection.commit()
             connection.execute('PRAGMA locking_mode=EXCLUSIVE')
             connection.execute('CREATE TABLE cache (value TEXT)')
             connection.commit()
@@ -228,9 +233,11 @@ class SnapshotTests(unittest.TestCase):
             snapshot = self.make_snapshot()
         finally:
             connection.close()
+            profile_connection.close()
         paths = {item['path'] for item in snapshot['files']}
         self.assertNotIn('snowluma/.config/QQ/Partitions/qqnt_9210/SharedStorage', paths)
         self.assertNotIn('snowluma/.config/QQ/Partitions/qqnt_9210/SharedStorage-journal', paths)
+        self.assertNotIn('snowluma/.config/QQ/SharedStorage', paths)
         restored = self.base / 'restored-exclusive'
         restore_snapshot(self.archive, restored)
         self.assertEqual((restored / login.relative_to(self.data)).read_text(), '{"session":"preserved"}')

@@ -84,10 +84,11 @@ def _is_chromium_shared_storage(root_name: str, relative: Path) -> bool:
     # the process lifetime. Chromium recreates it; account/session databases
     # elsewhere in the profile continue to use consistent SQLite snapshots.
     parts = relative.parts
-    return (root_name == "snowluma" and len(parts) == 5
-            and parts[:3] == (".config", "QQ", "Partitions")
-            and parts[3].startswith("qqnt_")
-            and parts[4] in {"SharedStorage", "SharedStorage-wal", "SharedStorage-shm", "SharedStorage-journal"})
+    profile_cache = len(parts) == 3 and parts[:2] == (".config", "QQ")
+    partition_cache = (len(parts) == 5 and parts[:3] == (".config", "QQ", "Partitions")
+                       and parts[3].startswith("qqnt_"))
+    return (root_name == "snowluma" and (profile_cache or partition_cache)
+            and parts[-1] in {"SharedStorage", "SharedStorage-wal", "SharedStorage-shm", "SharedStorage-journal"})
 
 
 def _is_generated_directory(root_name: str, relative: Path, name: str) -> bool:
