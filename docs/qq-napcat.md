@@ -1,8 +1,8 @@
-# 通过 NapCat 接入 QQ
+# 通过 OneBot v11 接入 QQ（NapCat / SnowLuma）
 
-NapCat 负责 QQ 登录和 OneBot v11，Superagent 负责消息路由、任务执行及回复。
+NapCat 或 SnowLuma 负责 QQ 登录和 OneBot v11，Superagent 负责消息路由、任务执行及回复。
 
-本维护部署已于2026-11-02迁入CNB：NapCat与Superagent同环境运行，数据位于`/workspace/.superagent-runtime/data/napcat`，每5分钟随私有快照上传武汉。当前QQ授权用户为`1791081637`，群列表为空。本机便携包保留作回退副本；切换前先停旧端，保持同账号单端运行。详见[迁移实录](cnb-napcat-migration-record.md)。
+本维护部署已于2026-11-02迁入CNB：NapCat与Superagent同环境运行，数据位于`/workspace/.superagent-runtime/data/napcat`，每5分钟随私有快照上传武汉。SnowLuma 的 Docker 部署与重启恢复见 [CNB 运行说明](../deploy/cnb/README.md#snowluma-生命周期)。当前QQ授权用户为`1791081637`，群列表为空。本机便携包保留作回退副本；切换前先停旧端，保持同账号单端运行。详见[迁移实录](cnb-napcat-migration-record.md)。
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
 
 ## 2. 选择连接方式
 
-在 Superagent 的 **设置 → 来源 → QQ · NapCat** 中选择方式。
+在 Superagent 的 **设置 → 来源 → QQ · OneBot v11** 中选择方式。
 
 | Superagent 选项 | NapCat 中开启 | 连接方向 | 默认地址 |
 | --- | --- | --- | --- |
@@ -50,7 +50,13 @@ NapCat 配置文件对应 `network.websocketServers[]`，常用字段为 `enable
 2. 在 NapCat WebUI 中创建并启用 **WebSocket 客户端**，目标 URL 填 `ws://127.0.0.1:6199/onebot/v11/ws`。
 3. 消息格式选择 `array`，应用配置。
 
-NapCat 配置文件对应 `network.websocketClients[]`，常用字段为 `enable`、`url`、`messagePostFormat`、`token`、`reconnectInterval` 和 `heartInterval`。当前反向监听使用回环地址，适合部署在同一台机器。当前推荐 Superagent 与 NapCat 同机运行，完整支持文字及文件、图片、视频产物交付。正向模式可跨机器连接消息事件和文字回复；文件与媒体产物通过 Superagent 本机绝对路径交给 NapCat，完整产物交付依赖两端都能读取相同路径。分机部署的字节传输或路径映射适配仍需另行实现。
+NapCat 配置文件对应 `network.websocketClients[]`，常用字段为 `enable`、`url`、`messagePostFormat`、`token`、`reconnectInterval` 和 `heartInterval`。当前反向监听使用回环地址，适合部署在同一台机器。文件、图片与视频产物在校验快照后，以 `base64://` 字节内容通过 OneBot 发送；分容器或分机部署可直接传输。每个产物上限 50 MiB，编码后约 67 MiB，上传期间会占用相应内存。
+
+### SnowLuma Docker
+
+按 [官方 Docker 部署说明](https://snowluma.github.io/zh/docs/guide/deploy/docker) 启动，使用 noVNC（6081）完成 QQ 登录，WebUI 默认 5099。宿主机 SA 连接发布到 loopback 的 `ws://127.0.0.1:3001/`；同 Docker 网络可连接容器名。
+
+SnowLuma 的配置为 `data/config/onebot.json`（可选账号级 `onebot_<QQ号>.json`），使用 `networks.wsServers[]` 的 `host`、`port`、`path`、`role: Universal`、`accessToken`、`messageFormat: array`。容器内监听 `0.0.0.0`，宿主仅发布 `127.0.0.1`。将其 `accessToken` 保存到 SA 的 QQ 来源令牌。RPC echo 同时兼容数字及字符串。
 
 ## 3. 保存访问令牌与授权范围
 
@@ -95,7 +101,7 @@ QQ 活动可在 **来源、触发、评估、执行** 页查看。个人任务�
 
 支持文字、@、引用消息，以及图片、文件、语音、视频的附件元数据。每个入站附件都有稳定的 `attachment/<trigger-id>/<id>` 读取引用，Worker 通过 `orchestrator_read` 获取文件状态、名称、大小和本机缓存路径。模型按需读取文件内容，NapCat 凭据由适配器使用。
 
-附件获取优先使用 NapCat `get_file` / `get_image`，缺少定位信息时从原消息恢复；成功结果会缓存，并合并并发读取。默认文件上限 50 MiB、获取总超时 30 秒，支持重试、取消及失败清理。仅回环 NapCat 连接可使用 API 返回的本机文件路径，消息内的路径只作为定位信息处理。
+文件附件优先使用 `get_group_file_url` / `get_private_file_url`，接口返回不支持时回退 `get_file`；图片使用 `get_image`，缺少定位信息时从原消息恢复；成功结果会缓存，并合并并发读取。默认文件上限 50 MiB、获取总超时 30 秒，支持重试、取消及失败清理。仅回环 NapCat 连接可使用 API 返回的本机文件路径，消息内的路径只作为定位信息处理。
 
 Worker 完成文件任务时，通过 `orchestrator_report(state=ready, artifacts=[{path,name}])` 登记任务目录中的产物。系统保存独立快照、校验大小和 SHA-256；Router 的 `orchestrator_reply(purpose=result)` 自动携带报告内的产物。QQ 适配器通过私聊/群文件 API 上传，并记录确认结果，重试跳过已确认的文件。产物默认最多 8 个、每个 50 MiB。Worker 修改原文件后，已登记的快照继续保持原内容。
 

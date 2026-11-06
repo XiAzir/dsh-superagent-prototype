@@ -4,7 +4,7 @@
 
 ## 目标规格与访问
 
-- `.cnb.yml` 的 `linux.vscode` 使用4核、8GB，Docker service承载NapCat，离线保留18小时。首次配置将Worker并发设为1；已有配置继续保留。更高内存规格需核对对应runner资源。
+- `.cnb.yml` 的 `linux.vscode` 使用4核、8GB，Docker service承载所选QQ后端，离线保留18小时。首次配置将Worker并发设为1；已有配置继续保留。更高内存规格需核对对应runner资源。
 - 本部署的公网 Web 入口为 `https://superagent.1994622.xyz/`，使用独立 HTTPS BasicAuth 登录；用户名 `azir`，密码保存在运维仓库已忽略的 `local/secrets.md` 对应条目。云端环境恢复后会自动重建反向隧道，日常访问直接使用域名。
 - Superagent web 服务监听 `127.0.0.1:13082`。客户端通过当前 CNB 工作区 SSH 目标建立隧道：
 
@@ -39,6 +39,7 @@ CNB 应用的持久数据统一位于 `/workspace/.superagent-runtime/data`：
 | `state` | Superagent SQLite、任务、定时任务、QQ附件、默认Worker工作目录 |
 | `work` | DSH默认工作目录与手工保存的工作文件 |
 | `home` | 应用HOME；工具配置、XDG数据、浏览器profile等 |
+| `snowluma` | SnowLuma data、QQ .config/.local/share、稳定设备身份；完整保存 |
 | `napcat` | QQ登录数据、NapCat配置、插件、app、缓存、设备身份；完整保存依赖与缓存 |
 
 监督器显式设置HOME/XDG相关变量，并在复用tmux会话时更新每个新pane的环境。临时文件与运行socket位于同一workspace下的`control/tmp`和`control/run`。归档服务兼容较早仅包含dsh-home/state/work的快照。
@@ -63,6 +64,24 @@ python3 deploy/cnb/runtime.py shutdown    # 环境结束时保存快照，允许
 NapCat的WebUI token从已持久的`napcat/config/webui.json`读取，OneBot token通过Superagent管理API保存到DSH凭据服务。容器固定镜像digest、hostname、machine-id与MAC，并校验ownership、只读产物挂载和loopback端口；Docker29停止时隐藏的endpoint MAC会在启动后再次严格验证。WebUI6099与OneBot3001仅监听宿主loopback。
 
 迁移与验收记录：[本地NapCat迁移CNB](../../docs/cnb-napcat-migration-record.md)。切换回本机时先停止云端运行，再启动本地NapCat，以保持同账号单端运行。
+
+### SnowLuma 生命周期
+
+在 `data/snowluma/deployment.json` 写入 `{"enabled":true}`，并将 `data/napcat/deployment.json` 的 `enabled` 设为 `false`。监督器选择一个 QQ 后端，启动前停止另一个自有容器。两个后端同时启用时记录配置错误并等待修复。
+
+SnowLuma 容器 `superagent-snowluma` 固定 v2.4.0 镜像 digest，使用 `unless-stopped` 重启策略。CNB `.cnb.yml` 每次启动执行 `runtime.py start`，恢复快照后启动 QQ 后端，再启动 DSH；运行期间检查容器/WebUI并重试。人工暂停、环境结束或失去租约时停止 QQ 容器；环境结束保存快照并允许下一工作区恢复。手机验证要求以 QQ 的提示为准。
+
+三个持久卷为 `snowluma/data:/app/data`、`snowluma/.config:/app/.config`、`snowluma/.local/share:/app/.local/share`；`data/config/machine-id` 及 `identity/mac-address` 持久保存。SnowLuma 数据根完整参与私有快照。归档接收端须同步新版 `archive.py`，支持 `snowluma` 根。
+
+WebUI 5099、noVNC 6081、OneBot WS 3001 发布到宿主 `127.0.0.1`；可选 `http_enabled:true` 发布 HTTP 3000。应用默认 UID/GID1000。CNB Docker service 的 nofile 上限为65535，因此容器使用 `65535:65535`；Docker capability `CAP_SYS_PTRACE` 与 `SYS_PTRACE` 统一校验。镜像的 Node 二进制具有 `cap_sys_ptrace=ep`，显式设置 `no-new-privileges=false`，保留该文件 capability 供 UID1000 加载 QQ 组件；CNB Docker daemon 默认开启的 no-new-privileges 会屏蔽该能力。
+
+登录入口通过临时 SSH 转发访问：
+
+```sh
+ssh -N -L 15099:127.0.0.1:5099 -L 16081:127.0.0.1:6081 <当前工作区SSH目标>
+```
+
+WebUI 为 `http://127.0.0.1:15099/`，桌面为 `http://127.0.0.1:16081/vnc.html`。VNC 密码保存在云端私有 `snowluma/data/config/vnc-password`；OneBot token 存入 SA 凭据服务。产物通过 base64 内容传输，保持 SA 私有目录权限。
 
 跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭及人工暂停会在应用停止后再保存一次快照。
 
