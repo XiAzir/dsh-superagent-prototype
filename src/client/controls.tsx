@@ -31,6 +31,7 @@ const ICON_PATHS = {
   settings: 'M4 7h10M18 7h2M4 17h4M12 17h8M16 5v4M10 15v4',
   external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
   session: 'M4 5h16v14H4zM8 10l3 2-3 2M13 15h3',
+  workspace: 'M3 7h7l2-3h8a1 1 0 0 1 1 1v14H3zM3 7v12M3 9h18',
   stop: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM9.5 9.5h5v5h-5z',
   pause: 'M9 6v12M15 6v12',
   play: 'M8 5l11 7-11 7z',

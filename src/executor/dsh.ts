@@ -20,6 +20,7 @@ import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 import { lastAssistantMessage } from '../infra/session-history.ts'
+import { progressAnchor, progressEligible, type ProgressReminder } from '../app/worker-progress.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -124,6 +125,9 @@ export function triggerMessage(trigger: Trigger, link: { source_url?: string; so
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
     ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link,
     ...trigger.attachments?.length ? { attachments: trigger.attachments } : {}, ...(note ? { routing_note: note } : {}),
+    ...Array.isArray(trigger.meta.mentionedWorkers) ? { mentioned_workers: trigger.meta.mentionedWorkers,
+      collaboration_route: trigger.meta.router === true ? 'router_coordinates' : 'worker_direct',
+      ...typeof trigger.meta.routingInstruction === 'string' ? { routing_instruction: trigger.meta.routingInstruction } : {} } : {},
     ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
@@ -412,6 +416,46 @@ export class DshExecutor implements Executor {
   }
   /** Number of open tickets whose worker holds a worker slot: its turn runs, or its shell jobs or subagents still run after its turn ended. */
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
+  /** Withdraws unread timer reminders after a real report or a stop, leaving all task inputs intact. */
+  cancelProgressReminders(ticketId: string, requestIds: string[]): void {
+    const agent = this.host.context.agents.get(workerSessionId(ticketId) as SessionId)
+    for (const requestId of requestIds) agent?.inbox.remove(this.host.sessions.promptedId(requestId))
+  }
+  /** Steers a status-only reminder at a safe model step, preserving task authorization and worker capacity. */
+  async progressReminder(reminder: ProgressReminder): Promise<boolean> {
+    const { ticketId, assignmentId, requestId, previousRequestId, anchor } = reminder
+    const current = () => {
+      const ticket = this.host.store.tickets.get(ticketId)
+      return !this.host.closing() && !this.host.paused() && ticket && progressEligible(ticket)
+        && runningAssignment(ticket)?.id === assignmentId && progressAnchor(ticket) === anchor ? ticket : undefined
+    }
+    const ticket = current(), sessionId = workerSessionId(ticketId)
+    const agent = this.host.context.agents.get(sessionId as SessionId)
+    if (!ticket || !agent || this.stopping.has(ticketId)) return false
+    // A slow foreground tool can leave a reminder waiting until the next safe step. Keep just that one.
+    if (previousRequestId && [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
+      .some(message => message.id === this.host.sessions.promptedId(previousRequestId))) return false
+    const waking = !this.running(ticket)
+    if (waking) {
+      try { this.slots.reserve(ticketId, 'wake') }
+      catch (error) { if (error instanceof Later) return false; throw error }
+    }
+    try {
+      const text = 'Scheduled collaboration progress summary. Publish one concise orchestrator_report now from observations already available: '
+        + 'what is completed, the current finding or wait, and the next step (2-4 short lines, in the person\'s language). '
+        + 'Keep completed/pending steps accurate. This reminder is status-only: do not repeat task actions, poll tools, or start a new investigation. '
+        + 'If an external/event wait remains, preserve state=waiting and waiting_for; preserve existing next_check schedules unchanged. '
+        + 'Otherwise use state=progress and continue the current assignment. If no new result exists, say what is still running or awaited. '
+        + 'Ordinary progress stays in the collaboration record; omit reply_to_trigger_id and human_action unless a real new decision is required.'
+      await this.host.sessions.prompt(sessionId, requestId, text, 'steer', () => {
+        if (!current() || this.stopping.has(ticketId)) throw new Later('Progress reminder held because worker state changed')
+      })
+      return true
+    } catch (error) {
+      if (error instanceof Later) return false
+      throw error
+    } finally { if (waking) this.slots.free(ticketId) }
+  }
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false

@@ -3,7 +3,7 @@ import { act, useState, type ComponentType } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { ApiError, caller, usePoll } from '../src/client/api.ts'
-import { apply } from '../src/client/index.tsx'
+import { apply, inject } from '../src/client/index.tsx'
 import { zh } from '../src/client/locales.ts'
 import { SettingsSchema } from '../src/policy.ts'
 
@@ -21,6 +21,8 @@ function fixture(listed: string[]) {
     effect: (effect: () => unknown) => { effect() },
     sessions: { list: { getSnapshot: () => ({ phase: 'ready', byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
     uiWorkspace: { openSession: vi.fn() },
+    sidebarRightTabs: { register: vi.fn(() => () => {}) },
+    sidebarRight: { mounted: { getSnapshot: () => undefined, subscribe: () => () => {} }, openTab: vi.fn() },
     // Omit config form service so Deployment renders read-only.
     get: () => undefined,
   }
@@ -36,6 +38,8 @@ async function render(entry: Entry, props: Record<string, unknown>) {
   return { container, dispose: () => { act(() => { root.unmount() }); container.remove() } }
 }
 const openMaster = async (container: HTMLElement) => {
+  const tools = container.querySelector<HTMLDetailsElement>('.sa-shell-more')!
+  if (!tools.open) await act(async () => { tools.querySelector('summary')!.click() })
   const button = [...container.querySelectorAll('button')].find(item => item.textContent === zh.openMaster)!
   await act(async () => { button.click() })
   for (let i = 0; i < 5; i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
@@ -50,8 +54,9 @@ const serve = (masterReady = true) => vi.stubGlobal('fetch', vi.fn(async (url: s
 afterEach(() => { vi.unstubAllGlobals() })
 
 it('registers a localized main panel, sidebar entry and Plugin Manager row page, and no settings section', () => {
+  expect(inject).toContain('layout')
   const { entries, dictionaries, main, nav } = fixture([])
-  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'plugins.row.config'])
+  expect(entries.map(entry => entry.options.name)).toEqual(['main', 'sidebar.panellist', 'plugins.row.config', 'sidebar.right.pane.tab', 'shell.overlay'])
   expect(entries[2]!.options).toMatchObject({ key: 'dsh-superagent#dsh-superagent', locale: 'dshSuperagent' })
   expect(Object.keys(dictionaries)).toEqual(['dshSuperagent'])
   expect(main.options).toMatchObject({ key: 'dsh-superagent', locale: 'dshSuperagent' })
@@ -65,6 +70,7 @@ it('opens a listed Session through the workspace from the main panel', async () 
   const view = await render(main, { t })
   await openMaster(view.container)
   expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
+  expect(view.container.querySelector<HTMLDetailsElement>('.sa-shell-more')!.open).toBe(false)
   view.dispose()
 })
 

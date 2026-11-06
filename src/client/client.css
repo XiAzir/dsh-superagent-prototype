@@ -100,7 +100,6 @@
 .dt-room-worker { display: flex; align-items: flex-start; gap: 10px; min-width: 0; flex-wrap: wrap; }
 .dt-room-worker > .dt-row-main { flex: 1 1 180px; }
 .dt-room-worker-title { font-size: 13px; line-height: 20px; font-weight: 600; overflow-wrap: anywhere; }
-.dt-room-summary { margin: 4px 0 0; font-size: 13px; line-height: 20px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .dt-room-activity { margin: 10px 0 0 24px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .dt-room-activity-list { list-style: none; width: 100%; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .dt-room-activity-list li { min-width: 0; padding: 10px 12px; border-radius: 10px; background: var(--dsw-alias-bg-module-platform); }
@@ -114,8 +113,6 @@
 .dt-room-message-head time { margin-left: auto; flex: none; }
 .dt-room-message-text { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 20px; }
 .dt-room-details { margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: var(--dsw-alias-bg-module-platform); }
-.dt-room-composer { gap: 12px; }
-.dt-room-composer .dt-textarea { min-height: 84px; }
 @media (max-width: 520px) {
   .dt-room-message { padding: 10px; }
   .dt-room-message-head { align-items: flex-start; flex-wrap: wrap; }

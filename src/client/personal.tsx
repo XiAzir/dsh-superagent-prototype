@@ -1,13 +1,14 @@
 /** First-class web task entry for personal mode. */
-import { useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef } from 'react'
 import type { WebTaskSummary, WebTaskView } from '../app/web-tasks.ts'
 import { Button, Dot, Icon, Tag } from './controls.tsx'
 import { usePoll } from './api.ts'
 import type { DshSuperagentKey } from './locales.ts'
 import { usePanel } from './provider.tsx'
-import { errorText, valueLabel, when } from './text.ts'
+import { valueLabel, when } from './text.ts'
 import { Hint, LoadState, MarkdownLite, PageHead, Section } from './widgets.tsx'
 import { ArtifactDownload } from './artifacts.tsx'
+import { MessageComposer, MessageImages } from './message-composer.tsx'
 
 const statusKey = (status: WebTaskSummary['status']): DshSuperagentKey => `webTask.status.${status}`
 const statusTone = (status: WebTaskSummary['status']) => status === 'done' ? 'success'
@@ -18,51 +19,22 @@ const dotState = (status: WebTaskSummary['status']) => status === 'done' ? 'done
 function TaskComposer({ task, onCreated, onMessage }: { task?: WebTaskView; onCreated: (task: WebTaskView) => void
   onMessage: (task: WebTaskView) => void }) {
   const { t, call } = usePanel()
-  const [text, setText] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [failure, setFailure] = useState('')
-  const sending = useRef(false)
-  const pending = useRef<{ text: string; requestId: string }>()
-  const create = !task
-  const submit = async (event: FormEvent) => {
-    event.preventDefault()
-    const message = text.trim()
-    if (sending.current || !message || message.length > 16_000) return
-    if (!pending.current || pending.current.text !== message) pending.current = { text: message, requestId: crypto.randomUUID() }
-    sending.current = true; setBusy(true); setFailure('')
-    try {
-      const body = pending.current
-      const result = create
-        ? await call('POST web/tasks', { body })
-        : await call('POST web/tasks/:id/messages', { id: task.id, body })
-      pending.current = undefined
-      setText('')
-      if (create) onCreated(result)
-      else onMessage(result)
-    } catch (error) {
-      setFailure(errorText(error))
-    } finally {
-      sending.current = false; setBusy(false)
-    }
-  }
-  const label = create ? t('webTask.newPrompt') : t('webTask.followup')
-  return <form className="dt-form dt-web-task-composer" onSubmit={event => { void submit(event) }}>
-    <label className="dt-field">
-      <span className="dt-field-head">{label}</span>
-      <textarea id={create ? 'dt-web-task-input' : undefined} autoFocus={create} className="dt-textarea" rows={create ? 5 : 3}
-        maxLength={16_000} value={text} disabled={busy}
-        aria-label={label} placeholder={t(create ? 'webTask.newPlaceholder' : 'webTask.followupPlaceholder')}
-        onChange={event => { setText(event.target.value); setFailure('') }} />
-      <small>{t('webTask.charCount', { count: text.trim().length })}</small>
-    </label>
-    {failure && <p className="dt-error" role="alert">{failure}</p>}
-    <div className="dt-row-actions">
-      <Button type="submit" variant="primary" disabled={busy || !text.trim() || text.trim().length > 16_000}
-        icon={<Icon name={busy ? 'running' : 'plus'} size={14} />}>
-        {busy ? t('webTask.sending') : t(create ? 'webTask.create' : 'webTask.send')}
-      </Button>
-    </div>
-  </form>
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  const create = !task, chinese = t('lang') === 'zh'
+  const starterLabels = chinese ? ['分析与研究', '编写与修改', '检查与排障'] : ['Research & analysis', 'Create & edit', 'Review & debug']
+  const starterTexts = chinese
+    ? ['请帮我研究：\n\n背景：\n期望结果：', '请帮我完成：\n\n相关资料或路径：\n验收标准：', '请帮我检查：\n\n遇到的问题：\n已有线索：']
+    : ['Please research:\n\nContext:\nExpected result:', 'Please create or edit:\n\nReferences or paths:\nAcceptance criteria:', 'Please investigate:\n\nProblem:\nAvailable evidence:']
+  return <MessageComposer draftKey={`superagent/task-draft/${task?.id ?? 'new'}`} call={call} t={t}
+    label={t(create ? 'webTask.newPrompt' : 'webTask.followup')} placeholder={t(create ? 'webTask.newPlaceholder' : 'webTask.followupPlaceholder')}
+    submitLabel={t(create ? 'webTask.create' : 'webTask.send')} textareaId={create ? 'dt-web-task-input' : undefined}
+    rows={create ? 5 : 3} autoFocus={create} starters={create ? starterLabels.map((label, index) => ({ label, text: starterTexts[index]! })) : undefined}
+    onSend={async ({ text, requestId, attachmentIds }) => {
+      const body = { text, requestId, ...(attachmentIds.length ? { attachmentIds } : {}) }
+      const result = create ? await call('POST web/tasks', { body }) : await call('POST web/tasks/:id/messages', { id: task.id, body })
+      if (mounted.current) { if (create) onCreated(result); else onMessage(result) }
+    }} />
 }
 
 function TaskList({ items, selectedId }: { items: WebTaskSummary[]; selectedId?: string }) {
@@ -113,6 +85,7 @@ function TaskThread({ task, onUpdated }: { task: WebTaskView; onUpdated: (task: 
             <time dateTime={message.at}>{when(message.at, t('lang'))}</time></div>
           {message.role === 'assistant' ? <MarkdownLite text={message.text} />
             : <div className="dt-web-task-user-text">{message.text}</div>}
+          <MessageImages attachments={message.attachments} />
           {!!message.artifacts?.length && <ul className="dt-web-task-artifacts">
             {message.artifacts.map(artifact => <li key={artifact.id}><ArtifactDownload conversation={task.id} artifact={artifact} /></li>)}
           </ul>}
@@ -131,50 +104,26 @@ function TaskThread({ task, onUpdated }: { task: WebTaskView; onUpdated: (task: 
 
 export function PersonalPage({ id }: { id?: string }) {
   const { t, call, navigate } = usePanel()
-  const tasks = usePoll(() => call('GET web/tasks', { query: { limit: 50 } }), [], 4000)
   const selected = usePoll(() => id ? call('GET web/tasks/:id', { id }) : Promise.resolve(undefined), [id], 4000)
-  const [older, setOlder] = useState<WebTaskSummary[]>([])
-  const [nextOffset, setNextOffset] = useState<number | null | undefined>(undefined)
-  const [moreBusy, setMoreBusy] = useState(false)
-  const [moreError, setMoreError] = useState('')
-  const list: WebTaskSummary[] = [...tasks.data?.items ?? [], ...older.filter(item => !tasks.data?.items.some(latest => latest.id === item.id))]
-  const loadMore = async () => {
-    const offset = nextOffset === undefined ? tasks.data?.next_offset : nextOffset
-    if (offset === null || offset === undefined || moreBusy) return
-    setMoreBusy(true); setMoreError('')
-    try {
-      const page = await call('GET web/tasks', { query: { offset, limit: 50 } })
-      setOlder(current => [...current, ...page.items.filter(item => !current.some(existing => existing.id === item.id))])
-      setNextOffset(page.next_offset)
-    } catch (error) { setMoreError(errorText(error)) }
-    finally { setMoreBusy(false) }
-  }
+  const chinese = t('lang') === 'zh'
   const created = (task: WebTaskView) => navigate({ page: 'rooms', id: `web:${task.id}` })
-  return <div className="dt-web-task-page">
+  return <div className="dt-web-task-page sa-new-task-page">
     {id ? <>
       {selected.data ? <><LoadState error={selected.error} loading={false} /><TaskThread key={selected.data.id} task={selected.data}
-        onUpdated={() => { void selected.reload(); void tasks.reload() }} /></>
+        onUpdated={() => { void selected.reload() }} /></>
         : <><PageHead title={t('webTask.title')}><Button variant="outline" size="sm" icon={<Icon name="plus" size={14} />}
           onClick={() => navigate({ page: 'tasks' })}>{t('webTask.newTask')}</Button></PageHead>
           <LoadState error={selected.error} loading={!selected.data} /></>}
     </> : <>
-      <PageHead title={t('webTask.title')}>
-        <Button variant="primary" size="sm" icon={<Icon name="plus" size={14} />} onClick={() => document.getElementById('dt-web-task-input')?.focus()}>
-          {t('webTask.newTask')}
-        </Button>
-      </PageHead>
-      <Section title={t('webTask.newTask')}>
+      <button type="button" className="sa-back" onClick={() => navigate({ page: 'rooms' })}><Icon name="chevron-left" />{chinese ? '全部任务' : 'All tasks'}</button>
+      <div className="sa-page-intro"><div className="sa-eyebrow">{chinese ? '把目标交给 SUPERAGENT' : 'MAKE ROOM FOR YOUR NEXT IDEA'}</div>
+        <h2>{chinese ? '想完成什么？' : 'What would you like to accomplish?'}</h2>
+        <p>{chinese ? '写下目标、已有背景和期望结果。任务创建后，可以随时补充要求和查看进展。' : 'Describe the goal, context and expected result. You can add requirements and follow progress at any time.'}</p></div>
+      <div className="sa-new-task-card">
         <TaskComposer onCreated={created} onMessage={created} />
-      </Section>
-      <Section title={t('webTask.taskList')} count={list.length}>
-        {!tasks.data && <LoadState error={tasks.error} loading />}
-        {tasks.data && <TaskList items={list} />}
-        {moreError && <p className="dt-error" role="alert">{moreError}</p>}
-        {(nextOffset === undefined ? tasks.data?.next_offset !== null : nextOffset !== null) && tasks.data && <Button variant="outline" size="sm"
-          disabled={moreBusy} icon={<Icon name={moreBusy ? 'running' : 'chevron-down'} size={14} />} onClick={() => { void loadMore() }}>
-          {t(moreBusy ? 'webTask.loadingMore' : 'loadMore')}
-        </Button>}
-      </Section>
+      </div><div className="sa-new-task-guidance"><Icon name="review" size={18} /><p>{chinese
+        ? '清楚的目标有助于顺利交付：说明要解决的问题、可使用的资料，以及你希望收到的成果。'
+        : 'A clear goal helps delivery: include the problem, available references and the result you want to receive.'}</p></div>
     </>}
   </div>
 }

@@ -242,7 +242,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Reply by purpose: answer, status from a saved snapshot, result when ready, or attention with a question. Receipts persist; delivery is asynchronous. Web/QQ: 20000 characters; Feishu: ${IM_WORDS} words.`,
+      description: `Reply by purpose: answer/status use the current human message's trigger_id and return there; result goes to the Ticket's original conversation; attention follows its question. Use trigger_id for every answer/status candidate. Receipts persist; delivery is asynchronous. Web/QQ: 20000 characters; Feishu: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().min(1).optional().describe('Original human question for answer; current human follow-up for status.'),
         ticket_id: z.string().min(1).optional().describe('Explicit ticket for status, result or attention; ignored for answer.'),
@@ -265,7 +265,14 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           : host.engine.reply({ purpose: args.purpose, text: args.text, ...args.artifacts ? { artifacts: args.artifacts } : {},
             ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
             ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
-        return { receipt_id: reply.id, status: host.store.replyStatus(reply.id) ?? reply.status, ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
+        const ticket = args.ticket_id ? host.store.tickets.get(args.ticket_id) : undefined
+        const originTriggerId = args.purpose === 'attention' ? ticket?.attention?.triggerId ?? args.trigger_id
+          : args.purpose === 'result' ? ticket?.origin.triggerId : args.trigger_id
+        const origin = originTriggerId ? host.store.triggers.get(originTriggerId)?.channel?.address.sessionId
+          : args.purpose === 'attention' || args.purpose === 'result' ? ticket?.channels[0]?.address.sessionId : undefined
+        return { receipt_id: reply.id, status: host.store.replyStatus(reply.id) ?? reply.status,
+          ...origin ? { reply_target_session: origin, reply_target_is_current_session: origin === agent.id } : {},
+          ...reply.snapshot ? { snapshot: reply.snapshot } : {} }
       },
     }),
     tool({

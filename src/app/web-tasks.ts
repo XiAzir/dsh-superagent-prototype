@@ -7,9 +7,10 @@ import type { SourceKind } from '../sources/kind.ts'
 import { SourcePolicySchema } from '../policy.ts'
 import type { Store } from './store.ts'
 import type { ArtifactRegistry, TaskArtifact } from './artifacts.ts'
+import { WebImageIds, type WebAttachmentStore, type WebImage } from './web-attachments.ts'
 
 export interface WebMessageArtifact { id: string; ticketId: string; name: string; size: number; kind: TaskArtifact['kind'] }
-export interface WebMessage { id: string; role: 'user' | 'assistant'; text: string; at: string; artifacts?: WebMessageArtifact[] }
+export interface WebMessage { id: string; role: 'user' | 'assistant'; text: string; at: string; artifacts?: WebMessageArtifact[]; attachments?: WebImage[] }
 export interface WebTaskSummary {
   id: string; title: string; createdAt: string; updatedAt: string
   status: 'queued' | 'working' | 'person' | 'done' | 'idle' | 'paused'
@@ -24,15 +25,17 @@ interface WebTaskHost {
   health(): Readonly<Record<string, Health>>
   failure?(ticketIds: string[]): { message: string; at: string } | undefined
   artifacts?: Pick<ArtifactRegistry, 'verify'>
+  attachments?: WebAttachmentStore
   receive(trigger: Trigger): ReceiveResult
   requestPass(): void
 }
 const PREFIX = 'web-task:'
 const taskKey = (id: string) => record<WebTaskRecord>(`${PREFIX}${id}`)
 export const WebMessageRequest = z.object({
-  text: z.string().trim().min(1).max(16000),
+  text: z.string().trim().max(16000),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/),
-}).strict()
+  attachmentIds: WebImageIds,
+}).strict().refine(value => !!value.text || value.attachmentIds.length > 0, { message: '请输入内容或添加图片。' })
 /** A user-facing Web task refusal with the HTTP status its route should return. */
 export class WebTaskError extends Error {
   constructor(readonly status: 400 | 404 | 409 | 503, message: string) { super(message) }
@@ -83,38 +86,41 @@ export class WebTasks {
   }
   create(input: unknown): WebTaskView {
     this.requireWritable()
-    const { text, requestId } = WebMessageRequest.parse(input)
+    const { text, requestId, attachmentIds } = WebMessageRequest.parse(input)
     const id = key('web-task', requestId)
     const existing = this.host.store.get(taskKey(id))
     if (existing) {
-      if (existing.messages[0]?.text !== text) throw new WebTaskError(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+      if (existing.messages[0]?.text !== text || JSON.stringify(existing.messages[0]?.attachments?.map(image => image.id) ?? []) !== JSON.stringify([...new Set(attachmentIds)])) throw new WebTaskError(409, '这次发送的编号已经用于另一段内容，请重新发送。')
       return this.view(existing)
     }
     const at = new Date().toISOString()
-    const task: WebTaskRecord = { id, title: text.split('\n')[0]!.slice(0, 100), createdAt: at, updatedAt: at, messages: [] }
-    this.append(task, text, requestId)
+    const task: WebTaskRecord = { id, title: text.split('\n')[0]!.slice(0, 100) || '图片任务', createdAt: at, updatedAt: at, messages: [] }
+    this.append(task, text, requestId, attachmentIds)
     return this.get(id)
   }
   followup(id: string, input: unknown): WebTaskView {
     this.requireWritable()
     const task = this.record(id)
-    const { text, requestId } = WebMessageRequest.parse(input)
-    this.append(task, text, requestId)
+    const { text, requestId, attachmentIds } = WebMessageRequest.parse(input)
+    this.append(task, text, requestId, attachmentIds)
     return this.get(id)
   }
-  private append(task: WebTaskRecord, text: string, requestId: string): void {
+  private append(task: WebTaskRecord, text: string, requestId: string, attachmentIds: string[] = []): void {
     const id = `web-message-${key(task.id, requestId)}`
     const previous = task.messages.find(message => message.id === id)
     if (previous) {
-      if (previous.text !== text) throw new WebTaskError(409, '这次发送的编号已经用于另一段内容，请重新发送。')
+      if (previous.text !== text || JSON.stringify(previous.attachments?.map(image => image.id) ?? []) !== JSON.stringify([...new Set(attachmentIds)])) throw new WebTaskError(409, '这次发送的编号已经用于另一段内容，请重新发送。')
       return
     }
     const at = new Date().toISOString()
+    if (attachmentIds.length && !this.host.attachments) throw new WebTaskError(503, '图片服务正在初始化，请稍后重试。')
+    const attachments = this.host.attachments?.descriptions(attachmentIds) ?? []
     const trigger: Trigger = { id, source: 'web', routing: 'router', threads: [{ source: 'web', id: task.id }],
       actor: { source: 'web', id: 'owner' }, human: true, addressed: 'direct', text, at,
-      channel: { source: 'web', thread: `web:${task.id}`, address: { conversation: task.id } }, meta: { conversation: task.id } }
+      ...attachments.length ? { attachments: this.host.attachments!.references(id, attachmentIds) } : {},
+      channel: { source: 'web', thread: `web:${task.id}`, address: { conversation: task.id } }, meta: { conversation: task.id, attachmentIds } }
     this.host.store.atomic(() => {
-      task.messages.push({ id, role: 'user', text, at }); task.updatedAt = task.updatedAt < at ? at : task.updatedAt
+      task.messages.push({ id, role: 'user', text, at, ...attachments.length ? { attachments } : {} }); task.updatedAt = task.updatedAt < at ? at : task.updatedAt
       this.host.store.set(taskKey(task.id), task)
       this.host.store.webTasks.save({ id: task.id, title: task.title, createdAt: task.createdAt, updatedAt: task.updatedAt, lastUserAt: at })
       const result = this.host.receive(trigger)
@@ -151,7 +157,7 @@ export class WebTasks {
 }
 
 /** Channel delivery is persisted atomically and idempotently before the outbox marks the reply sent. */
-export function webSource(store: Store, personal: () => boolean, artifacts?: Pick<ArtifactRegistry, 'verify'>): SourceKind<Record<string, never>> {
+export function webSource(store: Store, personal: () => boolean, artifacts?: Pick<ArtifactRegistry, 'verify'>, attachments?: WebAttachmentStore): SourceKind<Record<string, never>> {
   const authorized = (): boolean => {
     const settings = store.settings()
     return personal() && settings.sources.web?.enabled !== false && !!settings.policy.sources.web?.allowed.some(actor => actor.id === 'owner')
@@ -164,6 +170,13 @@ export function webSource(store: Store, personal: () => boolean, artifacts?: Pic
     policy: { schema: SourcePolicySchema, fields: [{ key: 'allowed', type: 'rows', label: { zh: '允许交办的个人账号', en: 'Allowed owners' },
       columns: [{ key: 'id', type: 'text', label: { zh: '账号', en: 'Account' } }, { key: 'name', type: 'text', optional: true, label: { zh: '名称', en: 'Name' } }] }],
     explicit: { zh: '在 Web 任务中发送的消息视为直接交办，账号固定为 owner。', en: 'Web messages are direct requests from the local owner account.' } },
+    attachments: {
+      references: trigger => authorized() ? trigger.attachments ?? [] : [],
+      read: async (trigger, id, agent, signal) => {
+        if (!authorized() || !attachments) throw new WebTaskError(409, '图片读取权限已更新，请刷新后重试。')
+        return attachments.read(trigger, id, agent, signal)
+      },
+    },
     threadContext: {
       messageId: trigger => trigger.id,
       read: async (_commands, trigger, part, cursor) => {
@@ -172,7 +185,8 @@ export function webSource(store: Store, personal: () => boolean, artifacts?: Pic
         const start = part === 'root' ? 0 : Math.max(0, Number(cursor) || 0)
         const size = part === 'root' ? 1 : 30
         const messages = all.slice(start, start + size).map(message => ({ id: message.id, from: message.role === 'user' ? 'owner' : 'agent',
-          at: message.at, text: message.text, ...message.role === 'assistant' ? { bot: true as const } : {} }))
+          at: message.at, text: message.text, ...message.attachments?.length && attachments ? { attachments: attachments.references(message.id, message.attachments.map(image => image.id)) } : {},
+          ...message.role === 'assistant' ? { bot: true as const } : {} }))
         return { messages, body: { messages }, ...part === 'thread' && start + size < all.length ? { next: String(start + size) } : {} }
       },
     },

@@ -9,6 +9,9 @@ export function preview(text: string): string { return text.replace(/\s+/g, ' ')
 export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) {
   return { trigger_id: trigger.id, source: trigger.source, ...(trigger.url ? { source_url: trigger.url } : {}), actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), human: trigger.human, at: trigger.at,
     ...trigger.attachments?.length ? { attachments: trigger.attachments } : {},
+    ...Array.isArray(trigger.meta.mentionedWorkers) ? { mentioned_workers: trigger.meta.mentionedWorkers,
+      collaboration_route: trigger.meta.router === true ? 'router_coordinates' : 'worker_direct',
+      ...typeof trigger.meta.routingInstruction === 'string' ? { routing_instruction: trigger.meta.routingInstruction } : {} } : {},
     ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}`,
     ...(disposition ? { disposition: { ...(disposition.filtered ? { filtered: reasonText(disposition.filtered) } : {}),

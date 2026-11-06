@@ -10,6 +10,10 @@ On shared subscribed threads, use orchestrator_thread_publish only for findings 
 Use repository-specific pull request workflows only when a GitHub repository and account are configured. When no repository is configured, report the completed local result through orchestrator_report.
 # Structured progress and personal context
 
+Keep the person informed through short `orchestrator_report state=progress` summaries at meaningful milestones: finish a phase, establish an important finding, encounter a concrete obstacle, or begin verification. Use 2-4 short lines in the person's language: completed work, current finding/state, and next step. Record actual evidence and accurate completed/pending steps; combine repeated observations. These reports update the collaboration timeline without sending a separate Router/IM message. Continue work after reporting.
+
+The host also sends a scheduled collaboration progress reminder at a random 5-15 minute interval, reset after each report. On that reminder, summarize observations already available; retain an external wait and its scheduled checks when still waiting. A reminder requests status only and grants no new task action. Long foreground tools finish at a safe step before you handle the reminder. Report unchanged waits plainly and preserve the original request and pending decisions.
+
 Read `orchestrator_personal_context` for confirmed facts and commitments linked to your ticket when available. Keep source dates and effective scope. Report completed and pending steps plus evidence in `orchestrator_report`.
 
 For an external wait, report `state=waiting`, `waiting_for` and `next_check` (stable key, zoned timestamp, purpose, success_condition, resume_instruction). Finish the current turn after recording the wait. A scheduled check resumes this same ticket; inspect current state before repeating a side effect. For a human decision use `waiting_for.kind=human` and a concrete `human_action` question. Clear or cancel checks once resolved.

@@ -10,6 +10,7 @@ import type { RoomEntry } from './room-journal.ts'
 import type { Store } from './store.ts'
 import type { ArtifactRegistry, TaskArtifact } from './artifacts.ts'
 import { record } from '../kv.ts'
+import { WebImageIds, type WebAttachmentStore, type WebImage } from './web-attachments.ts'
 export interface RoomWorker {
   id: string; title: string; stage: string; summary: string; sessionId: string
   active: boolean; subscribed: boolean
@@ -22,6 +23,9 @@ export interface RoomMessage {
   actor: { role: 'user' | 'router' | 'worker' | 'system'; name: string; ticketId?: string }
   text: string; audience: 'router' | 'worker' | 'thread' | 'record'; recipient?: string
   ticketId?: string; details?: string
+  reportState?: string
+  mentions?: string[]; recipients?: string[]; router?: boolean
+  attachments?: WebImage[]
   artifacts?: { id: string; name: string; size: number }[]
   delivery?: 'queued' | 'delivered' | 'read' | 'held' | 'failed'
 }
@@ -32,12 +36,17 @@ export interface RoomActivity {
   items: { id: string; type: string; text: string }[]; next_offset: number | null
 }
 
-export const RoomMessageRequest = z.object({ text: z.string().trim().min(1).max(16000),
-  requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/), recipient: z.string().min(1).max(200).optional() }).strict()
+export const RoomMessageRequest = z.object({ text: z.string().trim().max(16000),
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{8,80}$/), recipient: z.string().min(1).max(200).optional(),
+  router: z.boolean().optional(), mentions: z.array(z.string().min(1).max(200)).max(20).optional(), attachmentIds: WebImageIds,
+}).strict().refine(value => !!value.text || value.attachmentIds.length > 0, { message: '请输入内容或添加图片。' })
+/** Server-produced member scope; bodies never supply room membership or session visibility. */
+export interface CollaborationScope { requestScope: string; members: Map<string, string[]> }
 interface RoomHost {
   store: Store; engine: Pick<Engine, 'receive' | 'direct'>
   personal(): boolean; configured(): boolean; requestPass(): void
   artifacts?: Pick<ArtifactRegistry, 'verify'> | undefined
+  attachments?: WebAttachmentStore
   inspectWorker?(ticketId: string): Promise<readonly SessionEvent[]>
 }
 const Cursor = z.object({ at: z.string().datetime(), id: z.string().min(1).max(512) }).strict()
@@ -86,14 +95,29 @@ export class TaskRooms {
   }
   list(offset = 0, limit = 50): { items: TaskRoomSummary[]; next_offset: number | null } {
     const rows = this.host.store.db.prepare(`SELECT t.value FROM thread t JOIN room_event e ON e.thread=t.key
-      WHERE EXISTS (SELECT 1 FROM room_member m WHERE m.thread=t.key) OR t.value ->> '$.ref.source'='web'
+      WHERE EXISTS (SELECT 1 FROM room_member m WHERE m.thread=t.key) OR t.value ->> '$.ref.source' IN ('web', 'dsh-session')
       GROUP BY t.key ORDER BY MAX(e.at) DESC,t.key ASC LIMIT ? OFFSET ?`).all(Math.min(100, limit) + 1, Math.max(0, offset))
     return { items: rows.slice(0, limit).map(row => this.summary(JSON.parse(String(row.value)) as Thread)),
       next_offset: rows.length > limit ? offset + limit : null }
   }
-  get(key: string, before?: string, limit = 50): TaskRoomView {
+  get(key: string, before?: string, limit = 50, workerId?: string): TaskRoomView {
     const thread = this.thread(key), tickets = this.tickets(thread), size = Math.max(1, Math.min(100, limit))
-    const rows = this.host.store.rooms.page(key, size + 1, parseCursor(before)), shown = rows.slice(0, size)
+    const worker = workerId ? tickets.find(ticket => ticket.id === workerId) : undefined
+    if (workerId && !worker) throw new WebTaskError(404, '该任务群没有这位 Worker。')
+    const cursor = parseCursor(before)
+    const triggerIds = worker ? [...new Set([...worker.origin.triggerIds,
+      ...worker.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])] : []
+    // Match before paging, so a busy sibling cannot crowd this worker's older progress out of the page.
+    const workerCondition = worker ? ` AND (e.value ->> '$.ticketId'=? OR tr.id IN (SELECT value FROM json_each(?))
+      OR tr.value ->> '$.collaboration.ticketId'=? OR EXISTS (SELECT 1 FROM json_each(tr.value,'$.meta.mentions') m WHERE m.value=?))` : ''
+    const rows = this.host.store.db.prepare(`WITH entries AS (
+      SELECT e.value,e.at,COALESCE('trigger:' || (tr.value ->> '$.meta.roomMessageId'),e.id) AS logical_id,
+      ROW_NUMBER() OVER (PARTITION BY COALESCE(tr.value ->> '$.meta.roomMessageId',e.id) ORDER BY e.id) AS repeated
+      FROM room_event e LEFT JOIN trigger tr ON tr.id=e.value ->> '$.triggerId' WHERE e.thread=?${workerCondition})
+      SELECT value,logical_id FROM entries WHERE repeated=1${cursor ? ' AND (at,logical_id) < (?,?)' : ''}
+      ORDER BY at DESC,logical_id DESC LIMIT ?`).all(key, ...worker ? [worker.id, JSON.stringify(triggerIds), worker.id, worker.id] : [],
+        ...cursor ? [cursor.at, cursor.id] : [], size + 1).map(row => ({ ...JSON.parse(String(row.value)) as RoomEntry, id: String(row.logical_id) }))
+    const shown = rows.slice(0, size)
     return { ...this.summary(thread, tickets), messages: shown.reverse().flatMap(row => this.message(row, tickets) ?? []),
       earlier: rows.length > size && shown[0] ? cursorOf(shown[0]) : null,
       writable: this.writable(), paused: this.host.store.settings().paused }
@@ -107,18 +131,22 @@ export class TaskRooms {
       const disposition = store.triggers.disposition(trigger.id), collaboration = trigger.collaboration
       const sender = collaboration && store.tickets.get(collaboration.ticketId)
       const target = disposition?.directTicketId
-      const owners = disposition?.fanout ?? []
-      const delivered = owners.flatMap(id => {
+      const mentions = Array.isArray(trigger.meta.mentions) ? trigger.meta.mentions.filter((id): id is string => typeof id === 'string') : []
+      const imageIds = Array.isArray(trigger.meta.attachmentIds) ? trigger.meta.attachmentIds.filter((id): id is string => typeof id === 'string') : []
+      const related = trigger.meta.router === false && typeof trigger.meta.roomMessageId === 'string'
+        ? store.db.prepare("SELECT value FROM trigger WHERE value ->> '$.meta.roomMessageId'=?").all(trigger.meta.roomMessageId)
+          .map(row => JSON.parse(String(row.value)) as Trigger) : [trigger]
+      const delivered = related.flatMap(received => (store.triggers.disposition(received.id)?.fanout ?? []).flatMap(id => {
         const ticket = store.tickets.get(id)
-        const input = ticket?.inputs.find(input => input.kind === 'trigger' ? input.triggerId === trigger.id
-          : input.kind === 'note' && input.collaborationTriggerId === trigger.id)
+        const input = ticket?.inputs.find(input => input.kind === 'trigger' ? input.triggerId === received.id
+          : input.kind === 'note' && input.collaborationTriggerId === received.id)
         if (!input || !ticket) return []
         if (ticket.delivery) return ['failed' as const]
         if (input.kind === 'trigger' && input.readAt) return ['read' as const]
         if (input.kind === 'trigger' && input.deliveredTo) return ['delivered' as const]
         // Context notes do not carry per-message read receipts; report only a queue state we can verify.
         return ticket.undelivered.includes(input.id) ? ['queued' as const] : []
-      })
+      }))
       const delivery = delivered.includes('failed') ? 'failed' : delivered.includes('queued') ? 'queued'
         : delivered.length && delivered.every(value => value === 'read') ? 'read'
           : delivered.length ? 'delivered' : undefined
@@ -126,7 +154,10 @@ export class TaskRooms {
         actor: collaboration ? { role: 'worker', name: sender?.title ?? collaboration.ticketId, ticketId: collaboration.ticketId }
           : { role: trigger.human ? 'user' : 'system', name: trigger.actor.source === 'web' && trigger.actor.id === 'owner' ? '我' : trigger.actor.id },
         text: bounded(trigger.text, 16000), audience: collaboration ? 'thread' : target ? 'worker' : trigger.routing === 'router' ? 'router' : 'thread',
-        ...target ? { recipient: target } : {}, ...delivery ? { delivery } : {} }
+        ...target ? { recipient: target } : {}, ...mentions.length ? { mentions, recipients: trigger.meta.router === false ? mentions : [] } : {},
+        ...typeof trigger.meta.router === 'boolean' ? { router: trigger.meta.router } : {},
+        ...imageIds.length && this.host.attachments && this.writable() ? { attachments: this.host.attachments.descriptions(imageIds) } : {},
+        ...delivery ? { delivery } : {} }
     }
     if (entry.kind === 'reply') {
       const receipt = entry.receiptId && store.receipts.get(entry.receiptId)
@@ -145,29 +176,64 @@ export class TaskRooms {
       text: bounded(entry.text ?? ''), audience: entry.kind === 'assignment' || entry.kind === 'note' ? 'worker'
         : entry.reportState === 'progress' || entry.reportState === 'waiting' ? 'record' : 'router',
       ...entry.kind === 'assignment' || entry.kind === 'note' ? { recipient: entry.ticketId } : {},
+      ...entry.reportState ? { reportState: entry.reportState } : {},
       ...entry.details ? { details: bounded(entry.details) } : {} }
   }
-  post(keyValue: string, input: unknown): TaskRoomView {
+  post(keyValue: string, input: unknown, scope?: CollaborationScope): TaskRoomView {
     if (!this.writable()) throw new WebTaskError(409, '任务群当前仅供查看，请检查个人模式、Web 来源与 owner 授权。')
-    const thread = this.thread(keyValue), { text, requestId, recipient = 'router' } = RoomMessageRequest.parse(input)
-    const id = `room-message-${key(keyValue, requestId)}`, store = this.host.store
+    const thread = this.thread(keyValue), request = RoomMessageRequest.parse(input), { text, requestId } = request
+    const router = request.router ?? (!request.recipient || request.recipient === 'router')
+    const mentions = [...new Set(request.mentions ?? (request.recipient && request.recipient !== 'router' ? [request.recipient] : []))].sort()
+    if (!router && !mentions.length) throw new WebTaskError(400, '请选择 @成员或开启 R。')
+    if (request.recipient && (request.router !== undefined || request.mentions !== undefined)) throw new WebTaskError(400, '请使用一套完整的接收人设置重新发送。')
+    const attachmentIds = [...new Set(request.attachmentIds)]
+    const identity = { text, router, mentions, attachmentIds }
+    const id = `room-message-${key(scope?.requestScope ?? keyValue, requestId)}`, store = this.host.store
+    const savedKey = record<typeof identity>(`room-message-request:${id}`)
+    const saved = store.get(savedKey)
+    if (saved) {
+      if (JSON.stringify(saved) !== JSON.stringify(identity)) throw new WebTaskError(409, '发送编号已经用于另一条消息，请重新发送。')
+      return this.get(keyValue)
+    }
     const previous = store.triggers.get(id)
     if (previous) {
-      if (previous.text !== text || previous.meta.roomRecipient !== recipient) throw new WebTaskError(409, '发送编号已经用于另一条消息，请重新发送。')
+      if (previous.text !== text || previous.meta.roomRecipient !== (request.recipient ?? 'router') || mentions.length > 1 || attachmentIds.length) throw new WebTaskError(409, '发送编号已经用于另一条消息，请重新发送。')
       return this.get(keyValue)
     }
     if (store.settings().paused) throw new WebTaskError(409, '任务处理已暂停，请恢复后再发送。')
-    if (recipient !== 'router') {
-      const target = store.tickets.get(recipient)
-      if (!target || !liveTicket(target) || !thread.subscriptions.includes(recipient)) throw new WebTaskError(409, '该 Worker 已离开或结束工作，请选择 Router 重新安排。')
-    }
-    const trigger: Trigger = { id, source: 'web', routing: 'router', threads: [thread.ref], actor: { source: 'web', id: 'owner' },
-      human: true, addressed: 'direct', at: new Date().toISOString(), text,
-      channel: { source: 'web', thread: keyValue, address: { room: keyValue } }, meta: { room: keyValue, roomRecipient: recipient } }
+    const members = scope?.members ?? new Map(this.tickets(thread).map(ticket => [ticket.id, [keyValue]]))
+    const targets = mentions.map(memberId => {
+      const target = store.tickets.get(memberId), roomKeys = members.get(memberId)
+      if (!target || !roomKeys?.length) throw new WebTaskError(409, '该 Worker 已离开或结束工作，请选择 Router 重新安排。')
+      const origin = store.triggers.get(target.origin.triggerId)
+      const originRooms = new Set(origin?.threads.map(ref => `${ref.source}:${ref.id}`) ?? [])
+      const candidateRooms = roomKeys.map(room => store.threads.get(room)).filter((room): room is Thread => !!room)
+      const targetRoom = candidateRooms.find(room => originRooms.has(room.key) && room.subscriptions.includes(memberId))
+        ?? candidateRooms.find(room => room.subscriptions.includes(memberId))
+      if (!router && (!liveTicket(target) || !targetRoom)) throw new WebTaskError(409, '该 Worker 已离开或结束工作，请选择 Router 重新安排。')
+      return { ticket: target, thread: targetRoom ?? this.thread(roomKeys[0]!) }
+    })
+    if (attachmentIds.length && !this.host.attachments) throw new WebTaskError(503, '图片服务正在初始化，请稍后重试。')
+    this.host.attachments?.descriptions(attachmentIds)
+    const at = new Date().toISOString()
+    const triggerFor = (triggerId: string, rooms: Thread[]): Trigger => ({ id: triggerId, source: 'web', routing: 'router',
+      threads: [...new Map(rooms.map(room => [room.key, room.ref])).values()], actor: { source: 'web', id: 'owner' }, human: true, addressed: 'direct', at, text,
+      ...attachmentIds.length ? { attachments: this.host.attachments!.references(triggerId, attachmentIds) } : {},
+      channel: { source: 'web', thread: keyValue, address: { room: keyValue } },
+      meta: { room: keyValue, roomRecipient: request.recipient ?? (router ? 'router' : mentions[0]), router, mentions, attachmentIds,
+        roomMessageId: id, mentionedWorkers: targets.map(target => ({ id: target.ticket.id, title: target.ticket.title,
+          status: ticketStage(target.ticket).stage, room: target.thread.key })),
+        routingInstruction: router && mentions.length ? 'Coordinate this request with the explicitly mentioned workers. This request reached Router only. Use orchestrator_route kind=attach for each relevant mentioned ticket, with a member-specific note. You may attach this same request to multiple mentioned tickets in sequence; retries to an already reached ticket are idempotent. Keep deliveries within the named members and distribute each requirement once.' : undefined } })
     store.atomic(() => {
-      if (recipient === 'router') {
+      if (router) {
+        const trigger = triggerFor(id, [thread])
         if (this.host.engine.receive(trigger) === 'filtered') throw new WebTaskError(409, '任务群来源已暂停接收，请检查来源设置。')
-      } else this.host.engine.direct(recipient, trigger)
+        for (const target of targets) store.rooms.link(trigger, target.thread.key)
+      } else {
+        targets.forEach((target, index) => this.host.engine.direct(target.ticket.id,
+          triggerFor(index === 0 ? id : `${id}-${key(target.ticket.id).slice(0, 12)}`, [target.thread])))
+      }
+      store.set(savedKey, identity)
     })
     this.host.requestPass()
     return this.get(keyValue)

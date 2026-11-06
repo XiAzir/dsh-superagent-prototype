@@ -8,6 +8,7 @@ import { protectStateDirectory } from './infra/private-directory.ts'
 import { assertPersistentDataPath } from './infra/persistent-path.ts'
 import { configureHttpNoReuse } from './infra/http-compat.ts'
 import { webSource } from './app/web-tasks.ts'
+import { WebAttachmentStore } from './app/web-attachments.ts'
 import { QqBridge, QqSourceError } from './app/qq-source.ts'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 
@@ -39,7 +40,12 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   })
   ctx.effect(() => () => { clearTimeout(modeRestart) })
   const runtime = new Runtime(ctx, machine, restart)
-  ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal', runtime.artifacts)))
+  const webAttachments = new WebAttachmentStore(runtime.store, machine.stateDir, () => {
+    const settings = runtime.store.settings()
+    return machine.mode === 'personal' && runtime.configured() && settings.sources.web?.enabled !== false
+      && !!settings.policy.sources.web?.allowed.some(actor => actor.id === 'owner')
+  })
+  ctx.effect(() => runtime.sources.register(webSource(runtime.store, () => machine.mode === 'personal', runtime.artifacts, webAttachments)))
   const qq = runtime.qq = new QqBridge({ store: runtime.store, stateDir: machine.stateDir, artifacts: runtime.artifacts,
     configured: () => runtime.configured(), receive: trigger => runtime.receive(trigger),
     notify: message => runtime.outbox.send(message),

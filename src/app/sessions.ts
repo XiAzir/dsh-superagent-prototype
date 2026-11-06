@@ -21,6 +21,8 @@ import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
 import { readLatestTurnEvents } from '../infra/session-history.ts'
+import { SESSION_CONVERSATION_PROMPT, type SessionConversations } from './session-conversations.ts'
+import { MEMORY_GUIDANCE, type Memory } from './memory.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -33,6 +35,8 @@ export interface SessionsHost {
   readonly health: HealthEntry
   readonly masterId: string
   readonly lifetime: AbortSignal
+  readonly conversations?: SessionConversations
+  readonly memory?: Pick<Memory, 'index'>
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
@@ -44,10 +48,14 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; roleModel?: RoleModelBinding; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; roleModel?: RoleModelBinding; subagent?: true; conversation?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+export const CONVERSATION_PRESET = 'dsh-superagent-conversation'
+const SESSION_ROUTING_GUIDANCE = `## Session replies
+Each dsh-session candidate binds its trigger_id to the asking Session. Simple questions: orchestrator_reply purpose=answer, then ignore. Status questions: orchestrator_route kind=status with the current trigger_id and referenced ticket_id, then orchestrator_reply purpose=status with those same IDs. Cross-Session queries answer the current question; task results retain their original conversation.
+The reply tool returns reply_target_session. If reply_target_is_current_session=false, its receipt is queued for that Session: end without repeating the answer here. If true, answer once in this Router turn; the host skips a second self-message.`
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -88,7 +96,7 @@ export class Sessions {
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
-  install(): void {
+  async install(): Promise<void> {
     const ctx = this.ctx
     ctx.on('agent/disposed', ({ agent }) => {
       this.release(agent)
@@ -98,6 +106,7 @@ export class Sessions {
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
+      if ((agent.id === this.host.masterId || binding.conversation) && event.type === 'user/message') this.host.conversations?.receive(agent, event.data)
       this.retryHealth.observe(agent.id, event)
       this.failures.observe(agent.id, event)
       this.updateModelHealth()
@@ -108,12 +117,16 @@ export class Sessions {
       this.failures.failed(agent.id, error)
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
+    ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+      if (agent.id === this.host.masterId || this.bindings.get(agent)?.conversation) this.host.conversations?.receive(agent, message)
+    })
     // Opening a Session in DSH's Web UI before its first turn may select the default preset for it: select ours again. After
     // its first turn DSH refuses any selection, which leaves it as it is.
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET
+          : this.bindings.get(agent!)?.conversation ? CONVERSATION_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -122,7 +135,16 @@ export class Sessions {
     ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
+    // Plugin reloads retain live agents; attach the bridge to them as well as future creations.
+    for (const agent of ctx.agents.list?.() ?? []) {
+      await this.decorate(agent)
+      if (agent.id === this.host.masterId) {
+        for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) this.host.conversations?.receive(agent, message)
+      }
+    }
   }
+  /** Conversation agents are stopped before their bridge and tool restrictions are released. */
+  conversationIds(): string[] { return [...this.bindings].filter(([, binding]) => binding.conversation).map(([agent]) => agent.id) }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
@@ -245,6 +267,21 @@ export class Sessions {
     const host = this.host
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
+    if (!master && !ticket && host.conversations?.matches(agent)) {
+      const binding: SessionBinding = { disposers: [], conversation: true }
+      this.bindings.set(agent, binding)
+      binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-conversation', order: 9999, complete: true,
+        interpolate: false, text: SESSION_CONVERSATION_PROMPT }))
+      const register = this.registerTool(agent, binding)
+      for (const tool of host.conversations.tools(agent)) register(tool.name, tool.description, tool.schema, tool.execute)
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: [] }),
+        agent.ctx.tools.guard(({ name }) => ROUTER_DENIED_TOOLS.has(name) ? ROUTER_TOOL_REFUSAL : undefined))
+      // Selecting before the first turn also gives the new conversation a visible Superagent mode label.
+      const presets = this.ctx.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> } | undefined
+      await presets?.select(agent, CONVERSATION_PRESET).catch(() => {})
+      for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) host.conversations.receive(agent, message)
+      return
+    }
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
@@ -260,7 +297,8 @@ export class Sessions {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      const memory = master && host.memory ? `\n<superagent-memory>\n${MEMORY_GUIDANCE}\n${host.memory.index()}\n</superagent-memory>\n` : ''
+      return `[dsh-superagent prompt revision ${version.revision}]\n${memory}${master ? `${SESSION_ROUTING_GUIDANCE}\n` : ''}${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {

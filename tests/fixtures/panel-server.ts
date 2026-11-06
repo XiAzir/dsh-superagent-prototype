@@ -26,6 +26,9 @@ import type { Health } from '../../src/sources/host.ts'
 import type { FieldSpec, SourceKind } from '../../src/sources/kind.ts'
 import { QqConfigSchema } from '../../src/app/qq-source.ts'
 import { testDeployment } from './deployment.ts'
+import { key } from '../../src/core/ids.ts'
+import { RoomMessageRequest } from '../../src/app/task-rooms.ts'
+import { WebMessageRequest } from '../../src/app/web-tasks.ts'
 
 export const MEMBER = 'ou_alice'
 const ALLOWED: Record<string, { id: string; name?: string }[]> = { feishu: [{ id: MEMBER, name: 'Alice' }], github: [{ id: 'alice' }] }
@@ -137,6 +140,7 @@ export interface PanelServer {
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
   webTasks: { items: ApiResponse<'GET web/tasks'>['items']; records: Record<string, ApiResponse<'GET web/tasks/:id'>> }
+  webImages: Record<string, ApiResponse<'POST web/attachments'> & { data: string }>
   rooms: { items: TaskRoomSummary[]; views: Record<string, TaskRoomView>; activities: Record<string, RoomActivity> }
   roomMessageError?: string
   qqStatus: ApiResponse<'GET qq/status'>
@@ -304,7 +308,7 @@ function initial(): PanelServer {
         ticketId: 't1', authorizationId: 'auth-demo', idempotencyKey: 'demo', action: 'calendar.create', target: 'Alice · 2026-11-08 10:00',
         requestHash: 'a'.repeat(64), payload: { text: '周日 10:00 在上海时区创建“周计划回顾”，邀请 Alice。' }, status: 'prepared' }],
     },
-    settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} },
+    settings, revisions: { policy: 3, eval: 1, executor: 0 }, webTasks: { items: [], records: {} }, webImages: {},
     rooms: (() => {
       const key = 'web:demo'
       const workers = [
@@ -374,6 +378,16 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET sessions/:id/workers': { answer: ({ params }) => ({ sessionId: params.id, eligible: false, scope: null,
+    pending: false, paused: false, workers: [], messages: [], rooms: [] }) },
+  'POST sessions/:id/collaboration': { body: true, answer: ({ params }) => ({ sessionId: params.id, eligible: true, scope: 'router',
+    pending: false, paused: false, workers: [], messages: [], rooms: [] }) },
+  'POST web/attachments': { body: true, answer: ({ body }) => {
+    const id = key('web-image', body.requestId), { data, requestId: _requestId, ...image } = body
+    server.webImages[id] = { ...image, id, size: Buffer.from(data, 'base64').length, data }
+    const { data: _data, ...description } = server.webImages[id]
+    return description
+  } },
   'GET personal': { answer: () => server.personal },
   'PUT personal/settings': { body: true, answer: ({ body }) => {
     if (body.revision !== server.personal.settings.revision) return refuse(409, '设置已在别处修改。')
@@ -453,17 +467,21 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     const offset = Number(query.offset ?? 0), limit = Number(query.limit ?? 50), items = server.rooms.items.slice(offset, offset + limit)
     return { items, next_offset: offset + limit < server.rooms.items.length ? offset + limit : null }
   } },
-  'GET rooms/:key': { query: ['before', 'limit'], answer: ({ params, query }) => {
+  'GET rooms/:key': { query: ['before', 'limit', 'workerId'], answer: ({ params, query }) => {
     const room = server.rooms.views[params.key]
     if (!room) return refuse(404, '任务群不存在。')
+    const workerId = query.workerId
+    const messages = workerId ? room.messages.filter(item => item.ticketId === workerId || item.recipient === workerId
+      || item.mentions?.includes(workerId) || item.actor.ticketId === workerId) : room.messages
     const limit = Number(query.limit ?? 50)
-    if (!query.before) return { ...room, messages: room.messages.slice(-limit), earlier: room.messages.length > limit ? room.messages.at(-limit)?.id ?? null : null }
-    const index = room.messages.findIndex(item => item.id === query.before)
+    if (!query.before) return { ...room, messages: messages.slice(-limit), earlier: messages.length > limit ? messages.at(-limit)?.id ?? null : null }
+    const index = messages.findIndex(item => item.id === query.before)
     if (index < 0) return { ...room, messages: [], earlier: null }
     const start = Math.max(0, index - limit)
-    return { ...room, messages: room.messages.slice(start, index), earlier: start > 0 ? room.messages[start - 1]?.id ?? null : null }
+    return { ...room, messages: messages.slice(start, index), earlier: start > 0 ? messages[start]?.id ?? null : null }
   } },
   'POST rooms/:key/messages': { body: true, answer: ({ params, body }) => {
+    RoomMessageRequest.parse(body)
     const room = server.rooms.views[params.key]
     if (!room) return refuse(404, '任务群不存在。')
     if (server.roomMessageError) return refuse(500, server.roomMessageError)
@@ -471,7 +489,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     if (previous) return { ...room, messages: room.messages }
     const worker = room.workers.find(item => item.id === body.recipient)
     const message: RoomMessage = { id: body.requestId, at: new Date().toISOString(), kind: 'user', actor: { role: 'user', name: 'Alice' },
-      text: body.text, audience: body.recipient ? 'worker' : 'router', recipient: worker?.title ?? body.recipient,
+      text: body.text, audience: body.router === false || body.recipient ? 'worker' : 'router', recipient: worker?.title ?? body.recipient,
+      ...body.mentions ? { mentions: body.mentions, recipients: body.router === false ? body.mentions : [], router: body.router } : {},
+      ...body.attachmentIds?.length ? { attachments: body.attachmentIds.flatMap(id => { const image = server.webImages[id]; if (!image) return []; const { data: _data, ...description } = image; return [description] }) } : {},
       ...(body.recipient ? { ticketId: body.recipient } : {}) }
     room.messages.push(message); room.updatedAt = message.at
     return { ...room }
@@ -495,24 +515,33 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'GET web/tasks/:id': { answer: ({ params }) => server.webTasks.records[params.id] ?? refuse(404, '任务对话不存在。') },
   'POST web/tasks': { body: true, answer: ({ body }) => {
+    WebMessageRequest.parse(body)
+    const attachments = body.attachmentIds?.flatMap(id => { const image = server.webImages[id]; if (!image) return []; const { data: _data, ...description } = image; return [description] }) ?? []
     const id = `web-task-${body.requestId}`
     const existing = server.webTasks.records[id]
     if (existing) return existing.messages[0]?.text === body.text ? existing : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
     const at = new Date().toISOString()
     const created = { id, title: body.text.split('\n')[0]!.slice(0, 100), createdAt: at, updatedAt: at, status: 'queued' as const,
-      tickets: [], messages: [{ id: `web-message-${body.requestId}`, role: 'user' as const, text: body.text, at }] }
+      tickets: [], messages: [{ id: `web-message-${body.requestId}`, role: 'user' as const, text: body.text, at, ...attachments.length ? { attachments } : {} }] }
     server.webTasks.records[id] = created
     const { messages: _messages, ...summary } = created
     server.webTasks.items.unshift(summary)
+    const room: TaskRoomView = { key: `web:${id}`, title: created.title, source: 'web', updatedAt: at, workers: [],
+      pending: true, paused: false, writable: true, earlier: null,
+      messages: [{ id: `web-message-${body.requestId}`, at, kind: 'user', actor: { role: 'user', name: 'owner' }, text: body.text, audience: 'router', ...attachments.length ? { attachments } : {} }] }
+    server.rooms.views[room.key] = room
+    server.rooms.items.unshift(room)
     return created
   } },
   'POST web/tasks/:id/messages': { body: true, answer: ({ params, body }) => {
+    WebMessageRequest.parse(body)
     const task = server.webTasks.records[params.id]
     if (!task) return refuse(404, '任务对话不存在。')
     const previous = task.messages.find(message => message.id === `web-message-${body.requestId}`)
     if (previous) return previous.text === body.text ? task : refuse(409, '这次发送的编号已经用于另一段内容，请重新发送。')
     const at = new Date().toISOString()
-    task.messages.push({ id: `web-message-${body.requestId}`, role: 'user', text: body.text, at }); task.updatedAt = at
+    const attachments = body.attachmentIds?.flatMap(id => { const image = server.webImages[id]; if (!image) return []; const { data: _data, ...description } = image; return [description] }) ?? []
+    task.messages.push({ id: `web-message-${body.requestId}`, role: 'user', text: body.text, at, ...attachments.length ? { attachments } : {} }); task.updatedAt = at
     const summary = server.webTasks.items.find(item => item.id === task.id)
     if (summary) summary.updatedAt = at
     return task
@@ -706,6 +735,10 @@ export function usePanelServer(cleanup: () => void) {
       const method = init?.method ?? 'GET'
       const body: unknown = init?.body ? JSON.parse(String(init.body)) : undefined
       server.requests.push({ path: decodeURIComponent(`${path}${address.search}`), method, ...body === undefined ? {} : { body } })
+      if (method === 'GET' && path.startsWith('web/attachments/')) {
+        const image = server.webImages[decodeURIComponent(path.slice('web/attachments/'.length))]
+        return image ? new Response(Buffer.from(image.data, 'base64'), { headers: { 'content-type': image.mediaType } }) : new Reply({ error: '图片不存在。' }, 404)
+      }
       const route = match(method, path.split('/'))
       if (!route) return new Reply({ error: 'Unknown operation' }, 404)
       const answer = await run(route.key, route.params, address.searchParams, body)

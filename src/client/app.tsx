@@ -1,7 +1,7 @@
 /** Root panel shell: header with global search and glossary, top-level navigation tabs, and active route view. */
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { SearchView } from './api.ts'
-import { Button, Dot, Icon, Input, Modal, SegmentedTabs, Tag } from './controls.tsx'
+import { Button, Dot, Icon, Input, Modal, SegmentedTabs } from './controls.tsx'
 import type { DeploymentForm } from './deployment.tsx'
 import { EvalStatus } from './eval.tsx'
 import { ExecutionStatus } from './execution.tsx'
@@ -11,8 +11,9 @@ import { OverviewPage } from './overview.tsx'
 import { PersonalPage } from './personal.tsx'
 import { PersonalAssistantPage } from './assistant.tsx'
 import { RoomsPage } from './rooms.tsx'
+import { WorkbenchPage } from './workbench.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
-import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
+import { HOME, TABS, initialLocation, lastSettingsGroup, parseRoute, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
 import { SettingsPage } from './settings.tsx'
 import { SourceStatus } from './source.tsx'
@@ -101,7 +102,7 @@ function SearchResults({ result, query, onClose }: { result: SearchView; query: 
   </div>
 }
 
-function Header({ masterId, mode, masterReady }: { masterId: string | undefined; mode: 'repository' | 'personal' | undefined; masterReady: boolean }) {
+function Header({ masterId, mode, masterReady, route }: { masterId: string | undefined; mode: 'repository' | 'personal' | undefined; masterReady: boolean; route: Route }) {
   const { t, call, openSession, notify, navigate } = usePanel()
   const [glossary, setGlossary] = useState(false)
   const [query, setQuery] = useState('')
@@ -124,22 +125,36 @@ function Header({ masterId, mode, masterReady }: { masterId: string | undefined;
     call('GET search', { query: { q: text } }).then(value => { if (request === latest.current) setResult({ query: text, value }) },
       failure => { if (request === latest.current) notify(errorText(failure)) })
   }
-  return <header className="dt-head">
-    <div className="dt-head-title"><h1 className="dt-title">{t('title')}</h1></div>
+  const chinese = t('lang') !== 'en'
+  const more = useRef<HTMLDetailsElement>(null)
+  const closeMore = () => { if (more.current) more.current.open = false }
+  useEffect(() => {
+    const close = (event: PointerEvent) => { if (!more.current?.contains(event.target as Node)) closeMore() }
+    document.addEventListener('pointerdown', close)
+    return () => { document.removeEventListener('pointerdown', close) }
+  }, [])
+  useEffect(() => { closeMore() }, [route])
+  return <header className="dt-head sa-shell-header">
+    <div className="dt-head-title sa-shell-brand"><span className="sa-shell-monogram" aria-hidden="true">S</span>
+      <div><h1 className="dt-title">Superagent</h1><span className="sa-shell-caption">{mode === 'personal'
+        ? chinese ? '个人工作空间' : 'Personal workspace' : mode === 'repository' ? chinese ? '团队工作空间' : 'Team workspace' : chinese ? '正在连接工作空间' : 'Connecting workspace'}</span></div></div>
     <div className="dt-toolbar">
       {mode !== 'personal' && <form ref={search} className="dt-search" role="search" onSubmit={submit} onKeyDown={event => { if (event.key === 'Escape') show() }}>
         <Input type="search" icon={<Icon name="search" />} value={query} placeholder={t('searchPlaceholder')} aria-label={t('searchLabel')}
           onChange={event => { setQuery(event.target.value); if (!event.target.value) show() }} />
         {result && <SearchResults result={result.value} query={result.query} onClose={() => { show() }} />}
       </form>}
-      {mode === 'personal' && <Tag tone="info">{t('personalMode')}</Tag>}
-      {mode === 'personal' && <Button variant="outline" size="sm" icon={<Icon name="plus" size={14} />}
+      {mode === 'personal' && !(route.page === 'tasks' && !route.id) && <Button variant="primary" icon={<Icon name="plus" size={16} />}
         onClick={() => navigate({ page: 'tasks' })}>{t('webTask.newTask')}</Button>}
-      <Button variant="ghost" size="sm" icon={<Icon name="question" />} aria-label={t('glossary')} title={t('glossary')} aria-haspopup="dialog"
-        onClick={() => setGlossary(true)} />
-      <Button variant="outline" size="sm" icon={<Icon name="session" size={14} />} disabled={!masterId || !masterReady}
-        title={!masterReady ? t('masterWaiting') : undefined}
-        onClick={() => { if (masterId && masterReady) openSession(masterId).catch(failure => notify(errorText(failure))) }}>{t('openMaster')}</Button>
+      <details ref={more} className="sa-shell-more" onKeyDown={event => { if (event.key === 'Escape') { closeMore(); more.current?.querySelector('summary')?.focus() } }}>
+        <summary aria-label={chinese ? '工作空间工具' : 'Workspace tools'}><Icon name="settings" /><span>{chinese ? '工具' : 'Tools'}</span><Icon name="chevron-down" size={13} /></summary>
+        <div className="sa-shell-more-menu">
+          <Button variant="ghost" icon={<Icon name="question" />} aria-haspopup="dialog" onClick={() => { closeMore(); setGlossary(true) }}>{t('glossary')}</Button>
+          <Button variant="ghost" icon={<Icon name="session" />} disabled={!masterId || !masterReady} title={!masterReady ? t('masterWaiting') : undefined}
+            onClick={() => { closeMore(); if (masterId && masterReady) openSession(masterId).catch(failure => notify(errorText(failure))) }}>{t('openMaster')}</Button>
+          {mode === 'personal' && <Button variant="ghost" icon={<Icon name="search" />} onClick={() => { closeMore(); navigate({ page: 'trigger', query: { filter: 'recent' } }) }}>{chinese ? '运行管理' : 'Operations'}</Button>}
+        </div>
+      </details>
     </div>
     <Glossary open={glossary} onClose={() => setGlossary(false)} />
   </header>
@@ -148,12 +163,19 @@ function Header({ masterId, mode, masterReady }: { masterId: string | undefined;
 function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm }) {
   const { t } = usePanel()
   const { state, error, reload } = usePanelData()
+  const personal = state?.mode === 'personal'
+  const chinese = t('lang') !== 'en'
+  const operational = ['source', 'trigger', 'eval', 'execution'].includes(route.page)
+  const primaryTab: Tab = personal ? route.page === 'tasks' ? 'rooms' : operational ? 'settings' : route.page : route.page
+  const primaryLabel = (tab: Tab) => personal ? ({ overview: chinese ? '工作台' : 'Workbench', rooms: chinese ? '任务' : 'Tasks',
+    assistant: chinese ? '个人助理' : 'Assistant', settings: chinese ? '设置' : 'Settings' } as Partial<Record<Tab, string>>)[tab] ?? t(`tab.${tab}`) : t(`tab.${tab}`)
+  const visibleTabs: readonly Tab[] = !state ? [] : personal ? ['overview', 'rooms', 'assistant', 'settings'] : TABS.filter(value => !['tasks', 'rooms', 'assistant'].includes(value))
   // Keep the active tab scrolled into view on narrow screens when routes change via links.
   useEffect(() => { document.getElementById(`dt-tab-${route.page}`)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [route.page])
   const waiting = error ? <p className="dt-error" role="alert">{error.message}</p> : <p className="dt-hint">{t('loading')}</p>
   const page = (() => {
     switch (route.page) {
-      case 'overview': return <OverviewPage />
+      case 'overview': return personal ? <WorkbenchPage /> : <OverviewPage />
       case 'source': return <SourceStatus />
       case 'trigger': return route.id !== undefined ? <ThreadPage key={route.id} id={route.id} target={route.query?.trigger} />
         : <TriggerStatus filter={route.query?.filter ?? 'subscribed'} />
@@ -168,14 +190,21 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
         deploymentForm={deploymentForm} /> : waiting
     }
   })()
-  return <div className="dt-page">
-    <div className="dt-column">
-      <Header masterId={state?.masterId} mode={state?.mode} masterReady={state?.masterReady ?? false} />
+  return <div className="dt-page sa-shell" data-mode={state?.mode}>
+    <div className="dt-column sa-shell-column">
+      <Header masterId={state?.masterId} mode={state?.mode} masterReady={state?.masterReady ?? false} route={route} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
-      <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
-        items={TABS.filter(value => !['tasks', 'rooms', 'assistant'].includes(value) || state?.mode === 'personal').map(value => ({ value, label: t(`tab.${value}`),
-          id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
-      <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page}`} className="dt-main">{page}</main>
+      {!!visibleTabs.length && <SegmentedTabs className="sa-shell-tabs" label={t('pagesLabel')} value={primaryTab} onChange={openTab}
+        items={visibleTabs.map(value => ({ value, label: primaryLabel(value),
+          id: `dt-tab-${value}`, panelId: 'dt-page' }))} />}
+      {personal && (operational || route.page === 'settings') && <nav className="sa-shell-operations" aria-label={chinese ? '设置与运行管理' : 'Settings and operations'}>
+        <span>{chinese ? '管理工作空间' : 'Manage workspace'}</span>
+        <button type="button" aria-current={route.page === 'settings' ? 'page' : undefined} onClick={() => openTab('settings')}>{chinese ? '配置' : 'Configuration'}</button>
+        {(['source', 'trigger', 'eval', 'execution'] as const).map(value => <button key={value} type="button" aria-label={t(`tab.${value}`)} aria-current={route.page === value ? 'page' : undefined}
+          onClick={() => openTab(value)}>{({ source: chinese ? '连接状态' : 'Connections', trigger: chinese ? '消息接入' : 'Intake',
+            eval: chinese ? '接单记录' : 'Decisions', execution: chinese ? '执行记录' : 'Execution' })[value]}</button>)}
+      </nav>}
+      <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${primaryTab}`} className="dt-main sa-shell-main">{page}</main>
     </div>
   </div>
 }
@@ -190,12 +219,19 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   /** Navigates to `route`; `replace` swaps the current entry (filters, paging) instead of pushing a back step. */
   const navigate = useCallback((route: Route, replace = false) => move(current => ({ route,
     stack: replace ? current.stack : [...current.stack, current.route].slice(-20) })), [move])
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const route = parseRoute((event as CustomEvent<unknown>).detail)
+      if (route) navigate(route)
+    }
+    window.addEventListener('dsh-superagent:navigate', receive)
+    return () => { window.removeEventListener('dsh-superagent:navigate', receive) }
+  }, [navigate])
   const back = useCallback(() => move(current => ({ route: current.stack.at(-1) ?? HOME, stack: current.stack.slice(0, -1) })), [move])
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
   const normalizeModeRoute = useCallback((mode: 'repository' | 'personal' | undefined) => move(current => {
-    if (mode === 'personal' && current.route.page === 'overview') return { route: { page: 'rooms' }, stack: current.stack }
-    if (mode === 'repository' && current.route.page === 'tasks') return { route: HOME, stack: current.stack }
+    if (mode === 'repository' && ['tasks', 'rooms', 'assistant'].includes(current.route.page)) return { route: HOME, stack: current.stack }
     return { route: current.route, stack: current.stack }
   }), [move])
   return <PanelProvider t={t} openSession={openSession} navigate={navigate} back={back} backLabel={routeLabel(t, location.stack.at(-1) ?? HOME)}>

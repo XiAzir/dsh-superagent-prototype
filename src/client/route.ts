@@ -23,8 +23,13 @@ export const settingsRoute = (group: SettingsGroup, query: { source?: string; ve
   ({ page: 'settings', query: { group, ...query } })
 export const setupPage = (place: SetupPlace): Route =>
   place === 'deployment' ? settingsRoute('deployment') : settingsRoute('source', { source: place })
-export const routeLabel = (t: T, route: Route): string =>
-  route.id ? t(route.page === 'trigger' ? 'term.thread' : route.page === 'tasks' ? 'webTask.title' : route.page === 'rooms' ? 'room.title' : 'term.ticket') : t(`tab.${route.page}`)
+export const routeLabel = (t: T, route: Route): string => {
+  const chinese = t('lang') !== 'en'
+  if (route.page === 'overview') return chinese ? '工作台' : 'Workbench'
+  if (route.page === 'rooms') return chinese ? '任务' : 'Tasks'
+  if (route.page === 'tasks') return route.id ? chinese ? '任务对话' : 'Task conversation' : chinese ? '新建任务' : 'New task'
+  return route.id ? t(route.page === 'trigger' ? 'term.thread' : 'term.ticket') : t(`tab.${route.page}`)
+}
 
 const pick = <V extends string>(values: readonly V[], value: unknown): V | undefined => values.find(item => item === value)
 function compact<Q extends object>(query: Q): Q | undefined {

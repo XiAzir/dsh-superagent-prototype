@@ -158,3 +158,31 @@
                   thresholdChars: 8192
                   headChars: 4096
                   tailChars: 1024
+    # Ordinary top-level conversations in the Superagent workspace submit human input to the shared router.
+    - id: dsh-superagent-conversation-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-conversation
+        name: Superagent
+        description: Superagent 工作区会话，自动派工并将结果回复到当前对话。
+        order: 92
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024

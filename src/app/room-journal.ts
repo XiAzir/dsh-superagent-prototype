@@ -33,6 +33,10 @@ export class RoomJournal {
     for (const ref of trigger.threads) this.append({ id: `trigger:${trigger.id}`, thread: threadKey(ref), at: trigger.at,
       kind: 'trigger', triggerId: trigger.id })
   }
+  /** Show one coordinated owner message in a selected member's room without changing delivery subscriptions. */
+  link(trigger: Trigger, thread: string): void {
+    this.append({ id: `trigger:${trigger.id}`, thread, at: trigger.at, kind: 'trigger', triggerId: trigger.id })
+  }
   thread(thread: Thread): void {
     this.db.prepare('DELETE FROM room_subscription WHERE thread=?').run(thread.key)
     for (const id of thread.subscriptions) {

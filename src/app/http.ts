@@ -32,6 +32,7 @@ import { decisionList, search, threadDetail, threadList } from './views/threads.
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import { WebTasks, WebTaskError } from './web-tasks.ts'
 import { TaskRooms } from './task-rooms.ts'
+import { workerPanel } from './worker-panel.ts'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { QqSourceError, type QqBridge } from './qq-source.ts'
 import { baselineAssessment, watchdogSnapshot } from './watchdog.ts'
@@ -42,6 +43,7 @@ import { PersonalConflict } from './personal-store.ts'
 import type { PersonalRuntime } from './personal-runtime.ts'
 import { ActionConflict, ActionAuthorizationError } from './personal-actions.ts'
 import { AttentionConflict } from './personal-attention.ts'
+import { MAX_WEB_IMAGE_BODY_BYTES, WebAttachmentStore, WebImageError } from './web-attachments.ts'
 
 export interface HttpHost {
   readonly personal?: PersonalCoordinator
@@ -54,7 +56,7 @@ export interface HttpHost {
   readonly schedules?: Pick<Schedules, 'list' | 'create' | 'update' | 'runNow' | 'remove'> | undefined
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'conversationIds'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople & Pick<Engine, 'receive' | 'requestStatus' | 'direct' | 'cancelFollowup'>
   inspectWorker?(ticketId: string, signal?: AbortSignal): Promise<readonly SessionEvent[]>
@@ -111,6 +113,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof PersonalConflict) return [409, { error: '记录已更新，请刷新后保存。' }]
   if (error instanceof QqSourceError) return [error.status, { error: error.message }]
   if (error instanceof WebTaskError) return [error.status, { error: error.message }]
+  if (error instanceof WebImageError) return [error.status, { error: error.message }]
   if (error instanceof ScheduleConflict) return [409, { error: error.message }]
   if (error instanceof ScheduleNotFound) return [404, { error: error.message }]
   if (error instanceof ScheduleLimit) return [400, { error: error.message }]
@@ -186,14 +189,16 @@ const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().no
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
+  const images = () => webImages(runtime)
   const rooms = () => new TaskRooms({ store, engine: runtime.engine, personal: () => (runtime.machine.mode ?? 'repository') === 'personal',
     configured: () => runtime.configured(), requestPass: () => runtime.requestPass(),
-    artifacts: runtime.artifacts,
+    artifacts: runtime.artifacts, attachments: images(),
     ...runtime.inspectWorker ? { inspectWorker: (id: string, signal?: AbortSignal) => runtime.inspectWorker!(id, signal) } : {} })
   const web = () => {
     const failures = runtime.sessions?.status?.().failures ?? []
     return new WebTasks({ store, mode: () => runtime.machine.mode ?? 'repository', configured: () => runtime.configured(),
       health: () => runtime.health, receive: trigger => runtime.engine.receive(trigger), requestPass: () => { runtime.requestPass() },
+      attachments: images(),
       failure: ticketIds => {
         const ids = new Set([runtime.masterId, ...ticketIds.map(workerSessionId)])
         return failures.filter(failure => ids.has(failure.sessionId)).sort((a, b) => a.at.localeCompare(b.at)).at(-1)
@@ -209,14 +214,29 @@ function routes(runtime: HttpHost): Routes {
       return rooms().list(page.offset, page.limit)
     },
     'GET rooms/:key': ({ params, query }) => {
-      const page = z.object({ before: z.string().optional(), limit: limit(50, 100) }).parse(query)
-      return rooms().get(params.key, page.before, page.limit)
+      const page = z.object({ before: z.string().optional(), limit: limit(50, 100), workerId: z.string().min(1).max(200).optional() }).parse(query)
+      return rooms().get(params.key, page.before, page.limit, page.workerId)
     },
     'POST rooms/:key/messages': async ({ params, body }) => rooms().post(params.key, await body()),
     'GET rooms/:key/workers/:ticketId/activity': ({ params, query }) => {
       const page = z.object({ offset, limit: limit(30, 50) }).parse(query)
       return rooms().activity(params.key, params.ticketId, page.offset, page.limit)
     },
+    'GET sessions/:id/workers': ({ params }) => workerPanel({ store, rooms: rooms(), masterId: runtime.masterId,
+      conversationIds: runtime.sessions.conversationIds() }, params.id),
+    'POST sessions/:id/collaboration': async ({ params, body }) => {
+      const request = await body(), service = rooms()
+      const panel = workerPanel({ store, rooms: service, masterId: runtime.masterId, conversationIds: runtime.sessions.conversationIds() }, params.id)
+      if (!panel.eligible) throw new WebTaskError(404, '该会话暂未启用 Superagent 协作。')
+      const anchor = `dsh-session:${params.id}`
+      store.atomic(() => {
+        if (!store.threads.get(anchor)) store.threads.save({ key: anchor, ref: { source: 'dsh-session', id: params.id },
+          createdAt: new Date().toISOString(), subscriptions: [], correlated: [], pending: [], meta: {} })
+        service.post(anchor, request, { requestScope: `session:${params.id}`, members: new Map(panel.workers.map(worker => [worker.id, worker.roomKeys])) })
+      })
+      return workerPanel({ store, rooms: service, masterId: runtime.masterId, conversationIds: runtime.sessions.conversationIds() }, params.id)
+    },
+    'POST web/attachments': async ({ body }) => images().upload(await body(MAX_WEB_IMAGE_BODY_BYTES)),
     'GET schedules': () => schedules().list(),
     'POST schedules': async ({ body }) => {
       const request = z.object({ config: ScheduleConfigSchema }).strict().parse(await body(32 * 1024))
@@ -333,6 +353,14 @@ function match(table: Routes, method: string, segments: string[]) {
   }
   return undefined
 }
+/** Shares the immutable upload spool with the Web source while rechecking current owner authorization. */
+function webImages(runtime: HttpHost): WebAttachmentStore {
+  return new WebAttachmentStore(runtime.store, runtime.machine.stateDir, () => {
+    const settings = runtime.store.settings()
+    return runtime.machine.mode === 'personal' && runtime.configured() && settings.sources.web?.enabled !== false
+      && !!settings.policy.sources.web?.allowed.some(actor => actor.id === 'owner')
+  })
+}
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
   if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
   const table = routes(runtime)
@@ -343,6 +371,14 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        const imageRoute = /^\/orchestrator\/api\/web\/attachments\/([^/]+)$/.exec(url.pathname)
+        if (imageRoute) {
+          if (req.method !== 'GET') throw new RouteError(404, 'Unknown operation')
+          const { image, bytes } = webImages(runtime).bytes(decoded(imageRoute[1]!))
+          res.writeHead(200, { 'content-type': image.mediaType, 'content-length': String(bytes.length),
+            'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox" })
+          res.end(bytes); return
+        }
         const artifactRoute = /^\/orchestrator\/api\/web\/tasks\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
         const roomArtifactRoute = /^\/orchestrator\/api\/rooms\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname)
         if (artifactRoute || roomArtifactRoute) {

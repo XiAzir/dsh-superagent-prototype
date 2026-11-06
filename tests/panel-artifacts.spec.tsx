@@ -32,6 +32,8 @@ it('downloads with the same-origin header, preserves the filename and shows acce
   expect(button.textContent).toBe('下载 十月排休表.xlsx')
   await act(async () => button.click())
   expect(button.disabled).toBe(true); expect(button.getAttribute('aria-busy')).toBe('true')
+  await act(async () => button.click())
+  expect(fetcher.mock.calls.filter(([url]) => url.includes('/artifacts/'))).toHaveLength(1)
   expect(fetcher).toHaveBeenCalledWith('/orchestrator/api/web/tasks/task-a/artifacts/artifact-a', expect.objectContaining({ headers: { 'x-orchestrator-request': '1' } }))
   await act(async () => { finish(new Response('actual file bytes')); await pending })
   expect(create).toHaveBeenCalledTimes(1)
@@ -41,13 +43,27 @@ it('downloads with the same-origin header, preserves the filename and shows acce
 })
 
 it('shows a download refusal next to the button and lets the person retry', async () => {
-  vi.stubGlobal('fetch', vi.fn((url: string) => Promise.resolve(url.includes('/artifacts/')
-    ? new Response('{"error":"Web 账号授权已关闭"}', { status: 403 }) : new Response('{"load":{"running":0}}'))))
+  let allowed = false
+  const fetcher = vi.fn((url: string) => Promise.resolve(url.includes('/artifacts/')
+    ? allowed ? new Response('retried file bytes') : new Response('{"error":"Web 账号授权已关闭"}', { status: 403 })
+    : new Response('{"load":{"running":0}}')))
+  vi.stubGlobal('fetch', fetcher)
+  const create = vi.fn(() => 'blob:retried-artifact')
+  vi.stubGlobal('URL', class extends URL { static createObjectURL = create; static revokeObjectURL = vi.fn() })
+  let filename = ''
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) { filename = this.download })
   await render()
   const button = container!.querySelector('button')!
   await act(async () => button.click())
   expect(container!.querySelector('[role="alert"]')?.textContent).toBe('Web 账号授权已关闭')
   expect(button.disabled).toBe(false)
+  allowed = true
+  await act(async () => button.click())
+  expect(fetcher.mock.calls.filter(([url]) => url.includes('/artifacts/'))).toHaveLength(2)
+  expect(filename).toBe('十月排休表.xlsx')
+  expect(create).toHaveBeenCalledTimes(1)
+  expect(container!.querySelector('[role="alert"]')).toBeNull()
+  expect(button.getAttribute('aria-busy')).toBe('false')
 })
 
 it('downloads a task-room artifact from the room-scoped endpoint', async () => {

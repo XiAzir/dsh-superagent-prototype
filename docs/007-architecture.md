@@ -339,6 +339,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions: managed Session lifecycle, prompt/tool installation, and `status().failures` for the latest run error of each main or worker Session |
+| `src/app/session-conversations.ts` | Ordinary Superagent workspace conversations: human input admission, per-Session source threads, status and durable replies to the original Session |
+| `src/app/worker-panel.ts` | Bounded per-conversation worker cards and group activity, with Router-wide aggregation |
+| `src/client/worker-panel.tsx`, `collaboration.tsx`, `worker-panel.css` | Native two-pane collaboration workbench: member cards, chronological progress, independently paged conversations and execution records |
+| `src/client/message-composer.tsx`, `message-composer.css` | Shared image-capable message editor, repeated single-member mentions, explicit Router switch, durable drafts and retry identities |
+| `src/app/web-attachments.ts` | Authorized immutable owner image uploads and source attachment references with visual reads |
+| `src/app/worker-progress.ts` | Persisted randomized 5–15 minute progress reminders, stage-report resets and lifecycle guards |
+| `src/app/memory.ts` | Main-Session long-term memory: bounded topic index, paginated disclosure, immutable versions, revision checks and archival |
 | `src/app/session-failures.ts` | Projects durable `turn/start` and `turn/end` events into one recoverable latest failure per managed Session; sanitizes exposed messages |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
@@ -407,6 +414,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
+| `src/client/workbench.tsx`, `shell.css` | Personal workspace shell, four primary destinations, actionable overview and runtime navigation |
+| `src/client/workspace-sidebar.tsx`, `workspace-sidebar.css`, `sidebar-dom.ts`, `sidebar-model.ts` | Dual DSH/Superagent workspace browser, retained native tree, task grouping, scoped session navigation and reversible region mounts |
+| `src/client/task-ui.ts`, `session-draft.ts`, `redesign.css` | Shared task labels, persistent per-task drafts and responsive workspace presentation |
 | `src/client/personal.tsx` | Personal-mode Web task creation, conversation history, follow-ups and related Ticket results |
 | `src/client/assistant.tsx` | The personal assistant page for owner settings, goals, commitments, facts, constraints, attention and action approval |
 | `src/client/rooms.tsx` | Group-style task supervision, recipients, live message pagination and lazy execution details |
@@ -475,6 +485,13 @@ The personal assistant stores structured records in the same transactional SQLit
 | `tests/session-history.spec.ts` | Read-only durable Session history, pagination cuts, cancellation, latest-turn restoration and last assistant lookup |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
+| `tests/session-conversations.spec.ts` | Conversation workspace ownership, human input deduplication, source gates, original-Session replies and scoped status |
+| `tests/worker-panel.spec.ts` | Worker panel ownership, bounded progress, deduplicated messages and Router aggregation |
+| `tests/worker-panel-ui.spec.tsx` | Two-pane member switching, independent history, chronological reports, mention routing retries, reading position and native-tab opening |
+| `tests/message-composer.spec.tsx` | Repeated mentions, Router routing combinations, image inputs, retries and isolated drafts |
+| `tests/collaboration-messages.spec.ts` | Cross-room multi-member dispatch, Router-only coordination, scoped history and authorized immutable image uploads |
+| `tests/worker-progress.spec.ts` | Random reminder intervals, report resets, restart recovery, capacity, pause and terminal-state guards |
+| `tests/memory.spec.ts` | Durable memory restoration, bounded index, version conflicts, archival, pagination and input validation |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
@@ -515,6 +532,9 @@ The personal assistant stores structured records in the same transactional SQLit
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
+| `tests/workbench.spec.tsx` | Personal workbench, four primary destinations, actionable task links and repository navigation compatibility |
+| `tests/workspace-sidebar.spec.tsx`, `sidebar-model.spec.ts` | Native sidebar preservation, switching, navigation, DOM lifecycle, task grouping, path identity and worker descendants |
+| `tests/panel-composer.spec.tsx` | Task creation drafts across navigation, successful draft cleanup, starters and keyboard input composition |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `session.ts`, the model and paged durable persistence fixtures; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
 

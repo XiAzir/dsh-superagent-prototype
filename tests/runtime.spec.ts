@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry } from './fixtures/host.ts'
@@ -219,6 +219,71 @@ beforeEach(async () => {
   deliveries.mockClear()
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+
+it('connects a new workspace conversation to routing, a real worker, follow-ups and durable replies to that conversation', async () => {
+  const settings = runtime.store.settings()
+  settings.sources['dsh-session'] = { enabled: true, config: {} }
+  settings.policy.sources['dsh-session'] = { allowed: [{ id: 'owner' }], admission: {} }
+  runtime.store.saveSettings(settings)
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  const presets = { select: vi.fn(async () => 'dsh-superagent-conversation') }
+  ctx.reflect.provide('agentPresets', presets)
+  await (controller.create as (options: { sessionId: string; agentPreset: string }) => Promise<void>)({ sessionId: 'workspace-conversation', agentPreset: 'standard' })
+  const agent = agents.get('workspace-conversation')! as unknown as import('@deepseek-ai/dsh-agent').Agent
+  Object.assign(agent.session.header, { cwd: directory })
+  const user = (id: string, text: string) => freezeMessage({ id: MessageId(id), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const first = user('conversation-user-1', '请修复回归并验证结果')
+  ;(agent.inbox.nextTurn as UserMessage[]).push(first)
+  await ctx.parallel('agent/created', { agent } as never)
+  await runtime.idle()
+  expect(presets.select).toHaveBeenCalledWith(agent, 'dsh-superagent-conversation')
+  expect(restricts.get(agent.id)).toEqual([{ allow: [] }])
+  expect(tools.get(agent.id)?.has('orchestrator_session_status')).toBe(true)
+  expect(tools.get(agent.id)?.has('orchestrator_memory_read')).toBe(false)
+  expect(guards.get(agent.id)!({ name: 'pwsh', arguments: {} })).toBeTruthy()
+  const triggerId = `session-message-${key(agent.id, first.id)}`
+  expect(relays(runtime.masterId)).toContainEqual(expect.objectContaining({ trigger_id: triggerId, strength: 'explicit' }))
+  // History and inbox callbacks may announce the same message; they must not enqueue a second candidate.
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: first } as never)
+  ctx.emit('agent/inbox/inserted', { agent, message: first })
+  const accepted = await route({ kind: 'accept', trigger_id: triggerId, title: '修复会话回归', worktree_name: 'conversation-fix', acknowledgement: '开始修复会话回归。' })
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id, workerId = `worker-${ticketId}`
+  expect(tools.get(workerId)?.has('orchestrator_report')).toBe(true)
+  expect(runtime.ticketEnvironment(runtime.store.tickets.get(ticketId)!).find(item => item.key === 'DSH_SUPERAGENT_SESSION_CWD')?.value).toBe(directory)
+  expect(relays(agent.id)).toContainEqual({ text: '[Superagent delivery]\n开始修复会话回归。' })
+  const followup = user('conversation-user-2', '补上中文按钮')
+  ctx.emit('agent/inbox/inserted', { agent, message: followup })
+  await runtime.idle()
+  await route({ kind: 'attach', trigger_id: `session-message-${key(agent.id, followup.id)}`, ticket_id: ticketId })
+  expect(relays(workerId).some(item => JSON.stringify(item).includes('补上中文按钮'))).toBe(true)
+  const candidateCount = relays(runtime.masterId).filter(item => item.kind === 'candidate').length
+  await runTool(workerId, 'orchestrator_report', { state: 'ready', summary: '已修复回归并通过验证。' })
+  const reply = await runTool(runtime.masterId, 'orchestrator_reply', { purpose: 'result', ticket_id: ticketId, text: '已修复，验证通过。' })
+  await runtime.sendReplies()
+  expect(runtime.store.replyStatus(reply.receipt_id as string)).toBe('sent')
+  expect(relays(agent.id)).toContainEqual({ text: '[Superagent delivery]\n已修复，验证通过。' })
+  const delivery = [...agent.inbox.nextTurn].find(message => message.source.kind === 'dsh-superagent')!
+  ctx.emit('agent/inbox/inserted', { agent, message: delivery })
+  await runtime.idle()
+  expect(relays(runtime.masterId).filter(item => item.kind === 'candidate')).toHaveLength(candidateCount)
+})
+
+it('gives only the main Session a shared memory index and tools, preserving bodies across a runtime restart', async () => {
+  const body = 'The owner prefers verification evidence before a completion report.'
+  await runTool(runtime.masterId, 'orchestrator_memory_save', { topic: 'owner-reporting', title: 'Owner reporting', summary: 'Report concrete outcomes and verification.',
+    content: body, expected_revision: 0, sources: ['owner:explicit-reporting-preference'] })
+  const prompt = sections.get(runtime.masterId)!.text({})
+  expect(prompt).toContain('owner-reporting')
+  expect(prompt).not.toContain(body)
+  const { sessionId } = await acceptedTicket()
+  expect(tools.get(sessionId)?.has('orchestrator_memory_read')).toBe(false)
+  expect(tools.get(sessionId)?.has('orchestrator_memory_save')).toBe(false)
+  expect(sections.get(sessionId)!.text({})).not.toContain('owner-reporting')
+  const next = await restart()
+  await next.ready
+  expect(await runTool(next.masterId, 'orchestrator_memory_read', { topic: 'owner-reporting' })).toMatchObject({ revision: 1, content: body })
+  expect(sections.get(next.masterId)!.text({})).toContain('owner-reporting')
+})
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()

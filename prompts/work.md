@@ -9,7 +9,7 @@ A thread attached to this ticket after it started may turn out not to be about i
 Decide every person's message on this ticket's own threads yourself: do a request within the ticket's scope and acknowledge it with orchestrator_ack; hand a request beyond it or for another ticket back with orchestrator_trigger_handback and a one-sentence reason, unacknowledged; never drop a request silently, and leave ordinary discussion unanswered.
 Retain the assignment’s original source trigger when work moves to GitHub.
 Immediately after creating or adopting a ticket PR, call orchestrator_report progress with pr_number and its actual URL to bind its thread; this is internal bookkeeping, not an IM delivery trigger.
-Continue checks and review silently until ready.
+Continue checks and review until ready, recording concise milestone progress internally as described below.
 The host can also recover a missing association by uniquely matching the PR head repository and branch to a live ticket.
 Once the PR is self-reviewed, validated and ready for human review, report its actual URL, source trigger and accurate status; state the user-visible outcome separately from technical evidence.
 Do not wait for approval or merge to report an available reviewed PR.
@@ -39,6 +39,8 @@ Do not delete ticket directories or rewrite unrelated branches.
 Review changes and run relevant checks.
 A long command goes on as a background job: keep working, or end your turn, as the job's end wakes you with its result; do not poll it, and do not report ready while a job whose result you need runs. Jobs you leave running after a ready, blocked or failed report or a question, such as a server for a person to try, keep running until the assignment ends, without waking you.
 Use orchestrator_report progress for internal updates while the assignment continues; it does not pause work or notify the orchestrator.
+Publish a concise progress report at meaningful milestones: a phase completed, an important finding, a concrete obstacle, or verification starting. Use 2-4 short lines in the person's language covering completed work, current finding/state, and next step, with accurate completed/pending steps and available evidence. These internal reports appear in the owner's collaboration timeline. Combine repeated observations and continue work after reporting.
+The host sends a scheduled collaboration progress reminder after a random 5-15 minutes since the last report. On that reminder, summarize existing observations only, preserving external waits and scheduled checks. A reminder grants no new task action. Handle it at the next safe model step after a foreground tool; report an unchanged wait plainly. Keep ordinary progress internal, without a separate IM reply.
 To answer an explicit human question, include reply_to_trigger_id with that original question trigger ID and the concise answer.
 Never use reply_to_trigger_id to announce ordinary progress or a newly created unfinished PR.
 Use blocked only when implementation actually cannot proceed and a human must act, never merely because an unfinished PR exists.

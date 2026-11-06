@@ -53,6 +53,9 @@ import { Schedules } from './schedules.ts'
 import { PersonalCoordinator } from './personal-coordinator.ts'
 import { personalTools } from './tools/personal.ts'
 import { PersonalRuntime } from './personal-runtime.ts'
+import { SessionConversations } from './session-conversations.ts'
+import { Memory } from './memory.ts'
+import { WorkerProgress } from './worker-progress.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -80,6 +83,7 @@ export class Runtime extends Service implements SourceHost {
   readonly schedules: Schedules
   readonly personal: PersonalCoordinator
   readonly personalRuntime: PersonalRuntime
+  readonly workerProgress: WorkerProgress
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
@@ -108,6 +112,11 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      const initial = store.settings()
+      let sessionDefaultsChanged = false
+      if (!initial.sources['dsh-session']) { initial.sources['dsh-session'] = { enabled: true, config: {} }; sessionDefaultsChanged = true }
+      if (!initial.policy.sources['dsh-session']) { initial.policy.sources['dsh-session'] = { allowed: [{ id: 'owner', name: '我' }], admission: {} }; sessionDefaultsChanged = true }
+      if (sessionDefaultsChanged) store.saveSettings(initial)
       this.personal = new PersonalCoordinator({ store, personalMode: () => (machine.mode ?? 'repository') === 'personal' })
       this.artifacts = new ArtifactRegistry(store, machine.stateDir)
       if ((machine.mode ?? 'repository') === 'personal') {
@@ -145,10 +154,17 @@ export class Runtime extends Service implements SourceHost {
         readAttachment: (trigger, id, sessionId, signal) => sources.readAttachment(trigger, id, ctx.agents.get(sessionId as SessionId), signal),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
+      const memory = new Memory(store)
+      const conversations = new SessionConversations({ masterId, stateDir: machine.stateDir, store, artifacts: this.artifacts,
+        configured: () => setup.configured(), receive: trigger => this.receive(trigger),
+        attachmentPath: block => block.type === 'image' ? ctx.get('attachments')?.imageHostPath(block.attachment)
+          : ctx.get('attachments')?.fileHostPath(block.attachment),
+        prompt: (id, requestId, text) => this.sessions.prompt(id, requestId, text, 'queue') })
+      this.disposers.push(sources.register(conversations.kind))
+      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, conversations, memory, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
-        tools: (agent, ticket) => [...(ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent)),
+        tools: (agent, ticket) => [...(ticket ? executorTools(this.toolHost, ticket) : [...mainTools(this.toolHost, agent), ...memory.tools()]),
           ...personalTools(this.personal, ticket?.id, this.personalRuntime)] })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
@@ -156,6 +172,10 @@ export class Runtime extends Service implements SourceHost {
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+      this.workerProgress = new WorkerProgress({ store, paused: () => this.paused(), closing: () => this.closing(),
+        remind: reminder => this.executor.progressReminder(reminder),
+        cancel: (ticketId, requestIds) => { this.executor.cancelProgressReminders(ticketId, requestIds) },
+        onError: error => { if (!this.closing()) ctx.logger.warn('dsh-superagent progress reminder: %s', String(error)) } })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -189,7 +209,7 @@ export class Runtime extends Service implements SourceHost {
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); this.personalRuntime.tick(); evals.set(evalsHealth(store)) }
+      const evaluateDue = () => { engine.evaluateDue(); this.personalRuntime.tick(); this.workerProgress.tick(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
@@ -241,7 +261,7 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
-    this.sessions.install()
+    await this.sessions.install()
     this.executor.install()
     try { await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator') }
     catch (error) {
@@ -279,10 +299,10 @@ export class Runtime extends Service implements SourceHost {
     this.closingFlag = true; const schedules = this.schedules.stop(); const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()
-      const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
+      const ids = [this.masterId, ...this.sessions.conversationIds(), ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([schedules, passes, this.personalRuntime.drain(), this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
+      await Promise.allSettled([schedules, passes, this.personalRuntime.drain(), this.workerProgress.drain(), this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

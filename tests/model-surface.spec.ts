@@ -39,7 +39,8 @@ interface Skill { name: string; description: string; content: string }
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
  */
 // Structured reports add waiting/evidence/recheck schemas and a cancellation tool (~2.3k characters).
-const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 44_000 }
+// Shared memory adds two bounded tool schemas and short recall guidance; saved indexes have a separate 3000-character cap.
+const BUDGET: Record<Role, number> = { orchestrator: 62_000, worker: 44_000 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
@@ -320,7 +321,11 @@ function failures(): Map<string, string> {
         if (!options.get(name!)!.has(value)) fail(`${name}=${value} is not an option`)
       }
     }
-    for (const [word, pattern] of LEGACY) if (pattern.test(text)) fail(`legacy word "${word}"`)
+    for (const [word, pattern] of LEGACY) {
+      // A memory topic is the new persistent-memory record, separate from the retired task-domain vocabulary.
+      const checked = word === 'topic' ? /tool orchestrator_memory_/.test(where) ? '' : text.replace(/<superagent-memory>[\s\S]*?<\/superagent-memory>/g, '') : text
+      if (pattern.test(checked)) fail(`legacy word "${word}"`)
+    }
     for (const [rule, scope, phrase] of BANNED) if (scope.test(where) && phrase.test(text)) fail(`breaks "${rule}"`)
     for (const [name] of text.matchAll(/\bDSH_SUPERAGENT_[A-Z][A-Z_]*[A-Z]\b/g)) if (!variables.has(name)) fail(`${name} is not a variable`)
     // A ticket's or worker's state is a card state; a report state is named with the word report.

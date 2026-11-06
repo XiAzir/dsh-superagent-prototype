@@ -12,7 +12,9 @@ import type { WebTaskSummary, WebTaskView } from './web-tasks.ts'
 import type { QqStatus } from './qq-source.ts'
 import type { ScheduleConfig, ScheduleItem, ScheduleList } from './schedules.ts'
 import type { TaskRoomSummary, TaskRoomView, RoomActivity } from './task-rooms.ts'
+import type { WorkerPanelView } from './worker-panel.ts'
 import type { PersonalApi } from './personal-http.ts'
+import type { WebImage } from './web-attachments.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -21,12 +23,16 @@ export type ThreadFilter = typeof THREAD_FILTERS[number]
 interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
+export interface CollaborationMessageBody { text: string; requestId: string; recipient?: string; router?: boolean; mentions?: string[]; attachmentIds?: string[] }
 
 export interface Api extends PersonalApi {
   'GET rooms': { query?: Paged; response: { items: TaskRoomSummary[]; next_offset: number | null } }
-  'GET rooms/:key': { query?: { before?: string; limit?: number }; response: TaskRoomView }
-  'POST rooms/:key/messages': { body: { text: string; requestId: string; recipient?: string }; response: TaskRoomView }
+  'GET rooms/:key': { query?: { before?: string; limit?: number; workerId?: string }; response: TaskRoomView }
+  'POST rooms/:key/messages': { body: CollaborationMessageBody; response: TaskRoomView }
   'GET rooms/:key/workers/:ticketId/activity': { query?: Paged; response: RoomActivity }
+  'GET sessions/:id/workers': { response: WorkerPanelView }
+  'POST sessions/:id/collaboration': { body: CollaborationMessageBody; response: WorkerPanelView }
+  'POST web/attachments': { body: { name: string; mediaType: string; data: string; requestId: string }; response: WebImage }
   'GET schedules': { response: ScheduleList }
   'POST schedules': { body: { config: ScheduleConfig }; response: { item: ScheduleItem } }
   'PUT schedules/:id': { body: { revision: number; config: ScheduleConfig }; response: { item: ScheduleItem } }
@@ -36,8 +42,8 @@ export interface Api extends PersonalApi {
   'PUT qq/token': { body: { value: string }; response: { configured: boolean } }
   'GET web/tasks': { query?: Paged; response: { items: WebTaskSummary[]; next_offset: number | null } }
   'GET web/tasks/:id': { response: WebTaskView }
-  'POST web/tasks': { body: { text: string; requestId: string }; response: WebTaskView }
-  'POST web/tasks/:id/messages': { body: { text: string; requestId: string }; response: WebTaskView }
+  'POST web/tasks': { body: { text: string; requestId: string; attachmentIds?: string[] }; response: WebTaskView }
+  'POST web/tasks/:id/messages': { body: { text: string; requestId: string; attachmentIds?: string[] }; response: WebTaskView }
   'GET state': { response: StateView }
   /** Bounded diagnostic projection for the external Watchdog process; contains no source message bodies or environment values. */
   'GET watchdog/snapshot': { query?: { offset?: number; limit?: number; candidateAfterMs?: number };

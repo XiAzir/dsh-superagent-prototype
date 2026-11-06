@@ -153,8 +153,15 @@ export class Tickets extends EnginePart {
   attachable(ticketId: string, triggerId: string): Trigger {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
-    // A follow-up that reached a ticket goes elsewhere only once the workers that decide it hand it back.
-    this.leftToWorkers(trigger)
+    // An owner can explicitly ask Router to coordinate several named workers. Router may distribute that one
+    // request to each named ticket once; ordinary follow-ups keep their existing worker ownership protection.
+    const coordinated = trigger.source === 'web' && trigger.actor.source === 'web' && trigger.actor.id === 'owner'
+      && trigger.human && trigger.meta.router === true && Array.isArray(trigger.meta.mentions) && trigger.meta.mentions.length > 0
+    if (coordinated) {
+      const mentions = (trigger.meta.mentions as unknown[]).filter((id): id is string => typeof id === 'string')
+      if (!mentions.includes(ticketId)) throw new UserError('notAdmissible', { reason: 'this collaboration request names different worker tickets' })
+      if (this.owners(trigger).some(id => !mentions.includes(id))) this.leftToWorkers(trigger)
+    } else this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')

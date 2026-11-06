@@ -4,6 +4,8 @@ import { createPortal } from 'react-dom'
 import { caller, usePoll, type ApiMessages, type Call, type SetupView, type StateView } from './api.ts'
 import type { Route } from './route.ts'
 import STYLES from './client.css?raw'
+import SHELL_STYLES from './shell.css?raw'
+import REDESIGN_STYLES from './redesign.css?raw'
 import { errorText, setupText, valueLabel, type T } from './text.ts'
 
 export interface PanelContext {
@@ -102,6 +104,8 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
     reload, restarts])
   return <Panel.Provider value={context}><PanelState.Provider value={data}>
     <style>{STYLES}</style>
+    <style>{SHELL_STYLES}</style>
+    <style>{REDESIGN_STYLES}</style>
     {children}
     {toast && <Toast key={toast.id} text={toast.text} onDone={() => setToast(undefined)} />}
   </PanelState.Provider></Panel.Provider>
