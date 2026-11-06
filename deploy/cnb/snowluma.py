@@ -279,7 +279,7 @@ class SnowLuma:
             and host.get('RestartPolicy', {}).get('Name') == 'unless-stopped'
             and host.get('ShmSize') == 1073741824
             and sorted(cap.removeprefix('CAP_') for cap in (host.get('CapAdd') or [])) == ['SYS_PTRACE']
-            and set(host.get('SecurityOpt') or []) == {'seccomp=unconfined'}
+            and set(host.get('SecurityOpt') or []) == {'seccomp=unconfined', 'no-new-privileges=false'}
             and host.get('Privileged') is False
             and mac_matches
             and (host.get('PortBindings') or {}) == self._expected_ports(config)
@@ -298,7 +298,7 @@ class SnowLuma:
             # SnowLuma's Node binary grants CAP_SYS_PTRACE at exec to UID1000.
             # Keep file capabilities enabled so the hook can attach to the QQ process.
             '--shm-size=1g', '--ulimit', 'nofile=65535:65535', '--cap-add=SYS_PTRACE',
-            '--security-opt', 'seccomp=unconfined',
+            '--security-opt', 'seccomp=unconfined', '--security-opt', 'no-new-privileges=false',
             '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
             '--mac-address', mac,
         ]
