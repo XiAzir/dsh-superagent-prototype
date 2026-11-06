@@ -46,6 +46,8 @@ WebUI 已完成首次使用设置并保存新的随机强密码。运维凭据�
 - 用户完成首次登录后，SA 实际连接机器人账号 `1152578024`，来源授权仍为1人、0个群。
 - 第一轮完整重建创建 `cnb-7a0-1k6nf3lg9`，证明三个数据卷、设备身份、OneBot和WebUI配置可从外部快照恢复；QQ窗口中的“自动登录”原为关闭状态。已在官方QQ窗口勾选该选项并登录保存的账号，SA随即恢复连接。
 - 保存新的登录配置后，第二轮完整重建创建 `cnb-v08-1k6nfnt67`。CNB自动恢复快照、启动SnowLuma、QQ自动登录原账号、SA OneBot恢复connected，监督器healthy。该轮账号恢复全程自动完成。
+- 登录状态下的完整在线快照上传HTTP200：568,937,828字节、6299文件，其中SnowLuma3250文件。归档内QuotaManager数据库quick_check为ok，自动登录配置已保留；备份期间QQ持续connected。
+- 监督器随后按计划自行完成周期备份，更新last_backup及下一次计划时间；全程healthy，QQ保持connected。实际打包与上传约130秒。自动备份验证记录位于 `control/snowluma-periodic-backup-verification.json`。
 - 冷启动校验标记保留；MAC、machine-id、deployment、默认及账号级OneBot、WebUI配置的6项SHA-256比较全部一致。受管容器配置与管理器预期一致。
 - 验收原始记录位于新工作区 `control/snowluma-coldboot-verification.json`，本机副本位于工作区外的 `output/snowluma-cnb-20261105/coldboot-verification.json`。首次登录时勾选“自动登录”已补入部署说明。
 
