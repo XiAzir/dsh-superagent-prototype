@@ -1,4 +1,4 @@
-/** QQ connection status, NapCat mode guidance, and credential controls for the QQ Source card. */
+/** QQ connection status, OneBot mode guidance, and credential controls for the QQ Source card. */
 import { useState } from 'react'
 import type { QqStatus } from '../app/qq-source.ts'
 import { usePoll } from './api.ts'

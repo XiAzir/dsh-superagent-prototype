@@ -1,6 +1,6 @@
-/** NapCat OneBot source: admission, persistent thread routing and replies to the original QQ chat. */
+/** OneBot v11 QQ source: admission, persistent thread routing and replies to the original QQ chat. */
 import { z } from 'zod'
-import { pathToFileURL } from 'node:url'
+import { readFile } from 'node:fs/promises'
 import { key, type OutboundMessage, type ReceiveResult, type Trigger } from '../core/index.ts'
 import { record } from '../kv.ts'
 import { SourcePolicySchema } from '../policy.ts'
@@ -92,7 +92,7 @@ export class QqBridge {
       allowed: trigger => trigger.source === 'qq' && !!trigger.channel && this.canSend(trigger.channel.address)
         && (!this.selfId || trigger.meta.selfId === this.selfId),
       call: async (action, params, signal) => {
-        if (!this.client?.connected || !this.selfId) throw new Error('NapCat 尚未连接，附件可在恢复连接后重试读取')
+        if (!this.client?.connected || !this.selfId) throw new Error('OneBot 尚未连接，附件可在恢复连接后重试读取')
         return this.client.call(action, params, signal)
       },
       localPeer: () => { const config = this.config(); return config.connection === 'reverse'
@@ -187,12 +187,12 @@ export class QqBridge {
         if (state === 'connected') {
           this.cancelLoginInfo(); this.loginRetryAttempt = 0
           this.selfId = undefined
-          this.setState('connecting', '正在确认 NapCat 登录账号。')
+          this.setState('connecting', '正在确认 OneBot 登录账号。')
           this.queryLoginInfo(client)
         } else {
           this.cancelLoginInfo()
           this.selfId = undefined
-          this.setState(state, detail ?? (state === 'connecting' ? '等待 NapCat WebSocket 连接。' : 'OneBot 连接已断开，等待重新连接。'))
+          this.setState(state, detail ?? (state === 'connecting' ? '等待 OneBot WebSocket 连接。' : 'OneBot 连接已断开，等待重新连接。'))
         }
       },
       onEvent: event => {
@@ -277,7 +277,7 @@ export class QqBridge {
     if (!this.canSend(message.channel.address)) return 'gone'
     const client = this.client, address = message.channel.address, config = this.config()
     if (!client?.connected || !this.selfId) throw new Error('OneBot 尚未连接，回复会在连接恢复后重试。')
-    if (address.self_id !== this.selfId) throw new Error('NapCat 登录账号与任务所属机器人不同，请恢复原账号。')
+    if (address.self_id !== this.selfId) throw new Error('当前 OneBot 登录账号与任务所属机器人不同，请恢复原账号。')
     const chunks = qqReplyChunks(message.text, config.replyChunkSize)
     if (chunks.length > config.maxReplyChunks) throw new Error('回复超过 QQ 分段上限，请在来源设置中提高最大分段数。')
     let delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
@@ -288,15 +288,17 @@ export class QqBridge {
       if (!this.canSend(address)) return 'gone'
       const native = artifact.kind === 'image' || artifact.kind === 'video'
       if (native && !artifact.mediaType.startsWith(`${artifact.kind}/`)) throw new Error('Artifact media kind and format do not match')
+      const contents = await readFile(artifact.path)
+      const file = `base64://${contents.toString('base64')}`
       const reply = native
         ? await client.call<{ message_id?: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
           { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id,
-            message: [{ type: artifact.kind, data: { file: pathToFileURL(artifact.path).href } }] })
+            message: [{ type: artifact.kind, data: { file } }] })
         : await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
-          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file: artifact.path, name: artifact.name })
-      // NapCat confirms file uploads with file_id, not the message_id used for text replies.
+          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file, name: artifact.name })
+      // OneBot confirms file uploads with file_id; text and native media use message_id.
       const fileId = native ? String((reply as { message_id?: string | number })?.message_id ?? '') : (reply as { file_id?: string | null })?.file_id
-      if (native ? !/^-?\d+$/.test(String(fileId)) : fileId !== null && typeof fileId !== 'string') throw new Error('NapCat did not confirm the artifact delivery')
+      if (native ? !/^-?\d+$/.test(String(fileId)) : fileId !== null && typeof fileId !== 'string') throw new Error('OneBot did not confirm the artifact delivery')
       this.host.store.atomic(() => {
         delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
         delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: fileId ?? null }]
@@ -313,7 +315,7 @@ export class QqBridge {
       const reply = await client.call<{ message_id: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
         { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, message: segments })
       const messageId = String(reply?.message_id ?? '')
-      if (!/^-?\d+$/.test(messageId)) throw new Error('NapCat 未返回有效的回复消息编号。')
+      if (!/^-?\d+$/.test(messageId)) throw new Error('OneBot 未返回有效的回复消息编号。')
       this.host.store.atomic(() => {
         delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
         if (delivery.chunks.length === index) delivery.chunks.push({ text: chunks[index]!, messageId })
@@ -324,8 +326,8 @@ export class QqBridge {
     return 'sent'
   }
   private source(): SourceKind<QqConfig> {
-    return { kind: 'qq', title: { zh: 'QQ · NapCat', en: 'QQ · NapCat' },
-      description: { zh: '通过 NapCat / OneBot v11 接收 QQ 私聊和群聊任务，并回复原会话。', en: 'Receive QQ tasks through NapCat / OneBot v11 and reply in the original chat.' },
+    return { kind: 'qq', title: { zh: 'QQ · OneBot v11', en: 'QQ · OneBot v11' },
+      description: { zh: '通过 OneBot v11（如 NapCat、SnowLuma）接收 QQ 私聊和群聊任务，并回复原会话。', en: 'Receive QQ tasks through OneBot v11 (such as NapCat or SnowLuma) and reply in the original chat.' },
       schema: QqConfigSchema, health: ['qq'], fields: qqFields(),
       attachments: { references: trigger => this.attachments.references(trigger),
         read: async (trigger, id, agent, signal) => {
@@ -352,7 +354,7 @@ function qqFields(): FieldSpec[] {
   return [
     { key: 'connection', type: 'select', label: label('连接方式', 'Connection'), options: [
       { value: 'forward', label: label('正向 WebSocket', 'Forward WebSocket') }, { value: 'reverse', label: label('反向 WebSocket', 'Reverse WebSocket') }] },
-    { key: 'url', type: 'text', label: label('NapCat WebSocket 地址', 'NapCat WebSocket URL'), hint: label('正向模式使用，例如 ws://127.0.0.1:3001。', 'For forward mode, for example ws://127.0.0.1:3001.') },
+    { key: 'url', type: 'text', label: label('OneBot WebSocket 地址', 'OneBot WebSocket URL'), hint: label('正向模式使用，例如 ws://127.0.0.1:3001；同一 Docker 网络可用 ws://snowluma:3001/。', 'For forward mode, for example ws://127.0.0.1:3001; use ws://snowluma:3001/ on the same Docker network.') },
     { key: 'privateMessages', type: 'switch', label: label('接收已授权账号的私聊', 'Receive authorized private messages') },
     { key: 'groups', type: 'rows', label: label('接收的 QQ 群', 'Allowed groups'), hint: label('空列表接收 0 个群，群内发送者另需账号授权。', 'An empty list receives no groups; senders also need authorization.'), columns: [
       { key: 'id', type: 'text', label: label('群号', 'Group ID'), pattern: '[1-9][0-9]{3,19}' }, { key: 'name', type: 'text', optional: true, label: label('名称', 'Name') }] },

@@ -31,7 +31,7 @@ const secureEqual = (left: string, right: string): boolean => {
 }
 const isLoopback = (host: string): boolean => ['127.0.0.1', '::1', 'localhost'].includes(host.toLowerCase())
 
-/** OneBot v11 bidirectional JSON RPC transport for NapCat. */
+/** OneBot v11 bidirectional JSON RPC transport used by NapCat and SnowLuma. */
 export class OneBotClient {
   readonly connection: OneBotConnection
   private readonly options: OneBotClientOptions
@@ -60,7 +60,9 @@ export class OneBotClient {
   async call<T = unknown>(action: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
     if (this.stopped || !this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('OneBot is not connected')
     if (signal?.aborted) throw new Error('OneBot request aborted')
-    const echo = `${Date.now().toString(36)}-${(++this.nextEcho).toString(36)}`
+    // Numeric echoes are part of the OneBot v11 protocol and tolerate peers
+    // that serialize the response echo as either a JSON number or string.
+    const echo = String(++this.nextEcho)
     return await new Promise<T>((resolve, reject) => {
       const timeout = this.connection.requestTimeoutMs ?? DEFAULT_TIMEOUT
       const timer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC timeout: ${action}`)), timeout)
@@ -70,7 +72,7 @@ export class OneBotClient {
         signal.addEventListener('abort', pending.abort, { once: true })
       }
       this.pending.set(echo, pending)
-      try { this.socket!.send(JSON.stringify({ action, params, echo }), error => { if (error) this.settle(echo, error) }) }
+      try { this.socket!.send(JSON.stringify({ action, params, echo: Number(echo) }), error => { if (error) this.settle(echo, error) }) }
       catch (error) { this.settle(echo, errorOf(error)) }
     })
   }
@@ -193,18 +195,22 @@ export class OneBotClient {
     if (!message || typeof message !== 'object' || Array.isArray(message)) { this.reportError(new Error('OneBot sent an invalid packet')); return }
     const packet = message as Record<string, unknown>
     if (Object.hasOwn(packet, 'echo')) {
-      if (typeof packet.echo !== 'string') { this.reportError(new Error('OneBot RPC response has invalid echo')); return }
+      // OneBot permits string or numeric echo values. Some peers normalize an
+      // echoed string to a number when they serialize RPC correlation IDs.
+      const echo = typeof packet.echo === 'string' ? packet.echo
+        : typeof packet.echo === 'number' && Number.isSafeInteger(packet.echo) ? String(packet.echo) : undefined
+      if (echo === undefined) { this.reportError(new Error('OneBot RPC response has invalid echo')); return }
       const response = packet as RpcResponse
-      if (!this.pending.has(packet.echo)) return
+      if (!this.pending.has(echo)) return
       if (!['ok', 'async', 'failed'].includes(String(response.status)) || typeof response.retcode !== 'number' || !Number.isInteger(response.retcode)) {
-        this.settle(packet.echo, new Error('OneBot RPC response has invalid status or retcode'))
+        this.settle(echo, new Error('OneBot RPC response has invalid status or retcode'))
         this.reportError(new Error('OneBot RPC response has invalid status or retcode'))
         return
       }
       if (response.status === 'failed' || response.retcode !== 0) {
-        this.settle(packet.echo, new Error(`OneBot RPC failed (retcode ${response.retcode})`)); return
+        this.settle(echo, new Error(`OneBot RPC failed (retcode ${response.retcode})`)); return
       }
-      this.settle(packet.echo, undefined, response.data)
+      this.settle(echo, undefined, response.data)
       return
     }
     try {

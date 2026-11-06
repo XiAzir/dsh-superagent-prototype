@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket, { WebSocketServer } from 'ws'
 import type { OutboundMessage, Trigger } from '../src/core/index.ts'
+import { record } from '../src/kv.ts'
 import { QqBridge, QqConfigSchema } from '../src/app/qq-source.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
@@ -55,6 +56,8 @@ async function startQq(options: Record<string, unknown> = {}, waitConnected = tr
         Promise.resolve(rpcHandlers[packet.action]!(packet.params ?? {})).then(data => {
           socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
         })
+      } else if (packet.action === 'get_group_file_url' || packet.action === 'get_private_file_url') {
+        socket.send(JSON.stringify({ status: 'failed', retcode: 1404, data: {}, echo: packet.echo }))
       } else if (packet.action === 'send_private_msg' || packet.action === 'send_group_msg') {
         sendCount++
         const params = packet.params ?? {}
@@ -246,7 +249,9 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     await runtime.sendReplies()
     const media = sent.flatMap(item => item.params.message as { type: string; data: { file?: string } }[]).filter(item => ['image', 'video'].includes(item.type))
     expect(media.map(item => item.type)).toEqual(['image', 'video'])
-    expect(media.every(item => item.data.file?.startsWith('file:///'))).toBe(true)
+    expect(media.every(item => item.data.file?.startsWith('base64://'))).toBe(true)
+    expect(Buffer.from(media[0]!.data.file!.slice('base64://'.length), 'base64')).toEqual(png)
+    expect(Buffer.from(media[1]!.data.file!.slice('base64://'.length), 'base64').toString()).toBe('video transport fixture')
   })
   it('exposes a source file as a durable authorized read reference and delivers an immutable task artifact through the Outbox', async () => {
     const { runtime, bridge: qq, store } = await startQq()
@@ -260,7 +265,8 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     rpcHandlers.upload_private_file = async params => {
       expect(params.user_id).toBe(owner)
       expect(params.name).toBe('10月排休表.xlsx')
-      expect(await readFile(String(params.file), 'utf8')).toBe('October sheet bytes')
+      expect(String(params.file).startsWith('base64://')).toBe(true)
+      expect(Buffer.from(String(params.file).slice('base64://'.length), 'base64').toString('utf8')).toBe('October sheet bytes')
       uploads++
       return { file_id: 'uploaded-file-id' }
     }
@@ -291,8 +297,11 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
     expect(uploads).toBe(1)
     expect(sent.at(-1)?.text).toBe('十月排休表已完成，请查收。')
     const receipt = store.db.prepare('SELECT value FROM outbox WHERE json_extract(value, \'$.ticketId\')=? AND json_extract(value, \'$.kind\')=\'reply\'').get(ticketId) as { value: string }
-    await qq.kind.channel!.send({} as never, JSON.parse(receipt.value))
+    const outbound = JSON.parse(receipt.value) as OutboundMessage
+    await qq.kind.channel!.send({} as never, outbound)
     expect(uploads).toBe(1)
+    expect(store.get(record<{ chunks: { text: string; messageId: string }[]; artifacts?: { id: string; fileId: string | null }[] }>(`qq-delivery:${outbound.id}`))?.artifacts)
+      .toEqual([{ id: outbound.artifacts![0]!, fileId: 'uploaded-file-id' }])
     const revoked = store.settings(); revoked.policy.sources.qq!.allowed = []; store.saveSettings(revoked)
     await expect(qq.kind.attachments!.read(trigger, attachment.id, undefined, new AbortController().signal)).rejects.toThrow('authorized')
   })

@@ -1,6 +1,6 @@
 export interface OneBotAttachment {
   type: 'image' | 'file' | 'record' | 'video'
-  /** OneBot/NapCat opaque locator. Never treat this as a local filesystem path. */
+  /** Opaque OneBot locator. Never treat this as a local filesystem path. */
   file_id?: string
   id?: string
   file_name?: string

@@ -35,7 +35,7 @@ describe('OneBotClient', () => {
   it('correlates concurrent RPC responses by echo and exposes login self id', async () => {
     const { url } = await forwardServer((socket, packet) => {
       if (packet.action === 'get_login_info') socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { user_id: 9988 }, echo: packet.echo }))
-      else setTimeout(() => socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { value: packet.params }, echo: packet.echo })), packet.action === 'slow' ? 15 : 1)
+      else setTimeout(() => socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { value: packet.params }, echo: packet.action === 'slow' ? String(packet.echo) : packet.echo })), packet.action === 'slow' ? 15 : 1)
     })
     const client = makeClient(url)
     await client.start()
@@ -101,7 +101,7 @@ describe('OneBotClient', () => {
     await once(socket, 'open')
     const pending = reverse.call('ping')
     const [raw] = await once(socket, 'message')
-    const packet = JSON.parse(raw.toString()) as { echo: string }
+    const packet = JSON.parse(raw.toString()) as { echo: string | number }
     socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: 'pong', echo: packet.echo }))
     await expect(pending).resolves.toBe('pong')
     socket.close()

@@ -47,6 +47,38 @@ describe('fetchOneBotAttachment', () => {
     expect(await readFile(result.path!)).toEqual(Buffer.from([37, 80, 68, 70]))
   })
 
+  it('uses SnowLuma file URL actions with the original chat identity', async () => {
+    const stateDir = await tempDir()
+    const bytes = new Uint8Array([83, 110, 111, 119, 76, 117, 109, 97])
+    const remote = await fixture(bytes, 'application/octet-stream')
+    const call = vi.fn(async () => ({ data: { url: remote.url, file_name: 'notes.txt', file_size: bytes.length } }))
+    const result = await fetchOneBotAttachment({ attachment: { type: 'file', file_id: 'opaque-group-file' }, messageId: '81',
+      chat: { messageType: 'group', id: '23456' }, authorized: true, stateDir, call, downloadOrigins: [remote.origin] })
+    expect(call).toHaveBeenCalledWith('get_group_file_url', { group_id: '23456', file_id: 'opaque-group-file' }, expect.any(AbortSignal))
+    expect(result).toMatchObject({ status: 'downloaded', name: 'notes.txt', size: bytes.length, source: 'api-url' })
+    expect(await readFile(result.path!)).toEqual(Buffer.from(bytes))
+  })
+
+  it('falls back to NapCat get_file only when the OneBot file URL action is unsupported', async () => {
+    const stateDir = await tempDir(), remote = await fixture(new Uint8Array([1, 2, 3]))
+    const call = vi.fn(async (action: string) => {
+      if (action === 'get_group_file_url') throw new Error('OneBot RPC failed (retcode 1404)')
+      return { data: { url: remote.url, file_name: 'legacy.bin', file_size: 3 } }
+    })
+    const result = await fetchOneBotAttachment({ attachment: { type: 'file', file_id: 'legacy-id' }, messageId: '82',
+      chat: { messageType: 'group', id: '23456' }, authorized: true, stateDir, call, downloadOrigins: [remote.origin] })
+    expect(call.mock.calls.map(([action]) => action)).toEqual(['get_group_file_url', 'get_file'])
+    expect(result).toMatchObject({ status: 'downloaded', name: 'legacy.bin', source: 'api-url' })
+  })
+
+  it('does not hide file URL action permission failures behind the NapCat fallback', async () => {
+    const stateDir = await tempDir(), call = vi.fn(async () => { throw new Error('OneBot RPC failed (retcode 1401)') })
+    const result = await fetchOneBotAttachment({ attachment: { type: 'file', file_id: 'private-id' }, messageId: '83',
+      chat: { messageType: 'private', id: '12345' }, authorized: true, stateDir, call })
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({ status: 'failed', error: { message: 'OneBot RPC failed (retcode 1401)' } })
+  })
+
   it.each(['image', 'video', 'file'] as const)('downloads a %s through a hostname with Node dual-stack address selection', async type => {
     const stateDir = await tempDir()
     const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
@@ -75,7 +107,7 @@ describe('fetchOneBotAttachment', () => {
     const result = await fetchOneBotAttachment({ attachment, messageId: '55', authorized: true, stateDir, call, allowLocalFiles: true })
     expect(call).toHaveBeenNthCalledWith(1, 'get_msg', { message_id: '55' }, expect.any(AbortSignal))
     expect(call).toHaveBeenNthCalledWith(2, 'get_file', { file: 'recovered' }, expect.any(AbortSignal))
-    expect(result).toMatchObject({ status: 'downloaded', name: 'safe.bin', size: 4, source: 'napcat-cache' })
+    expect(result).toMatchObject({ status: 'downloaded', name: 'safe.bin', size: 4, source: 'local-cache' })
     expect(await readFile(result.path!, 'utf8')).toBe('safe')
     const untrusted = await fetchOneBotAttachment({ attachment: { type: 'file', file_id: 'x' }, messageId: '56', authorized: true, stateDir, call: async () => ({ file: source, filename: 'bad.txt' }), allowLocalFiles: true, napcatCacheRoot: cache })
     expect(untrusted).toMatchObject({ status: 'failed', error: { code: 'untrusted_path', retryable: false } })

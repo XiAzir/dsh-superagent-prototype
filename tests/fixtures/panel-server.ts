@@ -88,7 +88,7 @@ const qqFields: FieldSpec[] = [
   { key: 'connection', type: 'select', label: qqLabel('连接方式', 'Connection'), options: [
     { value: 'forward', label: qqLabel('正向 WebSocket', 'Forward WebSocket') },
     { value: 'reverse', label: qqLabel('反向 WebSocket', 'Reverse WebSocket') }] },
-  { key: 'url', type: 'text', label: qqLabel('NapCat WebSocket 地址', 'NapCat WebSocket URL') },
+  { key: 'url', type: 'text', label: qqLabel('OneBot WebSocket 地址', 'OneBot WebSocket URL') },
   { key: 'privateMessages', type: 'switch', label: qqLabel('接收已授权账号的私聊', 'Receive authorized private messages') },
   { key: 'groups', type: 'rows', label: qqLabel('接收的 QQ 群', 'Allowed groups'), columns: [
     { key: 'id', type: 'text', label: qqLabel('群号', 'Group ID') }, { key: 'name', type: 'text', optional: true, label: qqLabel('名称', 'Name') }] },
@@ -100,7 +100,7 @@ const qqFields: FieldSpec[] = [
   { key: 'replyChunkSize', type: 'number', label: qqLabel('每段回复字符数', 'Reply chunk characters'), min: 200, max: 4000 },
   { key: 'maxReplyChunks', type: 'number', label: qqLabel('每条回复最多分段数', 'Maximum reply chunks'), min: 1, max: 50 },
 ]
-const qqKind = { kind: 'qq', title: qqLabel('QQ · NapCat', 'QQ · NapCat'), description: qqLabel('NapCat OneBot v11', 'NapCat OneBot v11'),
+const qqKind = { kind: 'qq', title: qqLabel('QQ · OneBot v11', 'QQ · OneBot v11'), description: qqLabel('NapCat / SnowLuma OneBot v11', 'NapCat / SnowLuma OneBot v11'),
   schema: QqConfigSchema, health: ['qq'], fields: qqFields } as unknown as SourceKind
 const KINDS = [feishuKind, githubKind, qqKind] as unknown as SourceKind[]
 export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000, admissionContextMaxPages: 10,

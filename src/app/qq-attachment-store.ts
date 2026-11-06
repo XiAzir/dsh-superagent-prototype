@@ -49,6 +49,8 @@ export class QqAttachmentStore {
     let pending = this.inflight.get(id)
     if (!pending) {
       pending = fetchOneBotAttachment({ attachment: stored.input, messageId: String(trigger.meta.messageId), authorized: true,
+        chat: { messageType: trigger.meta.messageType === 'group' ? 'group' : 'private',
+          id: String(trigger.meta.messageType === 'group' ? trigger.meta.groupId : trigger.meta.userId) },
         stateDir: this.host.stateDir, call: (action, params, cancel) => this.host.call(action, params, cancel),
         allowLocalFiles: this.host.localPeer(), signal: this.host.signal() })
         .then(result => { this.host.store.set(attachmentKey(id), { ...stored, result }); return result })

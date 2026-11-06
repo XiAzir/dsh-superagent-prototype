@@ -18,20 +18,22 @@ export interface QQAttachmentFetchResult {
   name?: string
   size?: number
   mime?: string
-  source?: 'message-url' | 'api-url' | 'napcat-cache'
+  source?: 'message-url' | 'api-url' | 'local-cache'
   error?: { code: string; message: string; retryable: boolean }
 }
 
 export interface QQAttachmentFetchOptions {
   attachment: OneBotAttachment
   messageId: string
+  /** Original chat identity used by OneBot file URL actions. */
+  chat?: { messageType: 'private' | 'group'; id: string }
   /** Caller sets this only after the user has explicitly authorized fetching this attachment. */
   authorized: boolean
   /** Trusted application state directory; never taken from event data. */
   stateDir: string
-  /** NapCat OneBot API client. API credentials stay inside this injected function. */
+  /** OneBot API client. API credentials stay inside this injected function. */
   call: (action: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>
-  /** Absolute root containing files returned by NapCat's get_file API, if same-host paths are enabled. */
+  /** Absolute root containing files returned by a local OneBot peer, if same-host paths are enabled. */
   napcatCacheRoot?: string
   /** Set only when the caller verified the OneBot peer is loopback and the cache root is trusted. */
   allowLocalFiles?: boolean
@@ -170,6 +172,9 @@ async function invoke<T>(fn: () => Promise<T>, retries: number, signal: AbortSig
     } catch (error) {
       last = error
       if (error instanceof FetchFault && !error.retryable) throw error
+      // OneBot retcodes are completed RPC responses; repeating the same action
+      // cannot fix permission, parameter, or unsupported-action failures.
+      if (/retcode\s+\d+\b/i.test(error instanceof Error ? error.message : String(error))) break
       checkAbort(signal)
       if (attempt >= retries) break
       await new Promise(resolveDelay => setTimeout(resolveDelay, Math.min(150 * 2 ** attempt, 1200)))
@@ -177,7 +182,8 @@ async function invoke<T>(fn: () => Promise<T>, retries: number, signal: AbortSig
     }
   }
   if (last instanceof FetchFault) throw last
-  throw new FetchFault('api_error', last instanceof Error ? last.message : 'OneBot API 调用失败', true)
+  const message = last instanceof Error ? last.message : 'OneBot API 调用失败'
+  throw new FetchFault('api_error', message, !/retcode\s+\d+\b/i.test(message))
 }
 
 function publicLookup(trustedOrigin: boolean) {
@@ -233,24 +239,31 @@ async function download(urlInput: string, target: string, limit: number, maxRedi
   throw new FetchFault('redirect_limit', '附件下载重定向次数超限')
 }
 
-async function copyNapCatFile(source: string, cacheRoot: string | undefined, target: string, maxBytes: number, signal: AbortSignal): Promise<number> {
-  if (!isAbsolute(source)) throw new FetchFault('untrusted_path', 'NapCat 返回了不受信任的本机路径')
+async function copyPeerFile(source: string, cacheRoot: string | undefined, target: string, maxBytes: number, signal: AbortSignal): Promise<number> {
+  if (!isAbsolute(source)) throw new FetchFault('untrusted_path', 'OneBot 返回了不受信任的本机路径')
   let path: string
-  try { path = await realpath(source) } catch { throw new FetchFault('untrusted_path', 'NapCat 返回的缓存文件不可访问') }
+  try { path = await realpath(source) } catch { throw new FetchFault('untrusted_path', 'OneBot 返回的缓存文件不可访问') }
   if (cacheRoot) {
     let root: string
-    try { root = await realpath(cacheRoot) } catch { throw new FetchFault('untrusted_path', 'NapCat 缓存根目录不可访问') }
+    try { root = await realpath(cacheRoot) } catch { throw new FetchFault('untrusted_path', 'OneBot 缓存根目录不可访问') }
     const rel = relative(root, path)
-    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new FetchFault('untrusted_path', 'NapCat 文件路径超出可信缓存目录')
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new FetchFault('untrusted_path', 'OneBot 文件路径超出可信缓存目录')
   }
   const info = await stat(path)
-  if (!info.isFile()) throw new FetchFault('invalid_file', 'NapCat 返回的路径不是普通文件')
+  if (!info.isFile()) throw new FetchFault('invalid_file', 'OneBot 返回的路径不是普通文件')
   if (info.size > maxBytes) throw new FetchFault('too_large', `附件超过 ${maxBytes} 字节上限`)
   checkAbort(signal)
   try { await pipeline(createReadStream(path), createWriteStream(target, { flags: 'wx' }), { signal }) }
   catch (error) { await rm(target, { force: true }); throw error }
   checkAbort(signal)
   return info.size
+}
+
+function unsupportedAction(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  // Keep permission, authentication, and transport failures visible. Retcode 1404 is the
+  // OneBot-compatible not-found response used when an implementation omits an action.
+  return /retcode\s+1404\b|unsupported action|unknown action|action not found|not supported/i.test(message)
 }
 
 async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortSignal, limits: { maxBytes: number; retries: number; maxRedirects: number }): Promise<QQAttachmentFetchResult> {
@@ -285,7 +298,19 @@ async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortS
     let apiLocator = attachment.file_id ?? attachment.id ?? (attachment.type !== 'file' ? attachment.file : undefined)
     const action = attachment.type === 'image' ? 'get_image' : 'get_file'
     const readApiMeta = async (locator: string): Promise<void> => {
-      const response = await invoke(() => options.call(action, { file: locator }, signal), limits.retries, signal)
+      let response: unknown
+      if (attachment.type === 'file' && options.chat && attachment.file_id) {
+        const fileAction = options.chat.messageType === 'group' ? 'get_group_file_url' : 'get_private_file_url'
+        const params = options.chat.messageType === 'group'
+          ? { group_id: options.chat.id, file_id: locator }
+          : { file_id: locator }
+        try { response = await invoke(() => options.call(fileAction, params, signal), limits.retries, signal) }
+        catch (error) {
+          if (!unsupportedAction(error)) throw error
+          // Older NapCat builds expose file downloads through get_file instead.
+          response = await invoke(() => options.call('get_file', { file: locator }, signal), limits.retries, signal)
+        }
+      } else response = await invoke(() => options.call(action, { file: locator }, signal), limits.retries, signal)
       checkAbort(signal)
       apiMeta = apiData(response) ?? {}
       trustedApiMeta = true
@@ -299,6 +324,7 @@ async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortS
     if (apiLocator) {
       try { await readApiMeta(apiLocator) } catch (error) { lookupFault = error; apiMeta = undefined; trustedApiMeta = false }
     }
+    if (lookupFault instanceof FetchFault && !lookupFault.retryable) throw lookupFault
 
     const tryApiMeta = async (): Promise<QQAttachmentFetchResult | undefined> => {
       if (!apiMeta || !trustedApiMeta) return undefined
@@ -313,13 +339,13 @@ async function fetchAuthorized(options: QQAttachmentFetchOptions, signal: AbortS
       }
       const apiPath = [apiMeta.file, apiMeta.path].find(value => typeof value === 'string' && isAbsolute(value))
       if (typeof apiPath === 'string') {
-        if (!options.allowLocalFiles) throw new FetchFault('untrusted_path', '未启用 NapCat 本机缓存路径访问')
-        const size = await copyNapCatFile(apiPath, options.napcatCacheRoot, targetPath, limits.maxBytes, signal)
+        if (!options.allowLocalFiles) throw new FetchFault('untrusted_path', '未启用本机 OneBot 缓存路径访问')
+        const size = await copyPeerFile(apiPath, options.napcatCacheRoot, targetPath, limits.maxBytes, signal)
         checkAbort(signal)
         const info = await stat(targetPath)
         if (info.size !== size) throw new FetchFault('size_mismatch', '保存后的附件大小校验失败')
         verifySize(info.size, declaredSize(apiMeta.file_size, apiMeta.size, attachment.file_size, attachment.size), limits.maxBytes)
-        return { status: 'downloaded', path: targetPath, ...(name ? { name } : {}), size, mime: name ? mimeFromName(name) : undefined, source: 'napcat-cache' }
+        return { status: 'downloaded', path: targetPath, ...(name ? { name } : {}), size, mime: name ? mimeFromName(name) : undefined, source: 'local-cache' }
       }
       return undefined
     }

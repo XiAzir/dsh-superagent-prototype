@@ -7,20 +7,20 @@ import { server } from './fixtures/panel-server.ts'
 
 usePanel()
 
-it('shows live QQ status, mode-specific NapCat guidance, and saves or clears the token separately', async () => {
+it('shows live QQ status, mode-specific OneBot guidance, and saves or clears the token separately', async () => {
   at({ page: 'settings', query: { group: 'source', source: 'qq' } })
   await mount()
   const card = document.getElementById('dt-source-qq')!
   expect(card.textContent).toContain('QQ 连接状态')
   expect(card.textContent).toContain('已关闭')
   expect(card.textContent).toContain('ws://127.0.0.1:3001')
-  expect(card.textContent).toContain('在 NapCat 中启用 OneBot v11 WebSocket 服务端')
+  expect(card.textContent).toContain('在 NapCat 或 SnowLuma 中启用 OneBot v11 WebSocket 服务端')
   expect(card.querySelectorAll('form')).toHaveLength(0)
   expect(card.querySelectorAll('input[type="password"]')).toHaveLength(1)
 
   await click([...card.querySelectorAll('button')].find(button => button.textContent === '反向 WebSocket')!)
   expect(card.textContent).toContain('ws://127.0.0.1:6199/onebot/v11/ws')
-  expect(card.textContent).toContain('在 NapCat 中启用 OneBot v11 WebSocket 客户端')
+  expect(card.textContent).toContain('在 NapCat 或 SnowLuma 中启用 OneBot v11 WebSocket 客户端')
   expect(card.textContent).not.toContain('启用 OneBot v11 WebSocket 服务端')
 
   const token = field<HTMLInputElement>(zh['qq.tokenTitle'])
