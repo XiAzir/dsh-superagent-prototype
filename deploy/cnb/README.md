@@ -83,6 +83,8 @@ ssh -N -L 15099:127.0.0.1:5099 -L 16081:127.0.0.1:6081 <当前工作区SSH目标
 
 WebUI 为 `http://127.0.0.1:15099/`，桌面为 `http://127.0.0.1:16081/vnc.html`。VNC 密码保存在云端私有 `snowluma/data/config/vnc-password`；OneBot token 存入 SA 凭据服务。产物通过 base64 内容传输，保持 SA 私有目录权限。
 
+本次部署与验收进度见 [SnowLuma 部署记录](../../docs/cnb-snowluma-deployment-record.md)。
+
 跨环境单实例租约为180秒。心跳每30秒续租，持续失联90秒后启动限时停机，过期owner的上传会被拒绝。每5分钟生成快照；突发回收时的恢复点以最近一次成功上传为准。活跃文件与多个数据库采取逐项一致性快照，业务动作发往外部系统的结果仍依赖业务层幂等记录。可预期的关闭及人工暂停会在应用停止后再保存一次快照。
 
 CNB监督器还设置 `DSH_SUPERAGENT_HTTP_CLOSE=1`：当前CNB SSH转发在远端HTTP keep-alive闲置关闭后可能保留失效socket，本适配器令DSH每个HTTP socket只处理一个请求，响应显式带 `Connection: close`；WebSocket与SSE继续工作。普通本机启动默认沿用DSH原连接策略。适配器涉及固定版本DSH的内部server字段，升级DSH时需运行真实HTTP/WebSocket回归测试。
