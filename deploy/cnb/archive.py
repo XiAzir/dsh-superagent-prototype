@@ -79,6 +79,17 @@ def _is_runtime_log(relative: Path, name: str) -> bool:
     return relative.parts[:1] == (".artifacts",) and bool(_RUNTIME_LOG.fullmatch(name))
 
 
+def _is_chromium_shared_storage(root_name: str, relative: Path) -> bool:
+    # QQ's Chromium Shared Storage cache holds an exclusive SQLite lock for
+    # the process lifetime. Chromium recreates it; account/session databases
+    # elsewhere in the profile continue to use consistent SQLite snapshots.
+    parts = relative.parts
+    return (root_name == "snowluma" and len(parts) == 5
+            and parts[:3] == (".config", "QQ", "Partitions")
+            and parts[3].startswith("qqnt_")
+            and parts[4] in {"SharedStorage", "SharedStorage-wal", "SharedStorage-shm", "SharedStorage-journal"})
+
+
 def _is_generated_directory(root_name: str, relative: Path, name: str) -> bool:
     # QQ bridges preserve their complete login/runtime tree, including client
     # configuration, native session data, plugin state and caches.
@@ -401,7 +412,7 @@ def _walk_source(
                     _mkdir_private(root_stage / rel_path, parents=True, exist_ok=True)
                     visit(src_path, rel_path, expected_stat=file_stat, parent_fd=directory_fd, entry_name=name)
                 elif stat.S_ISREG(file_stat.st_mode):
-                    if _is_runtime_log(rel_path, name):
+                    if _is_runtime_log(rel_path, name) or _is_chromium_shared_storage(root_name, rel_path):
                         skip_counts["generated_file"] += 1
                         continue
                     # SQLite's adjacent WAL and SHM are represented by the consistent backup.

@@ -209,6 +209,34 @@ class SnapshotTests(unittest.TestCase):
                 self.assertIn(f"snowluma/{relative}", paths)
                 self.assertEqual((restored / "snowluma" / relative).read_text(encoding="utf-8"), value)
 
+    def test_snowluma_exclusive_chromium_cache_does_not_block_login_state_backup(self):
+        partition = self.data / 'snowluma' / '.config' / 'QQ' / 'Partitions' / 'qqnt_9210'
+        partition.mkdir(parents=True)
+        cache = partition / 'SharedStorage'
+        connection = sqlite3.connect(cache)
+        try:
+            connection.execute('PRAGMA locking_mode=EXCLUSIVE')
+            connection.execute('CREATE TABLE cache (value TEXT)')
+            connection.commit()
+            (partition / 'SharedStorage-journal').write_bytes(b'rebuildable')
+            login = partition / 'login-state.json'
+            login.write_text('{"session":"preserved"}', encoding='utf-8')
+            # The same filename outside this exact Chromium cache is retained.
+            business = self.data / 'snowluma' / 'data' / 'SharedStorage'
+            business.parent.mkdir()
+            business.write_bytes(b'business state')
+            snapshot = self.make_snapshot()
+        finally:
+            connection.close()
+        paths = {item['path'] for item in snapshot['files']}
+        self.assertNotIn('snowluma/.config/QQ/Partitions/qqnt_9210/SharedStorage', paths)
+        self.assertNotIn('snowluma/.config/QQ/Partitions/qqnt_9210/SharedStorage-journal', paths)
+        restored = self.base / 'restored-exclusive'
+        restore_snapshot(self.archive, restored)
+        self.assertEqual((restored / login.relative_to(self.data)).read_text(), '{"session":"preserved"}')
+        self.assertEqual((restored / business.relative_to(self.data)).read_bytes(), b'business state')
+        self.assertTrue(cache.exists())
+
     def test_snowluma_remains_optional_for_existing_snapshots(self):
         self.make_snapshot()
         restored = self.base / "restored-without-snowluma"
