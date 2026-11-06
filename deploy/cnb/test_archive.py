@@ -9,7 +9,9 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from unittest import mock
 
+from deploy.cnb import archive as archive_module
 from deploy.cnb.archive import SnapshotError, create_snapshot, restore_snapshot, validate_archive
 
 
@@ -253,6 +255,142 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((restored / login.relative_to(self.data)).read_text(), '{"session":"preserved"}')
         self.assertEqual((restored / business.relative_to(self.data)).read_bytes(), b'business state')
         self.assertTrue(cache.exists())
+
+    def test_snowluma_qq_exclusive_wal_database_falls_back_to_stable_clone(self):
+        db = self.data / "snowluma" / ".config" / "QQ" / "Partitions" / "qqnt_1152578024" / "WebStorage" / "QuotaManager"
+        db.parent.mkdir(parents=True)
+        connection = sqlite3.connect(db, timeout=0.1)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+            connection.execute("CREATE TABLE quota (value TEXT)")
+            connection.commit()
+            connection.execute("INSERT INTO quota VALUES ('committed-wal-value')")
+            connection.commit()
+            connection.execute("SELECT * FROM quota").fetchall()
+            wal = Path(str(db) + "-wal")
+            self.assertTrue(wal.exists())
+            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.1), mock.patch.object(
+                archive_module, "_sqlite_backup_from_clone", wraps=archive_module._sqlite_backup_from_clone,
+            ) as clone_backup:
+                self.make_snapshot()
+                clone_backup.assert_called_once()
+            restored = self.base / "restored-quota"
+            restore_snapshot(self.archive, restored)
+            copy = sqlite3.connect(restored / db.relative_to(self.data))
+            try:
+                self.assertEqual(copy.execute("SELECT value FROM quota").fetchone(), ("committed-wal-value",))
+            finally:
+                copy.close()
+        finally:
+            connection.close()
+        self.assertTrue(db.exists())
+
+    def test_snowluma_qq_locked_rollback_journal_clone_rolls_back_uncommitted_value(self):
+        db = self.data / "snowluma" / ".config" / "QQ" / "QuotaManager"
+        db.parent.mkdir(parents=True)
+        connection = sqlite3.connect(db, timeout=0.1)
+        connection.execute("CREATE TABLE quota (value TEXT)")
+        connection.execute("INSERT INTO quota VALUES ('committed')")
+        connection.commit()
+        connection.execute("BEGIN EXCLUSIVE")
+        connection.execute("UPDATE quota SET value='uncommitted'")
+        self.assertTrue(Path(str(db) + "-journal").exists())
+        try:
+            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.1), mock.patch.object(
+                archive_module, "_sqlite_backup_from_clone", wraps=archive_module._sqlite_backup_from_clone,
+            ) as clone_backup:
+                self.make_snapshot()
+                clone_backup.assert_called_once()
+            restored = self.base / "restored-rollback"
+            restore_snapshot(self.archive, restored)
+            copy = sqlite3.connect(restored / db.relative_to(self.data))
+            try:
+                self.assertEqual(copy.execute("SELECT value FROM quota").fetchone(), ("committed",))
+            finally:
+                copy.close()
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_only_snowluma_qq_locked_databases_use_clone_fallback(self):
+        db = self.data / "state" / "application.sqlite"
+        connection = sqlite3.connect(db, timeout=0.1)
+        try:
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+            connection.execute("CREATE TABLE app (value TEXT)")
+            connection.commit()
+            connection.execute("BEGIN EXCLUSIVE")
+            with mock.patch.object(archive_module, "SQLITE_BACKUP_TIMEOUT", 0.1):
+                with self.assertRaises(SnapshotError):
+                    self.make_snapshot()
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_sqlite_clone_rejects_sidecar_symlinks(self):
+        db = self.data / "snowluma" / ".config" / "QQ" / "QuotaManager"
+        db.parent.mkdir(parents=True)
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE quota (value TEXT)")
+        connection.commit()
+        connection.close()
+        external = self.base / "external-wal"
+        external.write_bytes(b"must not be read")
+        wal = Path(str(db) + "-wal")
+        try:
+            wal.symlink_to(external)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        with self.assertRaisesRegex(SnapshotError, "sidecar is not a regular file"):
+            archive_module._sqlite_backup_from_clone(
+                db, self.base / "clone-output.sqlite", 0, 1024 * 1024,
+                db.stat(), None, db.name,
+            )
+        self.assertEqual(external.read_bytes(), b"must not be read")
+
+    def test_sqlite_clone_clears_stale_wal_when_source_sidecar_disappears(self):
+        db = self.data / "snowluma" / ".config" / "QQ" / "QuotaManager"
+        db.parent.mkdir(parents=True)
+        connection = sqlite3.connect(db)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE quota (value TEXT)")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("INSERT INTO quota VALUES ('wal-only-value')")
+        connection.commit()
+        wal = Path(str(db) + "-wal")
+        main_bytes = db.read_bytes()
+        wal_bytes = wal.read_bytes()
+        connection.close()
+        # Recreate an independent source file group with committed data still only in WAL.
+        db.write_bytes(main_bytes)
+        wal.write_bytes(wal_bytes)
+        original_copy = archive_module._copy_regular_file
+        wal_copies = 0
+
+        def racing_copy(source, target, *args, **kwargs):
+            nonlocal wal_copies
+            result = original_copy(source, target, *args, **kwargs)
+            if source == wal:
+                wal_copies += 1
+                if wal_copies == 1:
+                    wal.unlink()
+            return result
+
+        output = self.base / "clone-output.sqlite"
+        with mock.patch.object(archive_module, "_copy_regular_file", side_effect=racing_copy):
+            archive_module._sqlite_backup_from_clone(
+                db, output, 0, 1024 * 1024, db.stat(), None, db.name,
+            )
+        self.assertEqual(wal_copies, 1)
+        copy = sqlite3.connect(output)
+        try:
+            self.assertIsNone(copy.execute("SELECT value FROM quota").fetchone())
+        finally:
+            copy.close()
 
     def test_snowluma_remains_optional_for_existing_snapshots(self):
         self.make_snapshot()

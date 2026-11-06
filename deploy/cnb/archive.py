@@ -50,6 +50,10 @@ class SnapshotError(ValueError):
     """Raised when a snapshot cannot be safely created, validated, or restored."""
 
 
+class _SQLiteBusy(SnapshotError):
+    """Online SQLite backup was blocked by a database lock."""
+
+
 @contextlib.contextmanager
 def _temporary_directory(parent: Path, prefix: str):
     path = _new_private_dir(parent, prefix)
@@ -128,7 +132,7 @@ def _hash_file(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _sqlite_backup(source: Path, target: Path, expanded_so_far: int, expanded_limit: int) -> None:
+def _sqlite_backup_online(source: Path, target: Path, expanded_so_far: int, expanded_limit: int) -> None:
     uri = source.as_uri() + "?mode=ro"
     started = time.monotonic()
     src: sqlite3.Connection | None = None
@@ -141,19 +145,155 @@ def _sqlite_backup(source: Path, target: Path, expanded_so_far: int, expanded_li
 
         def progress(_status: int, remaining: int, total: int) -> None:
             if time.monotonic() - started > SQLITE_BACKUP_TIMEOUT:
+                if _status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise _SQLiteBusy(f"SQLite backup remained busy for {SQLITE_BACKUP_TIMEOUT:g}s: {source}")
                 raise SnapshotError(f"SQLite backup exceeded {SQLITE_BACKUP_TIMEOUT:g}s: {source}")
             estimated = total * page_size
             if expanded_so_far + estimated > expanded_limit:
                 raise SnapshotError(f"Snapshot exceeds expanded byte limit ({expanded_limit})")
 
         src.backup(dst, pages=256, progress=progress, sleep=0.05)
-    except (sqlite3.Error, OSError) as exc:
+    except _SQLiteBusy:
+        raise
+    except sqlite3.Error as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        if code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise _SQLiteBusy(f"SQLite backup is locked for {source}: {exc}") from exc
+        raise SnapshotError(f"SQLite backup failed for {source}: {exc}") from exc
+    except OSError as exc:
         raise SnapshotError(f"SQLite backup failed for {source}: {exc}") from exc
     finally:
         if dst is not None:
             dst.close()
         if src is not None:
             src.close()
+
+
+def _is_snowluma_qq_storage(root_name: str, relative: Path) -> bool:
+    return root_name == "snowluma" and relative.parts[:2] == (".config", "QQ")
+
+
+def _sqlite_group_stat(source: Path, name: str, directory_fd: int | None) -> os.stat_result | None:
+    try:
+        result = _source_lstat(source.with_name(name), name, directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SnapshotError(f"Cannot inspect SQLite source group file {source.with_name(name)}: {exc}") from exc
+    if not stat.S_ISREG(result.st_mode):
+        raise SnapshotError(f"SQLite source sidecar is not a regular file: {source.with_name(name)}")
+    return result
+
+
+def _same_group_version(before: os.stat_result | None, after: os.stat_result | None) -> bool:
+    if before is None or after is None:
+        return before is None and after is None
+    return _same_source_version(before, after)
+
+
+def _sqlite_backup_from_clone(
+    source: Path,
+    target: Path,
+    expanded_so_far: int,
+    expanded_limit: int,
+    initial_stat: os.stat_result,
+    source_dir_fd: int | None,
+    source_name: str,
+) -> None:
+    """Clone the stable SQLite file group, let SQLite recover it, then emit one DB."""
+    sidecars = (source_name, source_name + "-wal", source_name + "-journal")
+    with _temporary_directory(target.parent, ".sqlite-clone-") as clone_dir:
+        clone_db = clone_dir / source_name
+        for attempt in range(_COPY_ATTEMPTS):
+            snapshots: dict[str, os.stat_result | None] = {}
+            for name in sidecars:
+                value = _sqlite_group_stat(source, name, source_dir_fd)
+                if value is not None and name == source_name and not _same_sqlite_identity(initial_stat, value):
+                    raise SnapshotError(f"SQLite source identity changed during snapshot: {source}")
+                snapshots[name] = value
+            if snapshots[source_name] is None:
+                raise SnapshotError(f"SQLite source disappeared during snapshot: {source}")
+            try:
+                for name in (*sidecars, source_name + "-shm"):
+                    (clone_dir / name).unlink(missing_ok=True)
+            except OSError as exc:
+                raise SnapshotError(f"Cannot reset SQLite clone files for {source}: {exc}") from exc
+            clone_budget = {"expanded": expanded_so_far, "members": 0}
+            changed = False
+            try:
+                for name in sidecars:
+                    before = snapshots[name]
+                    if before is None:
+                        continue
+                    target_file = clone_dir / name
+                    source_file = source if name == source_name else source.with_name(name)
+                    copied = _copy_regular_file(
+                        source_file, target_file, before, clone_budget, expanded_limit,
+                        source_dir_fd, name,
+                    )
+                    if isinstance(copied, str):
+                        raise SnapshotError(f"Cannot safely clone SQLite source file: {source_file}")
+            except SnapshotError:
+                changed_during_copy = False
+                for name in sidecars:
+                    after = _sqlite_group_stat(source, name, source_dir_fd)
+                    if not _same_group_version(snapshots[name], after):
+                        changed_during_copy = True
+                        break
+                if changed_during_copy and attempt + 1 < _COPY_ATTEMPTS:
+                    continue
+                raise
+            for name in sidecars:
+                after = _sqlite_group_stat(source, name, source_dir_fd)
+                if not _same_group_version(snapshots[name], after):
+                    changed = True
+                    break
+            if changed:
+                if attempt + 1 == _COPY_ATTEMPTS:
+                    raise SnapshotError(f"SQLite source group changed during snapshot: {source}")
+                continue
+            try:
+                recovered = sqlite3.connect(clone_db, timeout=SQLITE_BACKUP_TIMEOUT)
+                try:
+                    check = recovered.execute("PRAGMA quick_check").fetchone()
+                    if not check or check[0] != "ok":
+                        raise SnapshotError(f"SQLite clone integrity check failed for {source}: {check}")
+                finally:
+                    recovered.close()
+                clone_size = sum(path.stat().st_size for path in clone_dir.iterdir() if path.is_file())
+                if expanded_so_far + clone_size > expanded_limit:
+                    raise SnapshotError(f"Snapshot exceeds expanded byte limit ({expanded_limit})")
+                _sqlite_backup_online(clone_db, target, expanded_so_far, expanded_limit)
+                return
+            except _SQLiteBusy as exc:
+                raise SnapshotError(f"Recovered SQLite clone remained locked for {source}: {exc}") from exc
+            except (sqlite3.Error, OSError) as exc:
+                raise SnapshotError(f"Cannot recover SQLite clone for {source}: {exc}") from exc
+        raise SnapshotError(f"SQLite source group changed during snapshot: {source}")
+
+
+def _sqlite_backup(
+    source: Path,
+    target: Path,
+    expanded_so_far: int,
+    expanded_limit: int,
+    *,
+    root_name: str | None = None,
+    relative: Path | None = None,
+    initial_stat: os.stat_result | None = None,
+    source_dir_fd: int | None = None,
+    source_name: str | None = None,
+) -> None:
+    try:
+        _sqlite_backup_online(source, target, expanded_so_far, expanded_limit)
+    except _SQLiteBusy:
+        if not (root_name is not None and relative is not None and _is_snowluma_qq_storage(root_name, relative)):
+            raise
+        if initial_stat is None or source_name is None:
+            raise SnapshotError(f"Missing stable source identity for SQLite clone: {source}")
+        _sqlite_backup_from_clone(
+            source, target, expanded_so_far, expanded_limit, initial_stat, source_dir_fd, source_name,
+        )
 
 
 def _same_source_version(before: os.stat_result, after: os.stat_result) -> bool:
@@ -434,7 +574,11 @@ def _walk_source(
                                 raise SnapshotError(f"SQLite source changed during snapshot: {src_path}")
                             if directory_fd is not None and not _same_directory(os.fstat(directory_fd), directory.lstat()):
                                 raise SnapshotError(f"SQLite source directory changed during snapshot: {directory}")
-                            _sqlite_backup(src_path, dst_path, budget["expanded"], expanded_limit)
+                            _sqlite_backup(
+                                src_path, dst_path, budget["expanded"], expanded_limit,
+                                root_name=root_name, relative=rel_path, initial_stat=before_sqlite,
+                                source_dir_fd=directory_fd, source_name=name,
+                            )
                             after_sqlite = _source_lstat(src_path, name, directory_fd)
                             parent_stable = directory_fd is None or _same_directory(os.fstat(directory_fd), directory.lstat())
                             if parent_stable and _same_sqlite_identity(before_sqlite, after_sqlite):
