@@ -11,6 +11,10 @@ import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
+  /** Copy only registered source-report artifacts after a durable original-request transfer. */
+  'request-handoff': { handoffId: string }
+  /** Check whether a read-only routing disposition left an explicit human action unresolved. */
+  'request-review': { reviewId: string }
   /** Extract an optional long-term memory candidate from one accepted result revision. */
   'memory-experience': { requestId: string }
   /** Independently inspect one exact ready report. The key is the durable review ID. */

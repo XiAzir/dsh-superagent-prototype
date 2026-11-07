@@ -125,6 +125,7 @@ export interface PanelServer {
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
   requests: { path: string; method: string; body?: unknown }[]
+  requestViews: Record<string, ApiResponse<'GET tickets/:id/requests'>>
   /** Requests with undeclared query params or invalid body presence; asserted empty after each test. */
   misuse: string[]
   queued: Set<string>
@@ -155,6 +156,8 @@ export interface PanelServer {
   verificationRequestError?: string
   verificationConfigError?: string
   supervisionConfig: ApiResponse<'GET watchdog/config'>
+  routingReviewConfig: ApiResponse<'GET routing-review/config'>
+  routingReviews: ApiResponse<'GET routing-review/history'>
   supervisionReviews: ApiResponse<'GET watchdog/reviews'>
   supervisionError?: string
   qqObservations: ApiResponse<'GET qq/observations'>
@@ -306,9 +309,10 @@ function initial(): PanelServer {
     en: 'Feishu message' } }
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
-    health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
+    health: {}, down: false, pending: 0, opened: [], requests: [], requestViews: {}, misuse: [], queued: new Set(), dropped: [], failing: [],
     verificationConfig: { mode: 'observe', maxRepairs: 2 }, verificationViews: {}, verificationRequests: {},
     supervisionConfig: { mode: 'observe' }, supervisionReviews: [], qqObservations: { items: [], nextOffset: null },
+    routingReviewConfig: { mode: 'repair', maxRecoveries: 2, maxReviewsPerHour: 30 }, routingReviews: [],
     environments: { items: [] }, environmentRegistrations: [], environmentViews: {}, environmentProbeErrors: {}, feedbackRecords: [],
     evaluationSummary: { runId: 'runtime', events: 0, counts: { request: 0, route: 0, usage: 0, completion: 0, verification: 0,
       intervention: 0, adoption: 0, recovery: 0, side_effect: 0 }, metrics: { routerDecisions: 0, wrongRoutes: null, falseCompletions: null,
@@ -418,6 +422,11 @@ const operationResult = (command: ApiResponse<'GET tickets/:id/environment'>['co
 })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET tickets/:id/requests': { answer: ({ params, query }) => {
+    const view = server.requestViews[params.id] ?? { items: [], next_offset: null }
+    const start = Number(query.offset ?? 0), size = Math.max(1, Math.min(50, Number(query.limit ?? 20)))
+    return { items: view.items.slice(start, start + size), next_offset: view.items.length > start + size ? start + size : null }
+  } },
   'GET environments': { answer: () => server.environments },
   'POST environments': { body: true, answer: ({ body }) => {
     const input = z.object({ id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/), label: z.string().min(1).max(100),
@@ -505,6 +514,15 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     return { resumed: true }
   } },
   'GET watchdog/config': { answer: () => server.supervisionError ? refuse(503, server.supervisionError) : server.supervisionConfig },
+  'GET routing-review/config': { answer: () => server.routingReviewConfig },
+  'PUT routing-review/config': { body: true, answer: ({ body }) => {
+    server.routingReviewConfig = z.object({ mode: z.enum(['off', 'observe', 'repair']), maxRecoveries: z.number().int().min(0).max(3),
+      maxReviewsPerHour: z.number().int().min(1).max(200) }).strict().parse(body)
+    return server.routingReviewConfig
+  } },
+  'GET routing-review/history': { query: ['triggerId', 'limit'], answer: ({ query }) => server.routingReviews
+    .filter(review => !query.triggerId || review.triggerId === query.triggerId).slice(0, Number(query.limit ?? 30)) },
+  'POST triggers/:id/review': { body: true, answer: () => ({ reviewId: null }) },
   'POST watchdog/config': { body: true, answer: ({ body }) => {
     if (server.supervisionError) return refuse(503, server.supervisionError)
     server.supervisionConfig = z.object({ mode: z.enum(['observe', 'advise']) }).strict().parse(body)

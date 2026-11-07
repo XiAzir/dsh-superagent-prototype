@@ -270,7 +270,9 @@ export async function startRuntime(seed?: (store: Store) => void) {
   }
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
   async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
+    const target = item.kind === 'attach' && typeof item.ticket_id === 'string' ? runtime.store.tickets.get(item.ticket_id) : undefined
+    const supplied = target ? { reason: 'The original request continues this target task.', evidence_refs: [`trigger/${target.origin.triggerId}`], ...item } : item
+    const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [supplied] }) as { results: Record<string, unknown>[] }
     if (results[0]!.refused) throw new Error(String(results[0]!.refused))
     return results[0]!
   }

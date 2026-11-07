@@ -111,7 +111,7 @@ it('answers every routing tool in one shape: the decision it recorded, why, and 
   const route = async (item: Record<string, unknown>) => ((await run('orchestrator_route', { decisions: [item] })).results as unknown[])[0]
   const other = feishu('3', '@bot 顺便看看这个')
   h.runtime.receive(other); await h.runtime.idle()
-  expect(await route({ kind: 'attach', ticket_id: ticket.id, trigger_id: other.id })).toEqual({ trigger_id: other.id, kind: 'attach',
+  expect(await route({ kind: 'attach', ticket_id: ticket.id, trigger_id: other.id, reason: 'Same original task.', evidence_refs: [`trigger/${ticket.origin.triggerId}`] })).toEqual({ trigger_id: other.id, kind: 'attach',
     reason: expect.any(String), ticket: card })
   const status = await run('orchestrator_ticket_request_status', { ticket_id: ticket.id })
   expect(status).toEqual({ reason: 'The worker is not waiting; nothing was sent', ticket: card })
@@ -131,6 +131,62 @@ it('answers every routing tool in one shape: the decision it recorded, why, and 
   expect(stopped).toEqual({ trigger_id: request.id, kind: 'stop', decision: 'stop', reason: 'Not needed after all',
     ticket: expect.objectContaining({ ticket_id: ticket.id, state: 'stopped', ended }) })
   expect(TICKET_STATES).toContain(stopped.ticket.state)
+})
+
+it('requires real target-source evidence for a new thread and confirms its subscription only through the worker claim', async () => {
+  const work = await h.acceptedTicket(feishu('71', '@bot 修复首页导出按钮'))
+  const update = feishu('72', '@bot 这个导出按钮采用已有图标')
+  h.runtime.receive(update); await h.runtime.idle()
+  const route = async (extra: Record<string, unknown> = {}) => ((await h.runTool(h.runtime.masterId, 'orchestrator_route', {
+    decisions: [{ kind: 'attach', trigger_id: update.id, ticket_id: work.ticket.id, ...extra }],
+  })).results as Record<string, unknown>[])[0]!
+  expect(await route()).toMatchObject({ refused: expect.stringContaining('needs reason and evidence_refs') })
+  expect(await route({ reason: 'It names the export button.', evidence_refs: ['trigger/invented'] }))
+    .toMatchObject({ refused: expect.stringContaining('Routing evidence is unavailable') })
+  expect(await route({ reason: 'It names the export button.', evidence_refs: [`ticket/${work.ticket.id}`, `trigger/${update.id}`] }))
+    .toMatchObject({ refused: expect.stringContaining('target source/input trigger reference') })
+  expect(await route({ reason: 'Both originals name the homepage export button.', evidence_refs: [`trigger/${work.trigger.id}`] }))
+    .toMatchObject({ ticket: { ticket_id: work.ticket.id, requests: { proposed: 1 } } })
+  const thread = `feishu:${CHAT}:om_72`
+  expect(h.runtime.store.threads.get(thread)?.subscriptions).not.toContain(work.ticket.id)
+  const record = h.runtime.engine.requestResponsibility(update.id)!
+  expect(record.state).toBe('proposed')
+  const details = await h.runTool(work.sessionId, 'orchestrator_read', { resource: `trigger/${update.id}/request` })
+  expect(JSON.parse(String(details.text))).toMatchObject({ request: { id: update.id, state: 'proposed' }, source: { triggerId: update.id } })
+  const claim = { trigger_id: update.id, expected_revision: record.revision, reason: 'The original and current assignment name this export button.' }
+  expect(await h.runTool(work.sessionId, 'orchestrator_request_claim', claim)).toMatchObject({ request: { state: 'active' } })
+  expect(await h.runTool(work.sessionId, 'orchestrator_request_claim', claim)).toMatchObject({ request: { state: 'active' } })
+  expect(h.runtime.store.threads.get(thread)?.subscriptions).toContain(work.ticket.id)
+  expect(await h.api('GET', `tickets/${work.ticket.id}/requests`)).toMatchObject({ status: 200,
+    body: { items: expect.arrayContaining([expect.objectContaining({ request: { ...h.runtime.engine.requestResponsibility(update.id)! }, source: expect.objectContaining({ triggerId: update.id }) })]) } })
+  const unrelated = await h.acceptedTicket(feishu('73', '@bot 处理另一份独立报表'))
+  await expect(h.runTool(work.sessionId, 'orchestrator_read', { resource: `trigger/${unrelated.trigger.id}/request` })).rejects.toThrow()
+})
+
+it('lets the router correct an initial accept with a stable transfer, preserving request identity, reusable findings and exact retry semantics', async () => {
+  const original = await h.acceptedTicket(feishu('81', '@bot 核对导出按钮的可访问名称'))
+  const owner = await h.acceptedTicket(feishu('82', '@bot 完成首页导出按钮的可访问性修复'))
+  await h.runTool(original.sessionId, 'orchestrator_report', { state: 'progress', summary: '已确认名称来自 exportLabel，尚待修改及验证。' })
+  const revision = h.runtime.engine.requestResponsibility(original.trigger.id)!.revision
+  const body = { from_ticket_id: original.ticket.id, trigger_id: original.trigger.id, to_ticket_id: owner.ticket.id,
+    expected_revision: revision, request_id: 'same-export-responsibility', reason: 'The target owns this export button; reuse the exportLabel finding and validate the accessible name.',
+    evidence_refs: [`trigger/${owner.trigger.id}`] }
+  const first = await h.runTool(h.runtime.masterId, 'orchestrator_request_transfer', body)
+  const request = h.runtime.engine.requestResponsibility(original.trigger.id)!
+  expect(first).toMatchObject({ request: { id: original.trigger.id,
+    owners: expect.arrayContaining([{ ...request.owners.find(item => item.ticketId === owner.ticket.id)!, state: 'proposed' }]) } })
+  expect(h.runtime.store.tickets.get(original.ticket.id)).toMatchObject({ requestRedirect: { toTicketId: owner.ticket.id }, ended: { outcome: 'dropped' } })
+  expect(h.runtime.store.tickets.get(original.ticket.id)?.acceptance?.criteria).toEqual([])
+  const forwarded = h.runtime.store.tickets.get(owner.ticket.id)!.inputs.find(input => input.kind === 'trigger' && input.triggerId === original.trigger.id)!
+  expect(forwarded).toMatchObject({ provisional: true, note: expect.stringContaining('exportLabel') })
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_request_transfer', body)).toEqual(first)
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_request_transfer', { ...body, reason: 'A different transfer body.' }))
+    .rejects.toThrow('reused with different details')
+  const page = await read(`ticket/${owner.ticket.id}/requests`) as { items: { request: { id: string } }[] }
+  expect(page.items.some(item => item.request.id === original.trigger.id)).toBe(true)
+  await h.runTool(owner.sessionId, 'orchestrator_request_claim', { trigger_id: original.trigger.id,
+    expected_revision: request.revision, reason: 'The original request matches this export button task.' })
+  expect(h.runtime.engine.requestResponsibility(original.trigger.id)?.state).toBe('active')
 })
 
 it('rejects an old report after artifact staging when delivery failure retries into a pending assignment', async () => {
@@ -184,7 +240,7 @@ it('routes several triggers in one call, in order, and answers a refused or fail
     { kind: 'stop', trigger_id: request.id },
     { kind: 'accept', trigger_id: request.id, title: 'Other', worktree_name: 'fix-other', acknowledgement: '收到。' },
     { kind: 'attach', trigger_id: other.id, ticket_id: 'no-such-ticket' },
-    { kind: 'attach', trigger_id: more.id, ticket_id: ticket.id },
+    { kind: 'attach', trigger_id: more.id, ticket_id: ticket.id, reason: 'Same original task.', evidence_refs: [`trigger/${ticket.origin.triggerId}`] },
   ] }) as { results: Record<string, unknown>[] }
   expect(results).toEqual([
     { trigger_id: thanks.id, kind: 'ignore', decision: 'ignore', reason: 'Thanks only.' },

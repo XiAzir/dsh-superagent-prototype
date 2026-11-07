@@ -11,6 +11,7 @@ import type { ArtifactRegistry } from './artifacts.ts'
 const CONFIG = record<VerificationConfig>('verification-config')
 const PREFIX = 'verification-review:'
 const reviewKey = (id: string) => record<VerificationRecord>(`${PREFIX}${id}`)
+const releasedRequests = (ticket: Ticket) => new Set(ticket.requests?.filter(item => item.state === 'released').map(item => item.triggerId) ?? [])
 interface ActiveReview { id: string; reportKey: string; generation: number }
 const activeKey = (ticketId: string) => record<ActiveReview>(`verification-active:${ticketId}`)
 const Criterion = z.object({ id: z.string().trim().min(1).max(100), description: z.string().trim().min(1).max(2000),
@@ -69,9 +70,14 @@ export class VerificationService {
     const { mode } = this.config()
     if (mode === 'off' || ticket.acceptance) return ticket
     const source = this.host.store.triggers.get(ticket.origin.triggerId)
-    return { ...ticket, acceptance: { revision: 1, mode, createdAt: this.now(), criteria: [{ id: 'original-request',
-      description: (source?.text || ticket.mandate.scope || ticket.title).slice(0, 2000), kind: 'content',
-      sourceRefs: [`trigger/${ticket.origin.triggerId}`] }] } }
+    const sources = [...new Set([ticket.origin.triggerId, ...ticket.origin.triggerIds])]
+      .flatMap(id => { const trigger = this.host.store.triggers.get(id); return trigger?.human ? [trigger] : [] })
+    const criteria: AcceptanceCriterion[] = sources.length ? sources.map(trigger => ({
+      id: trigger.id === ticket.origin.triggerId ? 'original-request' : `original-${key(trigger.id)}`,
+      description: trigger.text.slice(0, 2000), kind: 'content', sourceRefs: [`trigger/${trigger.id}`],
+    })) : [{ id: 'original-request', description: (source?.text || ticket.mandate.scope || ticket.title).slice(0, 2000),
+      kind: 'content', sourceRefs: [`trigger/${ticket.origin.triggerId}`] }]
+    return { ...ticket, acceptance: { revision: 1, mode, createdAt: this.now(), criteria } }
   }
   /** Criteria must cite human input actually delivered to this ticket. */
   setCriteria(ticketId: string, expectedRevision: number, input: unknown): Ticket {
@@ -82,7 +88,7 @@ export class VerificationService {
       if (!ticket || !liveTicket(ticket)) throw new Error('Acceptance criteria require a live ticket')
       if ((ticket.acceptance?.revision ?? 0) !== expectedRevision) throw new Error('Acceptance revision conflict')
       const humanIds = [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(item => item.kind === 'trigger' && item.human ? [item.triggerId] : [])]
-        .filter(id => this.host.store.triggers.get(id)?.human)
+        .filter(id => !releasedRequests(ticket).has(id) && this.host.store.triggers.get(id)?.human)
       const refs = new Set(humanIds.map(id => `trigger/${id}`))
       for (const criterion of criteria) if (criterion.sourceRefs.some(ref => !refs.has(ref))) throw new Error('Criterion source must be an original human request on this ticket')
       const previous = ticket.acceptance
@@ -174,7 +180,9 @@ export class VerificationService {
     const evidence: VerificationEvidence[] = []
     let result: z.infer<typeof Result>, model: { usage?: unknown; model?: unknown } = {}
     try {
+      const released = releasedRequests(ticket)
       const ids = [...new Set([ticket.origin.triggerId, ...[...ticket.origin.triggerIds, ...ticket.inputs.flatMap(item => item.kind === 'trigger' && item.human ? [item.triggerId] : [])].slice(-19)])]
+        .filter(id => !released.has(id))
       for (const triggerId of ids) {
         const trigger = this.host.store.triggers.get(triggerId)
         if (trigger) evidence.push({ ref: `trigger/${triggerId}`, kind: 'source', text: trigger.text.slice(0, 16_000),
@@ -187,7 +195,9 @@ export class VerificationService {
         remaining = Math.max(0, remaining - item.text.length)
       }
       const problems = evidence.filter(item => item.problem)
-      if (problems.length) result = { state: 'needs_changes', summary: problems.map(item => item.problem).join('; ').slice(0, 2000),
+      if (ticket.acceptance.criteria.length > 30 || ticket.acceptance.criteria.some(criterion => criterion.sourceRefs.some(ref => !evidence.some(item => item.ref === ref)))) {
+        result = { state: 'unknown', summary: 'Current requests exceed complete source coverage; inspect the remaining original requests before accepting.', checks: [] }
+      } else if (problems.length) result = { state: 'needs_changes', summary: problems.map(item => item.problem).join('; ').slice(0, 2000),
         checks: ticket.acceptance.criteria.map(item => ({ criterionId: item.id, state: 'needs_changes',
           summary: 'Deliverable evidence failed validation.', evidenceRefs: problems.map(problem => problem.ref) })) }
       else {

@@ -1,6 +1,7 @@
 /** Real Runtime/SQLite/HTTP integration for the autonomy control plane and a local environment daemon. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { startRuntime, feishu, type Host } from './fixtures/host.ts'
 import { startEnvironmentDaemon, type RunningEnvironmentDaemon } from '../src/remote/daemon.ts'
 import { commandPayload, payloadHash } from '../src/remote/protocol.ts'
@@ -36,6 +37,106 @@ async function completed(ticketId: string, commandId: string) {
   }, { timeout: 12_000, interval: 40 })
   return result
 }
+
+it('recovers legacy request ownership and preserves original remote effects and cancellation across a Runtime transfer', async () => {
+  const daemon = await registerDevice(2)
+  const target = await h.acceptedTicket(feishu('601', '@bot 维护汇总工单'))
+  const source = await h.acceptedTicket(feishu('602', '@bot 补充该汇总，沿用一次记账结果'))
+  // Upgrade an actual live task with the schema-13 JSON shape, before the first request-scoped operation.
+  const legacy = h.runtime.store.tickets.get(source.ticket.id)!
+  delete legacy.requests; h.runtime.store.tickets.save(legacy)
+  const disposition = h.runtime.store.triggers.disposition(source.trigger.id)!
+  delete disposition.request; h.runtime.store.triggers.saveDisposition(source.trigger.id, disposition)
+  expect((await h.api('PUT', `tickets/${source.ticket.id}/environment`, { deviceId: 'laptop' })).status).toBe(200)
+  await h.runtime.idle()
+  const command = encodedCommand('require("node:fs").appendFileSync("once.txt","once\\n");')
+  const first = await h.runTool(source.sessionId, 'orchestrator_environment_start', { request_id: 'transfer-once', command })
+  const done = await completed(source.ticket.id, String(first.commandId))
+  expect(done.state).toBe('completed')
+  const long = await h.runTool(source.sessionId, 'orchestrator_environment_start', { request_id: 'transfer-running', timeout_ms: 30_000,
+    command: encodedCommand('console.log("transfer-ready"); setInterval(() => {},1000);') })
+  await vi.waitFor(async () => expect(await daemonRequest(daemon, `/v1/commands/${long.commandId}?ticketId=${source.ticket.id}`))
+    .toMatchObject({ status: 200, body: { state: 'running', stdout: expect.stringContaining('transfer-ready') } }), { timeout: 12_000 })
+  await h.runTool(source.sessionId, 'orchestrator_request_transfer', { trigger_id: source.trigger.id, to_ticket_id: target.ticket.id,
+    expected_revision: h.runtime.engine.requestResponsibility(source.trigger.id)!.revision, request_id: 'runtime-transfer', reason: 'Continue the same original action in its existing summary task.' })
+  await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(source.ticket.id)?.requestRedirect?.toTicketId).toBe(target.ticket.id)
+  expect(h.runtime.store.get<RemoteIntent>(`remote-command:${long.commandId}`)?.cancelRequested).toBeUndefined()
+  await h.runTool(target.sessionId, 'orchestrator_request_claim', { trigger_id: source.trigger.id,
+    expected_revision: h.runtime.engine.requestResponsibility(source.trigger.id)!.revision, reason: 'The original action belongs to this summary.' })
+  expect((await h.api('PUT', `tickets/${target.ticket.id}/environment`, { deviceId: 'laptop' })).status).toBe(200)
+  await h.runtime.idle()
+  const retry = await h.runTool(target.sessionId, 'orchestrator_environment_start', { request_id: 'transfer-once', source_request_id: source.trigger.id, command })
+  expect(retry).toMatchObject({ commandId: first.commandId, ticketId: source.ticket.id, state: 'completed' })
+  expect(readFileSync(join(done.directory!, 'once.txt'), 'utf8')).toBe('once\n')
+  expect(h.runtime.remote.commands(target.ticket.id).map(item => item.commandId)).toEqual(expect.arrayContaining([first.commandId, long.commandId]))
+  expect((await h.api('POST', `tickets/${target.ticket.id}/stop`)).status).toBe(200)
+  await vi.waitFor(() => expect(h.runtime.store.get<RemoteIntent>(`remote-command:${long.commandId}`)).toMatchObject({ state: 'cancelled', cancelRequested: true }), { timeout: 12_000 })
+  expect(await daemonRequest(daemon, `/v1/commands/${long.commandId}?ticketId=${source.ticket.id}`)).toMatchObject({ status: 200, body: { state: 'cancelled' } })
+  expect(h.runtime.remote.commandResult(target.ticket.id, String(long.commandId))).toBeUndefined()
+  expect((await h.api('GET', `tickets/${target.ticket.id}/environment`)).body).toMatchObject({ commands: expect.arrayContaining([
+    expect.objectContaining({ commandId: long.commandId, state: 'cancelled', remote: expect.objectContaining({ stdout: expect.stringContaining('transfer-ready') }) }),
+  ]) })
+}, 30_000)
+
+it('holds the receiving Runtime task for inherited unknown effects until the owner records an observed outcome', async () => {
+  const daemon = await registerDevice()
+  const target = await h.acceptedTicket(feishu('605', '@bot 继续现有汇总'))
+  const source = await h.acceptedTicket(feishu('606', '@bot 补充同一汇总'))
+  await h.runTool(source.sessionId, 'orchestrator_request_transfer', { trigger_id: source.trigger.id, to_ticket_id: target.ticket.id,
+    expected_revision: h.runtime.engine.requestResponsibility(source.trigger.id)!.revision, request_id: 'unknown-transfer', reason: 'Same summary request.' })
+  await h.runTool(target.sessionId, 'orchestrator_request_claim', { trigger_id: source.trigger.id,
+    expected_revision: h.runtime.engine.requestResponsibility(source.trigger.id)!.revision, reason: 'This original request belongs here.' })
+  expect((await h.api('PUT', `tickets/${target.ticket.id}/environment`, { deviceId: 'laptop' })).status).toBe(200)
+  await h.runtime.idle()
+  const payload = commandPayload({ ticketId: source.ticket.id, command: encodedCommand('throw new Error("must not replay")') })
+  const intent: RemoteIntent = { commandId: 'inherited-unknown', deviceId: 'laptop', ticketId: source.ticket.id, requestTriggerId: source.trigger.id,
+    requestId: 'lost-ack', payload, payloadHash: payloadHash(payload), state: 'unknown', sent: true,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  h.runtime.store.set(`remote-command:${intent.commandId}`, intent)
+  await h.runtime.pump(); await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(target.ticket.id)?.hold?.kind).toBe('environment')
+  expect(h.runtime.remote.hasUnsettled(target.ticket.id)).toBe(true)
+  expect((await h.api('POST', `tickets/${target.ticket.id}/resume`)).status).toBe(400)
+  await expect(h.runtime.remote.start('laptop', target.ticket.id, { requestId: 'fresh-write', requestTriggerId: source.trigger.id,
+    command: encodedCommand('console.log("must not execute")') })).rejects.toThrow('unknown operation')
+  await expect(h.runtime.remote.writeFile(target.ticket.id, 'laptop', 'new.txt', Buffer.from('held'))).rejects.toThrow('unknown operation')
+  expect((await daemonRequest(daemon, `/v1/commands/${intent.commandId}?ticketId=${source.ticket.id}`)).status).toBe(404)
+  h.runtime.remote.resolveUnknown(target.ticket.id, intent.commandId, { outcome: 'completed', evidence: 'Owner inspected the destination and confirmed its earlier effect.' })
+  expect((await h.api('POST', `tickets/${target.ticket.id}/resume`)).status).toBe(200)
+  expect(h.runtime.store.get<RemoteIntent>(`remote-command:${intent.commandId}`)?.payload).toEqual(payload)
+  expect((await h.api('POST', `tickets/${target.ticket.id}/stop`)).status).toBe(200)
+  expect(h.runtime.remote.commandResult(target.ticket.id, intent.commandId)).toBeUndefined()
+  expect((await h.api('POST', `tickets/${target.ticket.id}/environment/commands/${intent.commandId}/resolve`,
+    { outcome: 'failed', evidence: 'Owner rechecked the destination after stopping this task and corrected the earlier conclusion.' })).status).toBe(200)
+  expect((await h.api('GET', `tickets/${target.ticket.id}/environment`)).body).toMatchObject({ commands: expect.arrayContaining([
+    expect.objectContaining({ commandId: intent.commandId, effectiveState: 'failed', ticketId: source.ticket.id }),
+  ]) })
+})
+
+it('cancels remaining legacy work when another request has already been released from that task', async () => {
+  const daemon = await registerDevice()
+  const work = await h.acceptedTicket(feishu('607', '@bot 保留旧任务的运行命令'))
+  const target = await h.acceptedTicket(feishu('608', '@bot 接收独立补充要求'))
+  const legacy = h.runtime.store.tickets.get(work.ticket.id)!
+  delete legacy.requests; h.runtime.store.tickets.save(legacy)
+  const disposition = h.runtime.store.triggers.disposition(work.trigger.id)!
+  delete disposition.request; h.runtime.store.triggers.saveDisposition(work.trigger.id, disposition)
+  const addition = { ...feishu('609', '@bot 这条补充实际归另一任务'), routing: 'router' as const }
+  h.runtime.engine.direct(work.ticket.id, addition)
+  h.runtime.engine.transferRequest(work.ticket.id, addition.id, target.ticket.id, 'Move only this distinct supplement.', 'legacy-partial-transfer',
+    h.runtime.store.tickets.get(work.ticket.id)!.assignments.at(-1)!.id, h.runtime.engine.requestResponsibility(addition.id)!.revision)
+  expect(h.runtime.store.tickets.get(work.ticket.id)?.ended).toBeUndefined()
+  expect(h.runtime.store.tickets.get(work.ticket.id)?.requests?.map(item => item.state)).toEqual(['released'])
+  expect((await h.api('PUT', `tickets/${work.ticket.id}/environment`, { deviceId: 'laptop' })).status).toBe(200)
+  await h.runtime.idle()
+  const command = await h.runTool(work.sessionId, 'orchestrator_environment_start', { request_id: 'legacy-remaining',
+    command: encodedCommand('console.log("legacy-remaining-ready"); setInterval(() => {},1000);'), timeout_ms: 30_000 })
+  await vi.waitFor(async () => expect(await daemonRequest(daemon, `/v1/commands/${command.commandId}?ticketId=${work.ticket.id}`))
+    .toMatchObject({ status: 200, body: { state: 'running', stdout: expect.stringContaining('legacy-remaining-ready') } }), { timeout: 12_000 })
+  expect((await h.api('POST', `tickets/${work.ticket.id}/stop`)).status).toBe(200)
+  await vi.waitFor(() => expect(h.runtime.store.get<RemoteIntent>(`remote-command:${command.commandId}`)).toMatchObject({ state: 'cancelled', cancelRequested: true }), { timeout: 12_000 })
+}, 30_000)
 
 it('exposes the new HTTP endpoints, captures verification policy only on future tickets and keeps baseline semantic status explicit', async () => {
   const first = await h.acceptedTicket(feishu('101', '@bot 修复第一个问题'))
@@ -171,7 +272,7 @@ it.each(['human-stop', 'pr-merged'] as const)('cancels running and capacity-queu
   // Read saved host state only: an explicit status/cancel request here would hide missing ticket.ended wiring.
   await vi.waitFor(() => {
     for (const id of [runningId, queued.commandId]) {
-      expect(h.runtime.remote.commandResult(work.ticket.id, id)).toMatchObject({ state: 'cancelled', cancelRequested: true })
+      expect(h.runtime.store.get<RemoteIntent>(`remote-command:${id}`)).toMatchObject({ state: 'cancelled', cancelRequested: true })
     }
   }, { timeout: 12_000, interval: 40 })
   expect(await daemonRequest(daemon, `/v1/commands/${runningId}?ticketId=${work.ticket.id}`)).toMatchObject({ status: 200,

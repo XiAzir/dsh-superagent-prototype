@@ -188,7 +188,7 @@ describe('QQ source with a real OneBot WebSocket and Runtime', () => {
       purpose: 'answer', trigger_id: question.id, ticket_id: 'N/A', text: '你好！',
     })
     await waitFor(() => confirmed.some(item => item.text === '你好！'))
-    expect(store.replyStatus(String(reply.receipt_id))).toBe('sent')
+    await waitFor(() => store.replyStatus(String(reply.receipt_id)) === 'sent')
     expect(store.receipts.get(String(reply.receipt_id))).not.toHaveProperty('ticketId')
     expect(store.tickets.list()).toEqual([])
   })

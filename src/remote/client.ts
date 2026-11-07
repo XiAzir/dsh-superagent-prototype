@@ -13,6 +13,8 @@ export interface RemoteDeviceConfig { id: string; label: string; url: string; cr
 interface Device extends RemoteDeviceConfig { status: 'unprobed' | 'online' | 'offline' | 'identity_changed'; daemonId?: string; lastSeenAt?: string; error?: string; health?: EnvironmentHealth }
 export interface RemoteIntent {
   commandId: string; deviceId: string; ticketId: string; requestId: string; payload: CommandPayload; payloadHash: string
+  /** Original human request identity survives a transfer; ticketId and daemon payload keep their first execution owner. */
+  requestTriggerId?: string
   state: 'queued' | 'waiting_environment' | CommandState; createdAt: string; updatedAt: string
   sent?: boolean; daemonId?: string; cancelRequested?: boolean; remote?: RemoteCommand; error?: string
   ownerResolution?: { outcome: 'completed' | 'failed' | 'cancelled'; evidence: string; at: string }
@@ -27,10 +29,15 @@ export interface RemoteEnvironmentsHost {
   onState?(transition: RemoteTransition): void
   /** Rechecked before new executable work; permits held-but-authorized reconnects and refuses withdrawn mandates. */
   mayExecute?(ticketId: string): boolean
+  /** Resolve an executable claimed original request; an ambiguous/missing scope refuses new operations. */
+  requestScope?(ticketId: string, requestedTriggerId?: string): string | undefined
+  /** Current source authority may permit a proposed/claimed successor to inspect preserved command history. */
+  mayAccessRequestCommand?(ticketId: string, requestTriggerId: string, originalTicketId: string): boolean
   now?(): number
 }
 export interface RemoteOperationResult {
   deviceId: string; ticketId: string; commandId: string; state: RemoteIntent['state']; remote?: RemoteCommand; error?: string
+  requestTriggerId?: string
   directory?: string; cancelRequested?: boolean
   updatedAt?: string; ownerResolution?: RemoteIntent['ownerResolution']
 }
@@ -52,6 +59,30 @@ export class RemoteEnvironments {
   private now() { return this.host.now?.() ?? Date.now() }
   private at() { return new Date(this.now()).toISOString() }
   private records(): RemoteIntent[] { return this.host.store.keys(INTENT).map(key => this.host.store.get<RemoteIntent>(key)).filter((item): item is RemoteIntent => !!item) }
+  private mayAccess(ticketId: string, intent: RemoteIntent): boolean {
+    if (!intent.requestTriggerId) return intent.ticketId === ticketId
+    try {
+      if (this.host.mayAccessRequestCommand) return this.host.mayAccessRequestCommand(ticketId, intent.requestTriggerId, intent.ticketId)
+      if (this.host.requestScope) return this.host.requestScope(ticketId, intent.requestTriggerId) === intent.requestTriggerId
+      return intent.ticketId === ticketId
+    } catch { return false }
+  }
+  private requestScope(ticketId: string, requestedTriggerId?: string): string | undefined {
+    if (!this.host.requestScope) {
+      if (requestedTriggerId !== undefined) throw new EnvironmentError('request_scope', 'Original-request command scope requires the host responsibility resolver', 403)
+      return
+    }
+    if (requestedTriggerId !== undefined) validId(requestedTriggerId, 'source_request_id')
+    const scope = this.host.requestScope(ticketId, requestedTriggerId)
+    if (!scope || requestedTriggerId !== undefined && scope !== requestedTriggerId)
+      throw new EnvironmentError('request_held', 'Choose a claimed original source_request_id for this operation; claim proposed work before execution', 403)
+    return validId(scope, 'source_request_id')
+  }
+  private assertCommandAccess(ticketId: string, intent: RemoteIntent | undefined): asserts intent is RemoteIntent {
+    if (!intent || !this.mayAccess(ticketId, intent)) throw new EnvironmentError('command_missing', 'Command was not found for this task or its current original-request ownership', 404)
+    // An authorized successor may inspect an operation on its original device after selecting another environment.
+    this.assertBinding(ticketId, intent.requestTriggerId ? undefined : intent.deviceId)
+  }
   private device(id: string): Device {
     const device = this.host.store.get(deviceKey(id))
     if (!device) throw new EnvironmentError('device_missing', 'Choose a registered execution environment', 404)
@@ -71,19 +102,28 @@ export class RemoteEnvironments {
   }
   binding(ticketId: string): string | undefined { return this.host.store.get(bindingKey(validId(ticketId, 'ticketId')))?.deviceId }
   commands(ticketId: string): (Omit<RemoteIntent, 'payload'> & { effectiveState: RemoteIntent['state'] })[] {
-    return this.records().filter(intent => intent.ticketId === ticketId).map(({ payload: _payload, ...intent }) => ({ ...intent, effectiveState: intent.ownerResolution?.outcome ?? intent.state }))
+    return this.records().filter(intent => this.mayAccess(ticketId, intent)).map(({ payload: _payload, ...intent }) => ({ ...intent, effectiveState: intent.ownerResolution?.outcome ?? intent.state }))
   }
-  hasUnsettled(ticketId: string): boolean { return this.records().some(intent => intent.ticketId === ticketId && unsettled(intent)) }
+  /** The local owner panel retains raw and inherited history after task stop or transfer; Worker tools use commands(). */
+  ownerCommands(ticketId: string, requestTriggerIds: readonly string[] = []): ReturnType<RemoteEnvironments['commands']> {
+    const related = new Set(requestTriggerIds)
+    return this.records().filter(intent => intent.ticketId === ticketId || !!intent.requestTriggerId && related.has(intent.requestTriggerId))
+      .map(({ payload: _payload, ...intent }) => ({ ...intent, effectiveState: intent.ownerResolution?.outcome ?? intent.state }))
+  }
+  hasUnsettled(ticketId: string): boolean { return this.records().some(intent => this.mayAccess(ticketId, intent) && unsettled(intent)) }
   assertExecuting(ticketId: string): void {
-    if (this.records().some(intent => intent.ticketId === ticketId && intent.state === 'unknown' && !intent.ownerResolution))
+    if (this.records().some(intent => this.mayAccess(ticketId, intent) && intent.state === 'unknown' && !intent.ownerResolution))
       throw new EnvironmentError('unknown_pending', 'Inspect and owner-resolve the unknown operation before starting new work for this task', 409)
     if (this.host.mayExecute?.(ticketId) === false) throw new EnvironmentError('task_held', 'The current task authority is holding executable work', 403)
   }
   /** Owner-only host operation; it records an observed outcome and never replays or rewrites daemon history. */
-  resolveUnknown(ticketId: string, commandId: string, input: { outcome: 'completed' | 'failed' | 'cancelled'; evidence: string; expectedUpdatedAt?: string }): RemoteOperationResult {
+  resolveUnknown(ticketId: string, commandId: string, input: { outcome: 'completed' | 'failed' | 'cancelled'; evidence: string; expectedUpdatedAt?: string },
+    ownerRequestIds?: readonly string[]): RemoteOperationResult {
     return this.host.store.atomic(() => {
       const intent = this.host.store.get(intentKey(commandId))
-      if (!intent || intent.ticketId !== ticketId) throw new EnvironmentError('command_missing', 'Command was not found for this task', 404)
+      if (ownerRequestIds === undefined) this.assertCommandAccess(ticketId, intent)
+      else if (!intent || intent.ticketId !== ticketId && (!intent.requestTriggerId || !ownerRequestIds.includes(intent.requestTriggerId)))
+        throw new EnvironmentError('command_missing', 'Command was not found in the owner task history', 404)
       if (intent.state !== 'unknown') throw new EnvironmentError('resolution_state', 'Only an unknown operation needs owner resolution', 409)
       if (!['completed', 'failed', 'cancelled'].includes(input.outcome) || !input.evidence.trim() || input.evidence.length > 2000)
         throw new EnvironmentError('resolution_evidence', 'Owner resolution requires a concrete outcome and observed evidence')
@@ -109,12 +149,13 @@ export class RemoteEnvironments {
     if (!bound || deviceId && deviceId !== bound) throw new EnvironmentError('task_binding', 'Use the execution environment bound to this task', 403)
     return bound
   }
-  private async call<T>(device: Device, path: string, options: { method?: string; body?: unknown; maxBytes?: number; executableTicketId?: string } = {}): Promise<T> {
+  private async call<T>(device: Device, path: string, options: { method?: string; body?: unknown; maxBytes?: number; executableTicketId?: string; executableRequestTriggerId?: string } = {}): Promise<T> {
     this.controller.signal.throwIfAborted()
     const token = await this.host.credential(device.credentialRef)
     if (!token || token.length < 24) throw new EnvironmentError('credential', 'The host credential reference has no usable environment token', 401)
     try {
       if (options.executableTicketId) this.assertExecuting(options.executableTicketId)
+      if (options.executableTicketId && options.executableRequestTriggerId) this.requestScope(options.executableTicketId, options.executableRequestTriggerId)
       const response = await (this.host.fetchImpl ?? fetch)(`${device.url}${path}`, { method: options.method ?? 'GET',
         headers: { authorization: `Bearer ${token}`, ...(options.body ? { 'content-type': 'application/json' } : {}) },
         ...(options.body ? { body: JSON.stringify(options.body) } : {}),
@@ -158,51 +199,80 @@ export class RemoteEnvironments {
   }
   commandResult(ticketId: string, commandId: string): RemoteOperationResult | undefined {
     const intent = this.host.store.get(intentKey(commandId))
-    return intent?.ticketId === ticketId ? this.result(intent) : undefined
+    return intent && this.mayAccess(ticketId, intent) ? this.result(intent) : undefined
   }
   private result(intent: RemoteIntent): RemoteOperationResult {
     return { deviceId: intent.deviceId, ticketId: intent.ticketId, commandId: intent.commandId, state: intent.ownerResolution?.outcome ?? intent.state, updatedAt: intent.updatedAt,
+      ...intent.requestTriggerId ? { requestTriggerId: intent.requestTriggerId } : {},
       ...(intent.remote ? { remote: intent.remote, directory: intent.remote.directory } : {}), ...(intent.error ? { error: intent.error } : {}),
       ...(intent.cancelRequested ? { cancelRequested: true } : {}), ...(intent.ownerResolution ? { ownerResolution: intent.ownerResolution } : {}) }
   }
-  async start(deviceId: string, ticketId: string, request: { requestId: string; command: string; cwd?: string; timeoutMs?: number }): Promise<RemoteOperationResult> {
+  async start(deviceId: string, ticketId: string, request: { requestId: string; requestTriggerId?: string; command: string; cwd?: string; timeoutMs?: number }): Promise<RemoteOperationResult> {
     this.assertBinding(ticketId, deviceId); validId(request.requestId, 'requestId')
+    const requestTriggerId = this.requestScope(ticketId, request.requestTriggerId)
     const payload = commandPayload({ ticketId, command: request.command, cwd: request.cwd, timeoutMs: request.timeoutMs })
-    const id = sha256(JSON.stringify([deviceId, ticketId, request.requestId])), hash = payloadHash(payload), previous = this.host.store.get(intentKey(id))
-    if (previous && previous.payloadHash !== hash) throw new EnvironmentError('id_conflict', 'Reuse a request ID only for the same command', 409)
+    const identity = requestTriggerId ? [deviceId, 'request', requestTriggerId, request.requestId] : [deviceId, ticketId, request.requestId]
+    const id = sha256(JSON.stringify(identity)), hash = payloadHash(payload), previous = this.host.store.get(intentKey(id))
+    if (requestTriggerId && !previous) {
+      const legacy = this.records().find(intent => !intent.requestTriggerId && intent.requestId === request.requestId
+        && (intent.ticketId === ticketId || this.host.mayAccessRequestCommand?.(ticketId, requestTriggerId, intent.ticketId) === true))
+      if (legacy) throw new EnvironmentError('legacy_operation_scope', `Preserved task-scoped operation ${legacy.commandId} needs inspection before adopting an original-request operation ID; query that command and keep its saved outcome`, 409)
+    }
+    if (requestTriggerId && this.records().some(intent => intent.requestTriggerId === requestTriggerId && intent.requestId === request.requestId && intent.deviceId !== deviceId))
+      throw new EnvironmentError('request_device_conflict', 'This original-request operation already belongs to another device; inspect its preserved command before choosing a new operation ID', 409)
+    if (previous && (!this.mayAccess(ticketId, previous) || previous.requestTriggerId !== requestTriggerId))
+      throw new EnvironmentError('request_owner', 'The original request no longer belongs to this task', 403)
+    const comparableHash = previous?.requestTriggerId ? payloadHash({ ...payload, ticketId: previous.payload.ticketId }) : hash
+    if (previous && previous.payloadHash !== comparableHash) throw new EnvironmentError('id_conflict', 'Reuse a request ID only for the same command, directory and timeout', 409)
     // A stable retry remains a query even while an owner-held/unknown operation blocks new executable work.
     if (previous && (previous.state === 'unknown' || previous.ownerResolution)) return this.result(previous)
+    if (previous && previous.ticketId !== ticketId) {
+      const result = await this.reconcile(id, true, ticketId)
+      this.assertCommandAccess(ticketId, this.host.store.get(intentKey(id)))
+      return result
+    }
+    if (previous && ['completed', 'failed', 'cancelled', 'timed_out'].includes(previous.state)) return this.result(previous)
     this.assertExecuting(ticketId)
     if (!previous) this.host.store.set(intentKey(id), { commandId: id, deviceId, ticketId, requestId: request.requestId, payload, payloadHash: hash,
+      ...requestTriggerId ? { requestTriggerId } : {},
       state: 'queued', createdAt: this.at(), updatedAt: this.at() })
     return this.reconcile(id)
   }
   async status(ticketId: string, commandId: string): Promise<RemoteOperationResult> {
     const intent = this.host.store.get(intentKey(validId(commandId, 'commandId')))
-    if (!intent || intent.ticketId !== ticketId) throw new EnvironmentError('command_missing', 'Command was not found for this task', 404)
-    this.assertBinding(ticketId, intent.deviceId)
-    return this.reconcile(commandId)
+    this.assertCommandAccess(ticketId, intent)
+    const result = await this.reconcile(commandId, intent.ticketId !== ticketId, ticketId)
+    this.assertCommandAccess(ticketId, this.host.store.get(intentKey(commandId)))
+    return result
   }
   async cancel(ticketId: string, commandId: string): Promise<RemoteOperationResult> {
     const intent = this.host.store.get(intentKey(validId(commandId, 'commandId')))
-    if (!intent || intent.ticketId !== ticketId) throw new EnvironmentError('command_missing', 'Command was not found for this task', 404)
-    this.assertBinding(ticketId, intent.deviceId)
+    this.assertCommandAccess(ticketId, intent)
+    if (intent.requestTriggerId) this.requestScope(ticketId, intent.requestTriggerId)
     this.host.store.set(intentKey(commandId), { ...intent, cancelRequested: true, updatedAt: this.at() })
     const active = this.operations.get(commandId); if (active) await active
-    return this.reconcile(commandId)
+    return this.reconcile(commandId, intent.ticketId !== ticketId, ticketId)
   }
-  async cancelTicket(ticketId: string): Promise<void> {
-    const commands = this.records().filter(item => item.ticketId === ticketId && unsettled(item))
+  /** Host lifecycle cancellation follows explicit current request ownership even after owners become terminal. */
+  async cancelTicket(ticketId: string, ownedRequestIds?: readonly string[]): Promise<void> {
+    const owned = ownedRequestIds === undefined ? undefined : new Set(ownedRequestIds)
+    const commands = this.records().filter(item => unsettled(item) && (item.requestTriggerId && owned
+      ? owned.has(item.requestTriggerId) : item.ticketId === ticketId))
     for (const item of commands) this.host.store.set(intentKey(item.commandId), { ...item, cancelRequested: true, updatedAt: this.at() })
     const wait = this.host.store.get(waitKey(ticketId))
     if (wait) this.host.store.set(waitKey(ticketId), { ...wait, state: 'unknown', at: this.at() })
     await Promise.allSettled(commands.map(command => this.reconcile(command.commandId)))
   }
-  private reconcile(id: string): Promise<RemoteOperationResult> {
-    const pending = this.operations.get(id); if (pending) return pending
-    const work = this.reconcileOne(id).finally(() => { this.operations.delete(id) }); this.operations.set(id, work); return work
+  private reconcile(id: string, queryOnly = false, viewerTicketId?: string): Promise<RemoteOperationResult> {
+    const operationKey = queryOnly ? `${id}:query` : id
+    const pending = this.operations.get(operationKey); if (pending) return pending
+    const work = this.reconcileOne(id, queryOnly).then(result => {
+      if (viewerTicketId && viewerTicketId !== result.ticketId && this.mayAccess(viewerTicketId, this.host.store.get(intentKey(id))!)) this.notify({ ticketId: viewerTicketId, deviceId: result.deviceId, commandId: id,
+        state: result.state === 'unknown' ? 'unknown' : result.state === 'waiting_environment' ? 'waiting_environment' : 'ready', commandState: result.state })
+      return result
+    }).finally(() => { this.operations.delete(operationKey) }); this.operations.set(operationKey, work); return work
   }
-  private async reconcileOne(id: string): Promise<RemoteOperationResult> {
+  private async reconcileOne(id: string, queryOnly = false): Promise<RemoteOperationResult> {
     let intent = this.host.store.get(intentKey(id))!
     if (intent.ownerResolution) return this.result(intent)
     if (terminalCommand(intent.state as CommandState) && !['queued', 'waiting_environment', 'unknown'].includes(intent.state)) return this.result(intent)
@@ -220,11 +290,20 @@ export class RemoteEnvironments {
         intent = { ...intent, state: 'cancelled', updatedAt: this.at(), error: undefined }; this.host.store.set(intentKey(id), intent)
         this.notify({ ticketId: intent.ticketId, deviceId: intent.deviceId, commandId: id, state: 'ready' }); return this.result(intent)
       }
+      if (!remote && queryOnly) {
+        if (intent.sent) {
+          intent = { ...intent, state: 'unknown', updatedAt: this.at(), error: 'Preserved operation is absent on its original device; inspect its outcome before continuing.' }
+          this.host.store.set(intentKey(id), intent)
+        }
+        return this.result(intent)
+      }
       if (!remote) {
         this.assertExecuting(intent.ticketId)
+        if (intent.requestTriggerId) this.requestScope(intent.ticketId, intent.requestTriggerId)
         // Persist transmission identity before dispatch. A lost response is resolved by GET of this same command ID.
         intent = { ...intent, sent: true, daemonId: currentDevice.daemonId, updatedAt: this.at() }; this.host.store.set(intentKey(id), intent)
-        remote = await this.call<RemoteCommand>(device, '/v1/commands/start', { method: 'POST', body: { ...intent.payload, commandId: id, payloadHash: intent.payloadHash }, executableTicketId: intent.ticketId })
+        remote = await this.call<RemoteCommand>(device, '/v1/commands/start', { method: 'POST', body: { ...intent.payload, commandId: id, payloadHash: intent.payloadHash },
+          executableTicketId: intent.ticketId, executableRequestTriggerId: intent.requestTriggerId })
       }
       if (remote.commandId !== id || remote.ticketId !== intent.ticketId || remote.payloadHash !== intent.payloadHash)
         throw new EnvironmentError('protocol', 'Environment command identity does not match this request', 409)
@@ -237,7 +316,7 @@ export class RemoteEnvironments {
     } catch (error) {
       intent = this.host.store.get(intentKey(id))!
       const unknown = error instanceof EnvironmentError && ['identity_changed', 'protocol', 'id_conflict'].includes(error.code)
-      const permanent = error instanceof EnvironmentError && !unknown && !['task_held', 'credential'].includes(error.code) && [400, 403, 404, 413].includes(error.status)
+      const permanent = error instanceof EnvironmentError && !unknown && !['task_held', 'request_held', 'credential'].includes(error.code) && [400, 403, 404, 413].includes(error.status)
       intent = { ...intent, state: unknown ? 'unknown' : permanent ? 'failed' : 'waiting_environment', updatedAt: this.at(), error: safeRemoteText(error instanceof Error ? error.message : error, undefined, 1000) }
       this.host.store.set(intentKey(id), intent)
       this.notify({ ticketId: intent.ticketId, deviceId: intent.deviceId, commandId: id, state: unknown ? 'unknown' : permanent ? 'ready' : 'waiting_environment', commandState: intent.state })

@@ -310,6 +310,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
 | `src/core/verification.ts` | Acceptance criteria and exact completion identity: acceptance revision, current Assignment/report and relevant Input revision; current approval predicates shared by lifecycle, status and reply guards |
+| `src/core/requests.ts` | Durable original-request responsibility, current owners, provisional claims, bounded transfer history and release/settlement predicates |
 | `src/core/replies.ts` | `Replies`: the Engine's Channel writes |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
@@ -371,6 +372,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/watchdog.ts` | Bounded task and infrastructure snapshots for an independent external control loop |
 | `src/app/supervision.ts` | Isolated tool-free semantic assessments, durable findings and explicit revision-bound advice; observe is the default, with cooldown, attempt and lifecycle guards on advice |
 | `src/app/verification.ts` | Durable independent result reviews through Effects, source-bound criterion CAS, actual artifact/execution evidence, current-generation ownership and bounded repair notes to the original Worker |
+| `src/app/request-review.ts` | Independent, budgeted checks for explicit actions left unowned by status/ignore decisions, source quotes, CAS, restart recovery and bounded re-routing |
+| `src/app/request-views.ts` | Owner and Worker scoped request ownership, original-source previews, history pagination and compact model metadata |
+| `src/app/request-handoff.ts` | Durable verified artifact byte handoff between current request owners, with unchanged digests, local/remote destinations and bounded replay |
 | `src/app/execution-evidence.ts` | Bounded durable projection of host-observed tool calls/results, bound to Assignment and turn; replays Session events and exposes current execution evidence for review |
 | `src/app/runtime-manifest.ts` | Actual source/build fingerprints, non-secret configuration digest, startup/last-good manifests, read-only schema preflight and explicit SQLite-only snapshot export |
 | `src/app/schedules.ts` | Persistent local command schedules, revision guards, coalesced timer occurrences and Runtime-owned cancellation |
@@ -400,6 +404,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/evaluation/fixtures.ts` | Versioned fixed event scenarios, task inputs and independently scored expectations |
 | `src/evaluation/provider.ts` | Optional bounded CLI JSON provider adapter with reduced environment, measured usage and sanitized failures |
 | `src/evaluation/runner.ts` | Isolated Engine/SQLite replay across four routing/concurrency modes, actual file/child-process tasks, independent checks and retained evidence |
+| `src/evaluation/recovery.ts` | Forced routing faults, real Engine request recovery, request-scoped checkpoint reuse, completion coverage and recovery cost measurement |
 | `src/evaluation/index.ts` | Built evaluation entry and CLI exports consumed by the standalone evaluation launcher |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -457,6 +462,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/controls.tsx` | Local copies of DeepSeek Harness's controls, which follow its markup, keyboard behaviour and design tokens, since the bundle does not import `@deepseek-ai/dsh-client-ui-primitives`; they read no context |
 | `src/client/verification.tsx`, `verification.css` | Acceptance badges, lazy current/history evidence, explicit re-review/resume and independent verification/supervision settings within the existing task controls |
 | `src/client/remote-environments.tsx` | Owner device registration/probe, task binding, command history/cancellation and evidence-bound unknown-result resolution in the existing panel |
+| `src/client/requests.tsx` | Lazy original-request ownership/history within task details and bounded coverage-review settings in the existing execution group |
 | `src/client/widgets.tsx` | The small components the pages share, which read the panel's context: sections, page heads, load states, times, links, confirmed actions, the setup check and Markdown |
 | `src/client/rows.tsx` | The rows the pages share: a Ticket, a Thread and a Decision, a Thread's chip, and the folding of runs of automated messages |
 | `src/client/markdown.ts` | The Markdown subset of reports and questions, and the bare addresses in messages, as blocks and inline parts |
@@ -500,6 +506,11 @@ Task rooms, Worker details, execution history, directed input, the Router toggle
 | `tests/autonomy-integration.spec.ts` | Actual Runtime wiring for enforce/observe review, input/CAS invalidation, QQ usage/holds, structured HTTP operations, memory corrections and execution revocation/recovery |
 | `tests/autonomy-runtime.spec.ts` | Runtime owner APIs, real remote daemon/tool binding, offline cancellation, evidence-bound unknown resolution, memory corrections, measured feedback and reviewer fault isolation |
 | `tests/autonomy-evaluation.spec.ts` | Durable metric semantics, fixed and provider event paths, actual output checks, restart/side-effect identity, external waits and four-mode reports |
+| `tests/routing-recovery.spec.ts` | Real SQLite request ownership, trial claims, original-request return/transfer, acceptance release, revision races and bounded recovery |
+| `tests/request-review.spec.ts` | Exact-source coverage corrections, authority/revision protection, model faults, observation, repeat limits and SQLite reopen |
+| `tests/routing-recovery-runtime.spec.ts` | Runtime tools, HTTP ownership views, provisional delivery, original-request transfer and missed mixed-action recovery |
+| `tests/request-handoff.spec.ts` | Actual artifact byte/digest reuse, request transfer authority, stale outcomes and durable replay |
+| `tests/routing-recovery-evaluation.spec.ts` | Forced routing mistakes repaired through real Engine/SQLite, original request IDs, saved checkpoints and canonical-owner stop |
 | `tests/remote-environments.spec.ts` | Real HTTP/daemon processes, command replay/conflicts, reconnect, cancellation, crash/unknown resolution, byte transfer, digest/path checks and endpoint self-check/backup |
 | `tests/panel-remote-environments.spec.tsx` | Device controls, binding, command state/cancellation, owner outcome confirmation and recoverable panel errors |
 | `tests/panel-verification.spec.tsx` | Current and observed review projections, lazy evidence/history, accessible status, stable retry IDs, re-review/resume and isolated settings errors |

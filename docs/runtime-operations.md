@@ -90,7 +90,7 @@ Set these task-specific variables to inspected absolute paths. Use a fresh desti
 5. Exercise status queries and a deliberate stop. For a remote environment, also test a brief endpoint outage and reconnect on a canary, preserving the same command ID. Keep older critical work paused or supervised until the candidate demonstrates the needed paths.
 6. Keep the pre-upgrade bundle until the candidate has passed real work. Record the canary task IDs and observed outcome alongside the manifest/build ID.
 
-Schema 13 supplies storage-level protection against an older binary silently interpreting new execution controls. Existing task compatibility and canary verification remain part of the deployment check; each module's tests document the specific state transitions it covers.
+Schema 14 protects durable request ownership, provisional inputs and transferred acceptance responsibility. Schemas 12 and 13 upgrade additively; original requests and task records remain available. Existing task compatibility and canary verification remain part of the deployment check. See [routing recovery](routing-recovery.md) for internal claims, bounded review and migrated artifacts/commands.
 
 ## Rollback and recovery
 

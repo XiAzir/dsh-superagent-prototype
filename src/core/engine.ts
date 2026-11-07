@@ -10,6 +10,7 @@ import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest, type TicketStatusSnapshot } from './replies.ts'
 import { Tickets } from './tickets.ts'
+import { effectiveRequestOwners, releaseRequest, requestResponsibility, requestRoutingEnabled, writeRequest, type RequestResponsibility, type RequestRoutingEvidence } from './requests.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
@@ -119,7 +120,7 @@ export class Engine {
    * once unless processing is paused.
    * @throws UserError for a ticket a person stopped, which withdrew its Mandate, or one whose Mandate the Policy no longer holds.
    */
-  attach(ticketId: string, triggerId: string, note?: string): Ticket {
+  attach(ticketId: string, triggerId: string, note?: string, routing?: RequestRoutingEvidence): Ticket {
     return this.repo.atomic(() => {
       // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
       const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
@@ -132,7 +133,7 @@ export class Engine {
       }
       const trigger = this.tickets.attachable(ticketId, triggerId)
       this.evals.withdraw(trigger)
-      this.tickets.attach(ticketId, trigger, note)
+      this.tickets.attach(ticketId, trigger, note, routing)
       this.evals.routed(triggerId, ticketId)
       this.tickets.wake(ticketId)
       return this.repo.tickets.get(ticketId)!
@@ -166,7 +167,7 @@ export class Engine {
       if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
       this.repo.triggers.save(trigger)
       this.repo.triggers.saveDisposition(trigger.id, { fanout: [], directTicketId: ticketId, at: this.options.now?.() ?? new Date().toISOString() })
-      this.tickets.attach(ticketId, trigger)
+      this.tickets.attach(ticketId, trigger, undefined, undefined, true)
       const saved = this.repo.triggers.disposition(trigger.id)!
       this.repo.triggers.saveDisposition(trigger.id, { ...saved, directTicketId: ticketId })
       this.tickets.wake(ticketId)
@@ -256,7 +257,94 @@ export class Engine {
    */
   requestStatus(ticketId: string): boolean { return this.repo.atomic(() => this.tickets.requestStatus(ticketId)) }
   /** Read the requester's saved task status before composing a reply; leaves assignments and subscriptions untouched. */
-  status(ticketId: string, triggerId: string): TicketStatusSnapshot { return this.replies.statusSnapshot(ticketId, triggerId) }
+  status(ticketId: string, triggerId: string): TicketStatusSnapshot {
+    return this.repo.atomic(() => {
+      const snapshot = this.replies.statusSnapshot(ticketId, triggerId)
+      const previous = requestResponsibility(this.repo, triggerId)
+      if (previous && ['pending', 'returned', 'ignored'].includes(previous.state) && !previous.owners.some(owner => ['claimed', 'proposed'].includes(owner.state)))
+        writeRequest(this.options, triggerId, 'answered', previous.owners, { kind: 'status', ticketId, reason: 'Saved task status selected by Router' })
+      return snapshot
+    })
+  }
+  /** Read original request responsibility, including compatible legacy records, without mutating state. */
+  requestResponsibility(triggerId: string): RequestResponsibility | undefined { return requestResponsibility(this.repo, triggerId) }
+  /** A Worker's internal confirmation binds a trial input to its current Assignment. */
+  claimRequest(ticketId: string, triggerId: string, reason: string, expectedAssignmentId?: string, expectedRevision?: number): RequestResponsibility {
+    return this.repo.atomic(() => this.tickets.claimRequest(ticketId, triggerId, reason, expectedAssignmentId, expectedRevision))
+  }
+  /** Correct an earlier accept/attach while keeping the original request ID and completed work references. */
+  transferRequest(fromTicketId: string, triggerId: string, toTicketId: string, reason: string, requestId: string,
+    expectedAssignmentId?: string, expectedRevision?: number): RequestResponsibility {
+    return this.repo.atomic(() => {
+      const trigger = this.repo.triggers.get(triggerId), previous = requestResponsibility(this.repo, triggerId)
+      if (!trigger || !previous || !requestRoutingEnabled(this.options)) throw new UserError('notReached')
+      const receipt = previous.history.find(item => item.kind === 'transferred' && item.requestId === requestId)
+      if (receipt) {
+        if (receipt.ticketId !== fromTicketId || receipt.toTicketId !== toTicketId || receipt.reason !== reason)
+          throw new UserError('notAdmissible', { reason: 'Transfer request ID was reused with different details' })
+        return previous
+      }
+      if (!requestId.trim() || fromTicketId === toTicketId) throw new UserError('notAdmissible', { reason: 'Transfer requires a stable ID and different target' })
+      const from = this.repo.tickets.get(fromTicketId), to = this.repo.tickets.get(toTicketId)
+      if (!from || !to) throw new UserError('unknownTicket')
+      if (!liveTicket(from) || from.hold || to.ended?.by === 'human' || to.hold || this.options.policy().paused)
+        throw new UserError('notAdmissible', { reason: 'Transfer source or target is stopped or held' })
+      if (!this.options.policy().revalidate(from.mandate) || !this.options.policy().revalidate(to.mandate)) throw new UserError('mandateRevoked')
+      if (expectedAssignmentId !== undefined && runningAssignment(from)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+      if (expectedRevision !== undefined && previous.revision !== expectedRevision) throw new UserError('notAdmissible', { reason: 'Request responsibility revision changed' })
+      if (!previous.owners.some(owner => owner.ticketId === fromTicketId && ['claimed', 'proposed'].includes(owner.state))) throw new UserError('notReached')
+      if (this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === toTicketId)) throw new UserError('handedBackHere')
+      const thread = this.repo.threads.get(threadKeyOf(trigger.threads[0]!))!
+      const scope = this.options.scope.scope(trigger), gate = this.options.policy().gate(trigger, thread, [to])
+      if (!scope.listened || !gate.admissible) throw new UserError('notAdmissible', { reason: 'The original source request is no longer admitted' })
+      if (trigger.source === 'qq' && trigger.meta.observation && !this.options.policy().observedRouting)
+        throw new UserError('notAdmissible', { reason: 'Observed requests require current auto-mode authority before transfer' })
+      const latest = from.assignments.at(-1)?.report
+      releaseRequest(this.options, from, triggerId, reason, toTicketId, requestId)
+      this.repo.tickets.save(from)
+      const disposition = this.repo.triggers.disposition(triggerId)!
+      this.repo.triggers.saveDisposition(triggerId, { ...disposition,
+        fanout: disposition.fanout.filter(id => id !== fromTicketId),
+        handbacks: [...disposition.handbacks ?? [], { ticketId: fromTicketId, reason, at: this.options.now?.() ?? new Date().toISOString(), queued: false }] })
+      this.evals.withdraw(trigger)
+      const handoff = `Request ${triggerId} transferred from ${fromTicketId}: ${reason.slice(0, 500)}. Preserve the original request and existing completed work.\n`
+        + (latest ? `Prior observed report (context; verify before use): ${latest.summary.slice(0, 1200)}. Artifact references: ${(latest.artifacts ?? []).join(', ').slice(0, 1000)}.` : 'No prior completed-result report is recorded.')
+      this.tickets.attach(toTicketId, trigger, handoff, { reason, evidenceRefs: [`trigger/${triggerId}`, `ticket/${fromTicketId}`] })
+      this.evals.routed(triggerId, toTicketId)
+      this.tickets.finalizeReleasedTicket(fromTicketId, triggerId, reason, toTicketId)
+      if (liveTicket(this.repo.tickets.get(fromTicketId)!)) this.tickets.note(fromTicketId,
+        `Request ${triggerId} is now assigned to ${toTicketId}. Its prior input is historical context. Preserve completed work and continue only your remaining requests.`,
+        `request-transfer:${triggerId}:${requestId}`)
+      this.tickets.wake(toTicketId)
+      return requestResponsibility(this.repo, triggerId)!
+    })
+  }
+  /** Re-open an answered/ignored/unowned request after a source-grounded review, with CAS and a stable retry ID. */
+  reopenRequest(triggerId: string, reason: string, requestId: string, expectedRevision?: number): RequestResponsibility {
+    return this.repo.atomic(() => {
+      const previous = requestResponsibility(this.repo, triggerId), trigger = this.repo.triggers.get(triggerId)
+      if (!previous || !trigger || !requestRoutingEnabled(this.options)) throw new UserError('unknownTrigger')
+      const receipt = previous.history.find(item => item.kind === 'reopened' && item.requestId === requestId)
+      if (receipt) {
+        if (receipt.reason !== reason) throw new UserError('notAdmissible', { reason: 'Reopen request ID was reused with different details' })
+        return previous
+      }
+      if (!requestId.trim() || !reason.trim()) throw new UserError('notAdmissible', { reason: 'A reopen requires a stable request ID and source-grounded reason' })
+      if (expectedRevision !== undefined && previous.revision !== expectedRevision) throw new UserError('notAdmissible', { reason: 'Request responsibility revision changed' })
+      if (!['answered', 'ignored', 'returned', 'pending'].includes(previous.state) || effectiveRequestOwners(previous).length > 0)
+        throw new UserError('notAdmissible', { reason: 'Request is owned, completed or cancelled' })
+      if (this.options.policy().paused) throw new UserError('notAdmissible', { reason: 'Processing is paused' })
+      const scope = this.options.scope.scope(trigger), thread = this.repo.threads.get(threadKeyOf(trigger.threads[0]!))
+        ?? { key: threadKeyOf(trigger.threads[0]!), ref: trigger.threads[0]!, createdAt: trigger.at, subscriptions: [], correlated: [], pending: [], meta: {} }
+      const gate = this.options.policy().gate(trigger, thread, [])
+      if (!scope.listened || !gate.admissible) throw new UserError('notAdmissible', { reason: 'Original request authorization is no longer valid' })
+      const disposition = this.repo.triggers.disposition(triggerId) ?? { fanout: [], at: trigger.at }
+      this.repo.triggers.saveDisposition(triggerId, { ...disposition, routing: 'pending', requeued: true })
+      const next = writeRequest(this.options, triggerId, 'pending', previous.owners, { kind: 'reopened', reason, requestId })!
+      this.evals.reevaluate(triggerId)
+      return next
+    })
+  }
   /**
    * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
    * written, attention where the message that raised the question was, else, like a result, to the conversation the ticket
@@ -273,6 +361,9 @@ export class Engine {
         if (disposition?.routing === 'pending') this.repo.triggers.saveDisposition(trigger.id, { ...disposition, routing: 'handled' })
         this.evals.withdraw(trigger)
         this.evals.routed(trigger.id, request.ticketId, true)
+        const responsibility = requestResponsibility(this.repo, trigger.id)
+        if (responsibility && ['pending', 'returned', 'ignored'].includes(responsibility.state) && !responsibility.owners.some(owner => ['claimed', 'proposed'].includes(owner.state)))
+          writeRequest(this.options, trigger.id, 'answered', responsibility.owners, { kind: 'status', ticketId: request.ticketId })
       }
       return reply
     })
@@ -368,8 +459,8 @@ export class Engine {
    * @returns whether it was queued for Eval: false while another ticket still decides it, and for one this ticket did not decide (see `Evals.handback`).
    * @throws UserError when the ticket or trigger is unknown, the trigger did not reach the ticket, or the ticket already handed it back.
    */
-  handback(ticketId: string, triggerId: string, reason: string): boolean {
-    return this.repo.atomic(() => this.evals.handback(ticketId, triggerId, reason))
+  handback(ticketId: string, triggerId: string, reason: string, expectedAssignmentId?: string, expectedRevision?: number): boolean {
+    return this.repo.atomic(() => this.evals.handback(ticketId, triggerId, reason, expectedAssignmentId, expectedRevision))
   }
   /**
    * Record a report on an open ticket's Assignment. Executor callers pass the Assignment ID captured before any async
@@ -442,14 +533,14 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'direct' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note' | 'scheduleFollowup' | 'cancelFollowup'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'direct' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'requestResponsibility' | 'transferRequest' | 'reopenRequest' | 'note' | 'scheduleFollowup' | 'cancelFollowup'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Omit<Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-    | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'reply' | 'scheduleFollowup' | 'cancelFollowup'>, 'report'> & {
+    | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'claimRequest' | 'transferRequest' | 'requestResponsibility' | 'followForContext' | 'collaborate' | 'reply' | 'scheduleFollowup' | 'cancelFollowup'>, 'report'> & {
     /** A report is bound to the Assignment whose worker produced it, including reports that finish after asynchronous reads. */
     report(ticketId: string, report: WorkerReport, expectedAssignmentId: string): Ticket
   }

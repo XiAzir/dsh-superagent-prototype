@@ -12,11 +12,12 @@ import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { requestForWorker } from '../request-views.ts'
 
 export interface ExecutorToolsHost {
   readonly remote?: Pick<RemoteEnvironments, 'hasUnsettled' | 'downloadArtifact' | 'binding'>
   readonly verification?: Pick<import('../verification.ts').VerificationService, 'enqueue'>
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext' | 'collaborate' | 'cancelFollowup'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'claimRequest' | 'transferRequest' | 'followForContext' | 'collaborate' | 'cancelFollowup'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
@@ -29,6 +30,13 @@ export interface ExecutorToolsHost {
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  const currentAssignment = (receiptReplay = false) => {
+    const current = host.store.tickets.get(ticketId), assignment = current && runningAssignment(current)
+    // Core validates new mutations; an exact durable receipt can be read after a successful transfer ended its source.
+    if (receiptReplay && current?.assignments.at(-1)) return current.assignments.at(-1)!.id
+    if (!current || !liveTicket(current) || current.hold || !assignment) throw new Error('A live, unheld Assignment must own this request operation')
+    return assignment.id
+  }
   return [
     readTool('Read one page of this ticket’s listed resources; follow page links.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
@@ -87,13 +95,39 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       }),
     }),
     tool({
+      name: 'orchestrator_request_claim',
+      description: 'Claim matching scope from the original request; internally confirms its thread.',
+      schema: z.object({ trigger_id: z.string().min(1), expected_revision: z.number().int().min(0),
+        reason: z.string().trim().min(1).max(300).describe('Original goal/output relation.') }).strict(),
+      execute: async args => {
+        const request = host.engine.claimRequest(ticketId, args.trigger_id, args.reason, currentAssignment(), args.expected_revision)
+        host.requestPass(); return { request: requestForWorker(request, ticketId) }
+      },
+    }),
+    tool({
+      name: 'orchestrator_request_transfer',
+      description: 'Transfer a request to its identified task; retain work and IDs. Reuse request_id on retry.',
+      schema: z.object({ trigger_id: z.string().min(1), to_ticket_id: z.string().min(1), expected_revision: z.number().int().min(0),
+        request_id: z.string().trim().min(1).max(200), reason: z.string().trim().min(1).max(500)
+          .describe('Owner relation, reusable findings/receipts, remaining work.') }).strict(),
+      execute: async args => {
+        const request = host.engine.transferRequest(ticketId, args.trigger_id, args.to_ticket_id, args.reason, args.request_id,
+          currentAssignment(true), args.expected_revision)
+        host.requestPass(); return { request: requestForWorker(request, ticketId) }
+      },
+    }),
+    tool({
       name: 'orchestrator_trigger_handback',
-      description: 'Hand back a message that asks for work beyond this ticket or for another one, for a fresh assessment; once per message. queued is false while another ticket still decides it, and for a message that was never this ticket\'s to decide, such as a bot\'s, which is assessed without it.',
+      description: 'Return original/later work outside this task; retain its ID and release this responsibility. Retry safely.',
       schema: z.object({
         trigger_id: z.string().min(1),
         reason: z.string().trim().min(1).max(300).describe('One sentence on what it asks for beyond this ticket.'),
+        expected_revision: z.number().int().min(0).optional(),
       }).strict(),
-      execute: async args => ({ trigger_id: args.trigger_id, queued: host.engine.handback(ticketId, args.trigger_id, args.reason) }),
+      execute: async args => {
+        const queued = host.engine.handback(ticketId, args.trigger_id, args.reason, currentAssignment(true), args.expected_revision)
+        host.requestPass(); return { trigger_id: args.trigger_id, queued }
+      },
     }),
     tool({
       name: 'orchestrator_report',

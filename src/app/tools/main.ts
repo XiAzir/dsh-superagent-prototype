@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople, type TicketStatusSnapshot }
+import { UserError, followupOwners, key, reasonText, threadKey, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople, type TicketStatusSnapshot }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -16,11 +16,11 @@ import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
-  .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
+  .describe(`Routing facts/human constraints, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the source.`)
 export interface MainToolsHost {
   readonly verification?: Pick<import('../verification.ts').VerificationService, 'setCriteria' | 'enqueue'>
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'delegate' | 'reply' | 'status' | 'requestStatus' | 'transferRequest' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -51,9 +51,10 @@ const RouteItemSchema = z.object({
   ticket_id: z.string().nullish().describe('attach and stop: the ticket.'),
   title: z.string().nullish().describe('accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice.'),
   worktree_name: z.string().nullish().describe(`accept: ${WorktreeNameSchema.description ?? ''}`),
-  acknowledgement: z.string().nullish().describe(`accept: one brief sentence of at most ${IM_WORDS} words naming the concrete change and intended result in the source language. It is posted as a reply to the original source on acceptance, so do not quote the source; quote an earlier proposal briefly only when the trigger merely confirms it and the sentence does not already state it. No generic I will handle it.`),
+  acknowledgement: z.string().nullish().describe(`accept: one source-language sentence, at most ${IM_WORDS} words, naming the change/result. Posted to the original source on acceptance. Omit source repetition; briefly quote an earlier proposal only for an otherwise implicit confirmation.`),
   note: z.string().nullish().describe(`accept and attach: ${RoutingNoteSchema.description ?? ''}`),
-  reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
+  reason: z.string().nullish().describe('ignore/stop: why; cross-thread attach: concrete goal or output relation, at most 500 characters.'),
+  evidence_refs: z.array(z.string().min(1).max(400)).max(8).nullish().describe('Cross-thread attach: existing trigger/<id>, ticket/<id> or thread/<key> references supporting that relation.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
@@ -65,14 +66,15 @@ const FIELDS: Record<Field, { check: z.ZodType; reads: readonly Kind[]; needs: r
   worktree_name: { check: WorktreeNameSchema, reads: ['accept'], needs: ['accept'] },
   acknowledgement: { check: AcknowledgementSchema, reads: ['accept'], needs: ['accept'] },
   note: { check: RoutingNoteSchema, reads: ['accept', 'attach'], needs: [] },
-  reason: { check: z.string().max(500), reads: ['ignore', 'stop'], needs: ['ignore'] },
+  reason: { check: z.string().max(500), reads: ['ignore', 'stop', 'attach'], needs: ['ignore'] },
+  evidence_refs: { check: z.array(z.string().min(1).max(400)).min(1).max(8), reads: ['attach'], needs: [] },
 }
 /** Why an item cannot run: a field its kind needs is missing, or one it reads breaks its limit. */
 function invalid(item: RouteItem): string | undefined {
   for (const [field, { check, reads, needs }] of Object.entries(FIELDS) as [Field, typeof FIELDS[Field]][]) {
     const value = item[field]
     if (!reads.includes(item.kind)) continue
-    if (value === undefined || value === null || value.trim() === '') {
+    if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) {
       if (needs.includes(item.kind)) return `${item.kind} needs ${field}`
       continue
     }
@@ -80,6 +82,29 @@ function invalid(item: RouteItem): string | undefined {
     if (!checked.success) return `${field}: ${checked.error.issues[0]?.message ?? 'invalid'}`
   }
   return undefined
+}
+
+/** Validate quoted routing resources and require concrete evidence before a new thread reaches an existing worker. */
+function attachmentEvidence(host: MainToolsHost, item: RouteItem) {
+  const target = host.store.tickets.get(item.ticket_id!), source = host.store.triggers.get(item.trigger_id)
+  if (!target || !source) return undefined // Engine reports its precise unknown-resource error.
+  const targetIds = new Set([...target.origin.triggerIds, ...target.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])])
+  const targetThreads = new Set([...target.follows?.map(follow => follow.thread) ?? [],
+    ...target.origin.triggerIds.flatMap(id => host.store.triggers.get(id)?.threads.map(threadKey) ?? []),
+    ...source.threads.filter(ref => host.store.threads.get(threadKey(ref))?.subscriptions.includes(target.id)).map(threadKey)])
+  const crossThread = !source.threads.some(ref => targetThreads.has(threadKey(ref)))
+    && host.store.triggers.disposition(source.id)?.directTicketId !== target.id
+  if (crossThread && (!item.reason?.trim() || !item.evidence_refs?.length)) {
+    throw new Error('Cross-thread attach needs reason and evidence_refs; compare the original request with the target goal/output first')
+  }
+  if (!item.evidence_refs?.length) return undefined
+  const valid = new Set([`trigger/${source.id}`, `ticket/${target.id}`, ...[...targetIds].map(id => `trigger/${id}`),
+    ...[...targetThreads].map(id => `thread/${id}`)])
+  for (const ref of item.evidence_refs) if (!valid.has(ref)) throw new Error(`Routing evidence is unavailable for this request and target: ${ref}`)
+  if (crossThread && !item.evidence_refs.some(ref => ref.startsWith('trigger/') && targetIds.has(ref.slice('trigger/'.length)) && ref !== `trigger/${source.id}`)) {
+    throw new Error('Cross-thread attach needs a target source/input trigger reference; read the target original before claiming a relation')
+  }
+  return { reason: item.reason?.trim() || 'Existing thread relation', evidenceRefs: item.evidence_refs }
 }
 type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; triggerIds?: readonly string[]; snapshot?: TicketStatusSnapshot }
 /**
@@ -107,8 +132,9 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
       return { ...fromDecision(decision), triggerIds: decision.triggerIds }
     }
     case 'attach': {
-      const ticket = host.quietly(() => host.engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined))
-      return { reason: 'Attached: the ticket follows the trigger\'s thread and receives the trigger', ticketId: ticket.id }
+      const routing = attachmentEvidence(host, item)
+      const ticket = host.quietly(() => host.engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined, routing))
+      return { reason: 'Delivered for worker scope review; request ownership records whether the thread is confirmed', ticketId: ticket.id }
     }
     // Through `engine.decide`, so only a person's message the gate admits with explicit strength stops a ticket.
     case 'stop': {
@@ -128,7 +154,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route trigger IDs: accept explicit work, attach follow-ups, read status snapshots, stop on a human request, or ignore. Use snapshots for status replies. Items run independently; use orchestrator_eval_decide for proactive candidates.',
+    description: 'Route trigger IDs: accept, attach, status snapshot, human stop or ignore. Items run independently. Proactive acceptance uses orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }) => {
       const decided = new Map<string, string>()
@@ -175,6 +201,22 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     readTool('Read listed resource pages; follow page links.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
+    tool({
+      name: 'orchestrator_request_transfer',
+      description: 'Correct request ownership between known tasks, preserving original IDs and reusable work. Reuse request_id on retry.',
+      schema: z.object({ from_ticket_id: z.string().min(1), trigger_id: z.string().min(1), to_ticket_id: z.string().min(1),
+        expected_revision: z.number().int().min(0), request_id: z.string().trim().min(1).max(200),
+        reason: z.string().trim().min(1).max(500), evidence_refs: z.array(z.string().min(1).max(400)).min(1).max(8) }).strict(),
+      execute: async args => {
+        attachmentEvidence(host, { kind: 'attach', trigger_id: args.trigger_id, ticket_id: args.to_ticket_id,
+          reason: args.reason, evidence_refs: args.evidence_refs })
+        const source = host.store.tickets.get(args.from_ticket_id)
+        if (!source) throw new UserError('unknownTicket')
+        const request = host.quietly(() => host.engine.transferRequest(args.from_ticket_id, args.trigger_id, args.to_ticket_id,
+          args.reason, args.request_id, source.assignments.at(-1)?.id, args.expected_revision))
+        host.requestPass(); return { request }
+      },
+    }),
     tool({
       name: 'orchestrator_delegate',
       description: 'Assign a bounded peer task on a subscribed thread under its parent mandate. Reuse request_id on retries.',

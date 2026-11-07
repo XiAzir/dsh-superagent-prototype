@@ -6,27 +6,33 @@ import { z } from 'zod'
 import { Engine, latestAssignment, liveTicket, type Trigger } from '../core/index.ts'
 import { completionKey } from '../core/verification.ts'
 import { Store } from '../app/store.ts'
+import { Prompts, defaultPrompts } from '../app/prompts.ts'
 import { safeFailureMessage } from '../app/session-failures.ts'
 import { SettingsSchema, SourcePolicySchema, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { runCommand } from '../../scripts/dsh-superagent-watchdog.mjs'
 import { EvaluationLedger, type EvaluationSummary } from './ledger.ts'
 import { AUTONOMY_TASK_SET_VERSION, replayFixtures, taskFixtures, type FixtureTask, type ReplayFixture } from './fixtures.ts'
-import { evaluationEnvironment, type EvaluationProvider, type EvaluationRoute, type EvaluationUsage } from './provider.ts'
+import { EvaluationProviderError, evaluationEnvironment, type EvaluationCallTrace, type EvaluationProvider, type EvaluationRoute,
+  type EvaluationRouterPrompt, type EvaluationUsage } from './provider.ts'
 
 export type EvaluationMode = 'router-first' | 'structured-fast-path' | 'subscription-fast-path' | 'single-worker'
 export interface AutonomyEvaluationOptions {
   directory: string; mode?: EvaluationMode; runId?: string; gitRevision?: string; buildHash?: string
   provider?: EvaluationProvider
+  promptProfile?: 'protocol' | 'repository' | 'personal'
+  replicate?: number
 }
 export interface AutonomyEvaluationResult {
   schema: 1; runId: string; startedAt: string; finishedAt: string; taskSetVersion: string; gitRevision: string | null
   mode: EvaluationMode; configHash: string; buildHash: string | null; model: { provider: string; model: string | null } | null
   routingPolicy: 'fixture-oracle' | 'provider'; executionPolicy: 'fixture-programs' | 'provider-files'
+  promptProfile: 'protocol' | 'repository' | 'personal'; promptHash: string | null; replicate: number
   interpretation: string[]; summary: EvaluationSummary; failures: { eventId?: string; task?: string; reason: string }[]
   routes: { eventId: string; path: string; kind: string; correct: boolean; ticketId?: string }[]
   tasks: { task: FixtureTask; ticketId: string; passed: boolean; files: { name: string; sha256: string; bytes: number }[] }[]
-  output: { database: string; result: string; events: string }
+  requestOutcomes: { task: FixtureTask; triggerId: string; state: string; ownerTicketIds: string[] }[]
+  output: { database: string; result: string; events: string; traces: string; prompt?: string }
 }
 const PROGRAM = String.raw`const fs=require('node:fs');const s=JSON.parse(fs.readFileSync(0,'utf8'));process.chdir(s.directory);
 if(s.externalEvent){fs.writeFileSync('external.txt','external-ready');process.exit(0);}
@@ -49,8 +55,21 @@ const sha = (text: string | Uint8Array) => createHash('sha256').update(text).dig
 const now = () => new Date().toISOString()
 const fixtureById = new Map(replayFixtures.map(event => [event.id, event]))
 
+/** Rotate mode order within each paired repeat while every mode receives the same fixed event set. */
+export function pairedEvaluationSchedule(modes: EvaluationMode[], repeats = 1): { replicate: number; mode: EvaluationMode }[] {
+  if (!Number.isInteger(repeats) || repeats < 1 || repeats > 20) throw new Error('Evaluation repeats must be an integer from 1 to 20')
+  if (!modes.length || new Set(modes).size !== modes.length || modes.some(mode => !['router-first', 'structured-fast-path', 'subscription-fast-path', 'single-worker'].includes(mode))) {
+    throw new Error('Choose distinct supported evaluation modes')
+  }
+  return Array.from({ length: repeats }, (_, index) => [...modes.slice(index % modes.length), ...modes.slice(0, index % modes.length)]
+    .map(mode => ({ replicate: index + 1, mode }))).flat()
+}
+
 export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions): Promise<AutonomyEvaluationResult> {
   const mode = options.mode ?? 'structured-fast-path', startedAt = now()
+  const promptProfile = options.promptProfile ?? 'protocol', replicate = options.replicate ?? 1
+  if (!['protocol', 'repository', 'personal'].includes(promptProfile)) throw new Error('Unsupported prompt profile')
+  if (!Number.isInteger(replicate) || replicate < 1 || replicate > 20) throw new Error('Invalid evaluation replicate')
   if (!['router-first', 'structured-fast-path', 'subscription-fast-path', 'single-worker'].includes(mode)) throw new Error('Unsupported evaluation mode')
   const runId = options.runId ?? `${startedAt.replace(/[:.]/g, '-')}-${mode}`
   if (!/^[a-zA-Z0-9._-]{1,120}$/.test(runId)) throw new Error('Invalid evaluation run ID')
@@ -63,12 +82,32 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
   const logical = new Map<FixtureTask, string>(), ticketTasks = new Map<string, FixtureTask>(), queued = new Map<string, string>()
   const requestTimes = new Map<string, number>(), resultTasks: AutonomyEvaluationResult['tasks'] = [], routes: AutonomyEvaluationResult['routes'] = []
   const failures: AutonomyEvaluationResult['failures'] = []
+  const providerTraceOffset = options.provider?.traces?.().length ?? 0, traces: EvaluationCallTrace[] = []
   const settings = SettingsSchema.parse({ eval: { mode: 'auto' }, policy: { rules: [{ id: 'fixture', name: 'Fixture reproduction', enabled: true,
     instruction: 'Reproduce the specific malformed JSON defect in the isolated evaluation directory and record actual evidence silently.' }],
     sources: { evaluation: { allowed: [{ id: 'owner' }] }, qq: { allowed: [{ id: '12345' }] },
       ci: { allowed: [], admission: { fixture: { unlistedUnaddressed: 'inferred' } } } } },
     sources: { evaluation: { enabled: true, config: {} }, qq: { enabled: true, config: {} }, ci: { enabled: true, config: {} } } })
   store.saveSettings(settings)
+  const routerPrompt: EvaluationRouterPrompt | undefined = promptProfile === 'protocol' ? undefined : (() => {
+    const prompts = new Prompts(store, () => 1_000_000, () => undefined, () => false, () => false, () => promptProfile === 'personal')
+    const text = prompts.compose(defaultPrompts(), 'orchestrator', undefined)
+    return { profile: promptProfile, text, sha256: sha(text) }
+  })()
+  if (routerPrompt) await writeFile(join(directory, 'router-prompt.json'), JSON.stringify({ ...routerPrompt,
+    composition: 'Production Prompts.compose defaults with isolated fixture policy, no private installation overrides or execution environment.',
+    adaptation: 'The provider returns the evaluation JSON decision protocol instead of invoking DSH tools.' }, null, 2), { mode: 0o600 })
+  const invoke = async <T>(task: EvaluationCallTrace['task'], input: unknown, run: () => Promise<T>): Promise<T> => {
+    if (options.provider?.traces) return run()
+    const started = performance.now(), trace: EvaluationCallTrace = { at: now(), task, transport: 'in-process', input,
+      inputSha256: sha(JSON.stringify(input)), normalizations: [], state: 'running' }
+    traces.push(trace)
+    try {
+      const output = await run(); trace.output = JSON.stringify(output); trace.outputSha256 = sha(trace.output)
+      trace.normalized = output; trace.usage = (output as { usage?: EvaluationUsage }).usage; trace.state = 'valid'; return output
+    } catch (error) { trace.state = 'failed'; trace.error = safeFailureMessage(error); throw error }
+    finally { trace.durationMs = performance.now() - started }
+  }
   const makeSources = () => {
     const sources = new SourceRegistry(() => store.settings())
     for (const source of ['evaluation', 'qq', 'ci']) sources.register({ kind: source, title: { zh: source, en: source },
@@ -88,6 +127,13 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
         criteria: [{ id: 'fixture-output', description: 'Output satisfies the original fixture request and corrections.', kind: 'artifact', sourceRefs: [`trigger/${ticket.origin.triggerId}`] }] } }) })
   }
   let engine = makeEngine()
+  const originalTaskTrigger = (task: FixtureTask) => replayFixtures.find(event => event.task === task && !event.duplicateOf)
+  const currentTaskOwner = (task: FixtureTask): string | undefined => {
+    const original = originalTaskTrigger(task), request = original && engine.requestResponsibility(`evaluation-${original.id}`)
+    const owners = request?.owners ?? []
+    return owners.find(owner => owner.state === 'claimed' || owner.state === 'proposed')?.ticketId
+      ?? owners.find(owner => owner.state === 'completed' || owner.state === 'cancelled')?.ticketId ?? logical.get(task)
+  }
   const usage = (id: string, value?: EvaluationUsage, ticketId?: string) => {
     if (options.provider) ledger.record({ id: `usage:${id}`, kind: 'usage', ...ticketId ? { ticketId } : {},
       data: { tokens: value?.tokens ?? null, cost: value?.cost ?? null, provider: options.provider.name, model: options.provider.model ?? null } })
@@ -96,19 +142,21 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
     const original = event.duplicateOf ? fixtureById.get(event.duplicateOf)! : event
     const source = original.kind === 'observation' ? 'qq' : original.kind === 'ci' ? 'ci' : 'evaluation'
     const subscription = mode === 'subscription-fast-path' && ['followup', 'correction'].includes(original.kind)
+    const text = original.text.replace(/\{\{ticket:([a-z]+)\}\}/g, (_match, task: FixtureTask) => currentTaskOwner(task) ?? `unresolved-${task}`)
     return { id: `evaluation-${original.id}`, source, actor: { source, id: source === 'ci' ? '' : source === 'qq' ? '12345' : 'owner' },
       human: source !== 'ci', ...source !== 'ci' && original.kind !== 'noise' && original.kind !== 'observation' ? { addressed: 'direct' as const } : {},
       ...source !== 'ci' && !subscription ? { routing: 'router' as const } : {},
-      threads: [{ source: source === 'qq' ? 'qq' : 'evaluation', id: original.thread }], text: original.text, at: now(),
+      threads: [{ source: source === 'qq' ? 'qq' : 'evaluation', id: original.thread }], text, at: now(),
       channel: { source: source === 'qq' ? 'qq' : 'evaluation', thread: `${source === 'qq' ? 'qq' : 'evaluation'}:${original.thread}`, address: { fixture: original.thread } },
-      meta: { ...original.control ? { action: original.control, ...original.target && logical.get(original.target) ? { targetTicketId: logical.get(original.target)! } : {} } : {},
+      meta: { ...original.control ? { action: original.control, ...original.target && currentTaskOwner(original.target) ? { targetTicketId: currentTaskOwner(original.target)! } : {} } : {},
+        ...original.referenceTask && currentTaskOwner(original.referenceTask) ? { referencedTicketId: currentTaskOwner(original.referenceTask) } : {},
         ...source === 'qq' ? { observation: { groupId: '23456', windowId: original.thread } } : {} } }
   }
   const oracle = (event: ReplayFixture): EvaluationRoute => ({ kind: event.expected.kind === 'duplicate' ? 'ignore' : event.expected.kind,
-    ...event.expected.target && logical.get(event.expected.target) ? { ticketId: logical.get(event.expected.target)! } : {}, title: event.task ?? event.text.slice(0, 80) })
+    ...event.expected.target && currentTaskOwner(event.expected.target) ? { ticketId: currentTaskOwner(event.expected.target)! } : {}, title: event.task ?? event.text.slice(0, 80) })
   try {
     for (const event of replayFixtures) {
-      const before = performance.now(), trigger = triggerFor(event), expectedTarget = event.expected.target && logical.get(event.expected.target)
+      const before = performance.now(), trigger = triggerFor(event), expectedTarget = event.expected.target && currentTaskOwner(event.expected.target)
       let path = 'router', actual = 'ignore', target: string | undefined
       try {
         const direct = (mode === 'structured-fast-path' || mode === 'subscription-fast-path') && !!event.control && !!expectedTarget
@@ -133,13 +181,14 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
             let decision = oracle(event)
             if (options.provider) {
               try {
-                const response = await options.provider.route({ trigger, tickets: store.tickets.list().map(ticket => {
+                const input = { trigger, tickets: store.tickets.list().map(ticket => {
                   const origin = store.triggers.get(ticket.origin.triggerId)
                   return { id: ticket.id, title: ticket.title, ended: !liveTicket(ticket), sourceText: origin?.text ?? '',
                     ...(origin ? { source: origin.source, threads: origin.threads } : {}) }
-                }) })
+                }), ...routerPrompt ? { routerPrompt } : {} }
+                const response = await invoke('route', input, () => options.provider!.route(input))
                 decision = response.decision; usage(`route:${event.id}`, response.usage)
-              } catch (error) { usage(`route:${event.id}`); throw error }
+              } catch (error) { usage(`route:${event.id}`, error instanceof EvaluationProviderError ? error.trace.usage : undefined); throw error }
             }
             actual = decision.kind; target = decision.ticketId
             if (decision.kind === 'accept') {
@@ -219,8 +268,9 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
             ...task === 'waiting' ? ['external.txt'] : [], ...task === 'reproduction' ? ['observed-runtime.json'] : []]
             .map(async name => ({ name, content: await readFile(join(taskDirectory, name), 'utf8') })))
           let response: Awaited<ReturnType<NonNullable<EvaluationProvider['executeTask']>>>
-          try { response = await options.provider.executeTask({ ...definition, instruction: requirements.join('\n'), existingFiles }); usage(`task:${task}`, response.usage, ticketId) }
-          catch (error) { usage(`task:${task}`, undefined, ticketId); throw error }
+          const input = { ...definition, instruction: requirements.join('\n'), existingFiles }
+          try { response = await invoke('execute_fixture', input, () => options.provider!.executeTask!(input)); usage(`task:${task}`, response.usage, ticketId) }
+          catch (error) { usage(`task:${task}`, error instanceof EvaluationProviderError ? error.trace.usage : undefined, ticketId); throw error }
           const names = new Set<string>()
           for (const file of response.files) {
             if (!definition.outputNames.includes(file.name) || names.has(file.name)) throw new Error('Provider returned an unrequested or duplicate output name')
@@ -255,7 +305,7 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
     const jobs = [...queued], concurrency = mode === 'single-worker' ? 1 : 2
     for (let offset = 0; offset < jobs.length; offset += concurrency) await Promise.all(jobs.slice(offset, offset + concurrency).map(execute))
     for (const task of ['summary', 'recovery', 'reproduction', 'waiting'] as const) if (!resultTasks.some(row => row.task === task)) failures.push({ task, reason: 'Required fixture task did not produce a verified result.' })
-    const stoppedId = logical.get('stopped')
+    const stoppedId = currentTaskOwner('stopped')
     if (!stoppedId || store.tickets.get(stoppedId)?.ended?.outcome !== 'stopped') failures.push({ task: 'stopped', reason: 'Explicit stop did not end the fixture task.' })
     const unsettled = store.threads.active().filter(thread => thread.pending.length || thread.evaluating)
     if (unsettled.length) failures.push({ reason: `Replay left unsettled routing work: ${unsettled.map(thread => thread.key).join(', ')}.` })
@@ -263,20 +313,31 @@ export async function runAutonomyEvaluation(options: AutonomyEvaluationOptions):
     try { await access(join(directory, 'tasks', 'stopped', 'filtered.json')); stoppedOutput = true } catch { /* Absence is the expected physical cancellation outcome. */ }
     if (stoppedOutput) failures.push({ task: 'stopped', reason: 'The cancelled task left an unexpected output file.' })
     ledger.record({ id: 'stopped-side-effect', kind: 'side_effect', ...stoppedId ? { ticketId: stoppedId } : {}, data: { count: stoppedOutput ? 1 : 0, expectedCount: 0 } })
-    const gitRevision = options.gitRevision ?? null, config = { mode, concurrency, provider: options.provider?.name ?? null, model: options.provider?.model ?? null, taskSet: AUTONOMY_TASK_SET_VERSION, buildHash: options.buildHash ?? null }
+    const gitRevision = options.gitRevision ?? null, config = { mode, concurrency, provider: options.provider?.name ?? null, model: options.provider?.model ?? null,
+      taskSet: AUTONOMY_TASK_SET_VERSION, buildHash: options.buildHash ?? null, promptProfile, promptHash: routerPrompt?.sha256 ?? null }
     const result: AutonomyEvaluationResult = { schema: 1, runId, startedAt, finishedAt: now(), taskSetVersion: AUTONOMY_TASK_SET_VERSION,
       gitRevision, mode, configHash: sha(JSON.stringify(config)), buildHash: options.buildHash ?? null, model: options.provider ? { provider: options.provider.name, model: options.provider.model ?? null } : null,
       routingPolicy: options.provider ? 'provider' : 'fixture-oracle', executionPolicy: options.provider?.executeTask ? 'provider-files' : 'fixture-programs',
+      promptProfile, promptHash: routerPrompt?.sha256 ?? null, replicate,
       interpretation: ['Protocol replay uses the real Engine and SQLite. Fixture-oracle routing measures protocol behavior only.',
         'Subprocess tasks read and create actual files; fixture-program execution does not measure model coding ability.',
         'Provider routes receive original text and current ticket context with expected answers withheld.',
+        'Repository/personal profiles compose the bundled production Router prompt and isolated fixture policy, then adapt decisions through JSON; complete DSH Session/tool behavior is measured separately.',
+        'Exact provider inputs, outputs, schema failures, allowed null normalization and available usage are retained in provider-traces.json.',
         'Reproduction runs Node.js JSON.parse on the host before provider file generation; the provider organizes actual observed-runtime.json evidence.',
         'Wall-clock latency covers this local run; human adoption and unavailable provider usage remain unknown.',
         'Completion publication is verified against isolated local outbox receipts; no external user channel is contacted.',
         'Recovery timing covers a real failed command and SQLite/Engine reopen, with its persisted checkpoint inspected.',
+        'Routing replay completes before any worker concurrency is applied. single-worker and router-first use the same routing path; differences between independent calls do not establish a concurrency effect.',
         'single-worker serializes execution; the other modes allow two fixture subprocesses and do not emulate a complete LLM Session.'],
       summary: ledger.summary(), failures, routes, tasks: resultTasks.sort((a, b) => a.task.localeCompare(b.task)),
-      output: { database, result: join(directory, 'result.json'), events: join(directory, 'events.json') } }
+      requestOutcomes: (['summary', 'stopped', 'recovery', 'reproduction', 'waiting'] as const).map(task => {
+        const original = originalTaskTrigger(task)!, triggerId = `evaluation-${original.id}`, request = engine.requestResponsibility(triggerId)
+        return { task, triggerId, state: request?.state ?? 'missing', ownerTicketIds: request?.owners.filter(owner => owner.state !== 'cancelled').map(owner => owner.ticketId) ?? [] }
+      }),
+      output: { database, result: join(directory, 'result.json'), events: join(directory, 'events.json'), traces: join(directory, 'provider-traces.json'),
+        ...routerPrompt ? { prompt: join(directory, 'router-prompt.json') } : {} } }
+    await writeFile(result.output.traces, JSON.stringify(options.provider?.traces ? options.provider.traces().slice(providerTraceOffset) : traces, null, 2), { mode: 0o600 })
     await writeFile(result.output.events, JSON.stringify(ledger.events(), null, 2)); await writeFile(result.output.result, JSON.stringify(result, null, 2))
     return result
   } finally { store.close() }

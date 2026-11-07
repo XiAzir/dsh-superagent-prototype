@@ -81,6 +81,8 @@ Owner 可通过 `PUT /orchestrator/api/tickets/:id/acceptance` 整理逐项条�
 
 ## 验证入口
 
+同批受理的每条人类消息各自形成来源条件。请求退回或转交后，旧工单解除对应条件，独立验收排除其历史原文；来源约束拒绝重新添加已释放责任。试接请求完成 claim 或退回后进入正常验收；空转交旧工单的结果退出发布。参见[路由恢复](routing-recovery.md)。
+
 `tests/verification.spec.ts` 覆盖模式、真实交付物、条件来源、故障、修正和在途重验竞态。`tests/execution-evidence.spec.ts` 覆盖 Assignment/turn 归属、旧执行结果晚到及持久投影复用。`tests/autonomy-integration.spec.ts` 通过实际 Runtime/HTTP/Outbox 检查接线，`tests/panel-verification.spec.tsx` 检查状态、依据和重试控制。
 
 独立模型质量、实际项目交付质量与真实费用通过[自主性评估](autonomy-evaluation.md)的 provider 运行及真实任务账本继续衡量。当前统一全量验证与 v2 基线由本分支最终验收记录更新。

@@ -26,6 +26,11 @@ type Delivery = 'injected' | 'pending'
 export interface CollaborationMessageBody { text: string; requestId: string; recipient?: string; router?: boolean; mentions?: string[]; attachmentIds?: string[] }
 
 export interface Api extends PersonalApi {
+  'GET tickets/:id/requests': { query?: Paged; response: { items: import('./request-views.ts').RequestView[]; next_offset: number | null } }
+  'GET routing-review/config': { response: import('./request-review.ts').RequestReviewConfig }
+  'PUT routing-review/config': { body: import('./request-review.ts').RequestReviewConfig; response: import('./request-review.ts').RequestReviewConfig }
+  'GET routing-review/history': { query?: { triggerId?: string; limit?: number }; response: import('./request-review.ts').RequestReview[] }
+  'POST triggers/:id/review': { body: { requestId: string }; response: { reviewId: string | null } }
   'GET environments': { response: { items: ReturnType<import('../remote/client.ts').RemoteEnvironments['list']> } }
   'POST environments': { body: import('../remote/client.ts').RemoteDeviceConfig; response: { registered: true } }
   'POST environments/:id/probe': { response: ReturnType<import('../remote/client.ts').RemoteEnvironments['list']>[number] }

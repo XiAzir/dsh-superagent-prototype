@@ -191,7 +191,10 @@ async function drive(host: Host) {
   await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'It reads the config.', human_action: null, reply_to_trigger_id: request.id })
   const other = feishu('9', '@bot 顺便看看这个')
   await runtime.receive(other)
-  await run(master, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: a, trigger_id: other.id }] })
+  await run(master, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: a, trigger_id: other.id,
+    reason: 'The source refers to the same configured page.', evidence_refs: [`trigger/${request.id}`] }] })
+  await run(workerA, 'orchestrator_request_claim', { trigger_id: other.id,
+    expected_revision: runtime.engine.requestResponsibility(other.id)!.revision, reason: 'The original source identifies this page.' })
   await run(workerA, 'orchestrator_thread_unrelated', { thread: `feishu:${CHAT}:om_9`, reason: 'It asks for something else.' })
   await run(workerA, 'orchestrator_thread_follow', { thread: `feishu:${CHAT}:om_7`, reason: 'The same settings page.' })
   await runtime.receive(feishu('7', '@bot 这个页面的按钮也改一下'))
@@ -357,6 +360,7 @@ function failures(): Map<string, string> {
 
 it('collects both roles\' tools, prompts, skills and inputs', () => {
   expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_followup_cancel', 'orchestrator_read', 'orchestrator_report',
+    'orchestrator_request_claim', 'orchestrator_request_transfer',
     'orchestrator_thread_follow', 'orchestrator_thread_publish',
     'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))

@@ -14,12 +14,21 @@ export function remoteTools(remote: RemoteEnvironments, ticketId: string): Tool[
   const device = () => remote.assertBinding(ticketId)
   return [
     tool({ name: 'orchestrator_environment', description: 'Read this ticket’s bound execution device and remote working directory. Device-offline waits retain this ticket.',
-      schema: z.object({}).strict(), execute: async () => guarded(async () => ({ device: remote.list().find(item => item.id === device()), ...await remote.workspace(ticketId) })) }),
-    tool({ name: 'orchestrator_environment_start', description: 'Start a shell command on the bound remote device. Reuse request_id only to recover the same operation. Paths are relative to this ticket’s remote directory. Query command_id after a lost response; unknown operations require inspecting preserved state before any new action.',
+      schema: z.object({}).strict(), execute: async () => guarded(async () => {
+        const rank = (state: string) => state === 'unknown' ? 0 : ['queued', 'waiting_environment', 'accepted', 'running'].includes(state) ? 1 : 2
+        const commands = remote.commands(ticketId).sort((a, b) => rank(a.effectiveState) - rank(b.effectiveState)
+          || b.updatedAt.localeCompare(a.updatedAt) || a.commandId.localeCompare(b.commandId))
+        return { device: remote.list().find(item => item.id === device()), ...await remote.workspace(ticketId), command_count: commands.length,
+          commands: commands.slice(0, 8).map(command => ({ commandId: command.commandId, requestId: command.requestId,
+            requestTriggerId: command.requestTriggerId ?? null, originalTicketId: command.ticketId, state: command.effectiveState })) }
+      }) }),
+    tool({ name: 'orchestrator_environment_start', description: 'Start a shell command on the bound remote device. Keep request_id for the same operation across request transfers. source_request_id selects a claimed original request when this ticket owns several. Paths use the first execution ticket’s directory on a retry. Query command_id after a lost response; inspect unknown outcomes before new work.',
       schema: z.object({ request_id: z.string().min(1).max(200), command: z.string().min(1).max(64000),
+        source_request_id: z.string().min(1).max(200).optional(),
         cwd: z.string().max(1024).optional().describe('Task-relative directory; omit for the task root.'),
         timeout_ms: z.number().int().min(100).max(86_400_000).optional() }).strict(),
-      execute: async args => guarded(() => remote.start(device(), ticketId, { requestId: args.request_id, command: args.command, cwd: args.cwd, timeoutMs: args.timeout_ms })) }),
+      execute: async args => guarded(() => remote.start(device(), ticketId, { requestId: args.request_id, requestTriggerId: args.source_request_id,
+        command: args.command, cwd: args.cwd, timeoutMs: args.timeout_ms })) }),
     tool({ name: 'orchestrator_environment_status', description: 'Read a durable remote command result, including output. Reconnect by querying the same command_id; preserve unknown outcomes.',
       schema: z.object({ command_id: z.string().min(1).max(200) }).strict(), execute: async args => guarded(() => remote.status(ticketId, args.command_id)) }),
     tool({ name: 'orchestrator_environment_cancel', description: 'Cancel a remote command. Offline cancellation is durable and is applied after reconnect, before any queued start.',

@@ -13,7 +13,7 @@ import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, b
 import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
-import { UserError, type Engine, type EngineForPeople, type Ticket } from '../core/index.ts'
+import { UserError, requestIds, type Engine, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { workerSessionId, type DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
@@ -45,6 +45,7 @@ import { ActionConflict, ActionAuthorizationError } from './personal-actions.ts'
 import { AttentionConflict } from './personal-attention.ts'
 import { MAX_WEB_IMAGE_BODY_BYTES, WebAttachmentStore, WebImageError } from './web-attachments.ts'
 import { EnvironmentError } from '../remote/protocol.ts'
+import { ticketRequestViews } from './request-views.ts'
 
 export interface HttpHost {
   runtimeManifest?(): ReturnType<typeof import('./runtime-manifest.ts').runtimeManifestState>
@@ -52,6 +53,7 @@ export interface HttpHost {
   readonly remote?: import('../remote/client.ts').RemoteEnvironments
   readonly supervision?: import('./supervision.ts').SupervisionService
   readonly verification?: import('./verification.ts').VerificationService
+  readonly requestReview?: import('./request-review.ts').RequestReviewService
   readonly personal?: PersonalCoordinator
   readonly personalRuntime?: PersonalRuntime
   readonly qq?: QqBridge | undefined
@@ -88,7 +90,7 @@ export interface HttpHost {
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404 | 503, message: string) { super(message) } }
+class RouteError extends Error { constructor(readonly status: 400 | 404 | 409 | 503, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -231,7 +233,7 @@ function routes(runtime: HttpHost): Routes {
     },
     'GET tickets/:id/environment': ({ params }) => {
       const id = ticket(params.id)
-      return { deviceId: runtime.remote?.binding(id) ?? null, commands: runtime.remote?.commands(id) ?? [] }
+      return { deviceId: runtime.remote?.binding(id) ?? null, commands: runtime.remote?.ownerCommands(id, requestIds(store.tickets.get(id)!)) ?? [] }
     },
     'PUT tickets/:id/environment': async ({ params, body }) => {
       if (!runtime.remote || !runtime.engine.holdTicket || !runtime.engine.releaseTicket) throw new RouteError(503, 'Remote environment binding is unavailable')
@@ -255,12 +257,29 @@ function routes(runtime: HttpHost): Routes {
       if (!runtime.remote) throw new RouteError(503, 'Remote environments are unavailable')
       const value = z.object({ outcome: z.enum(['completed', 'failed', 'cancelled']), evidence: z.string().trim().min(1).max(2000),
         expectedUpdatedAt: z.string().optional() }).strict().parse(await body())
-      const result = runtime.remote.resolveUnknown(ticket(params.id), params.commandId, value)
+      const id = ticket(params.id), result = runtime.remote.resolveUnknown(id, params.commandId, value, requestIds(store.tickets.get(id)!))
       runtime.requestPass(); return result
     },
     'GET evaluation/summary': () => {
       if (!runtime.evaluation) throw new RouteError(503, 'Evaluation records are unavailable')
       return runtime.evaluation.summary()
+    },
+    'GET routing-review/config': () => {
+      if (!runtime.requestReview) throw new RouteError(503, 'Request coverage review is unavailable')
+      return runtime.requestReview.config()
+    },
+    'PUT routing-review/config': async ({ body }) => {
+      if (!runtime.requestReview) throw new RouteError(503, 'Request coverage review is unavailable')
+      return runtime.requestReview.config(await body())
+    },
+    'GET routing-review/history': ({ query }) => runtime.requestReview?.history({ triggerId: query.triggerId,
+      limit: Number(query.limit) || 30 }) ?? [],
+    'POST triggers/:id/review': async ({ params, body }) => {
+      if (!runtime.requestReview) throw new RouteError(503, 'Request coverage review is unavailable')
+      const value = z.object({ requestId: z.string().trim().min(1).max(200) }).strict().parse(await body())
+      if (!store.triggers.get(params.id)) throw new RouteError(404, 'Request source was not found')
+      const reviewId = runtime.requestReview.submit(params.id, value.requestId)
+      runtime.requestPass(); return { reviewId: reviewId ?? null }
     },
     'POST tickets/:id/feedback': async ({ params, body }) => {
       if (!runtime.evaluation) throw new RouteError(503, 'Evaluation records are unavailable')
@@ -290,10 +309,20 @@ function routes(runtime: HttpHost): Routes {
       return { acceptance: value.acceptance ?? null, verification: value.verification ?? null,
         history: [] }
     },
+    'GET tickets/:id/requests': ({ params, query }) => {
+      const page = z.object({ offset, limit: limit(20, 50) }).parse(query)
+      return ticketRequestViews(store, store.tickets.get(ticket(params.id))!, page.offset, page.limit)
+    },
     'PUT tickets/:id/acceptance': async ({ params, body }) => {
       if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')
       const value = z.object({ expectedRevision: z.number().int().min(0), criteria: z.array(z.unknown()).min(1).max(30) }).strict().parse(await body())
-      return { acceptance: runtime.verification.setCriteria(ticket(params.id), value.expectedRevision, value.criteria).acceptance! }
+      const id = ticket(params.id), current = store.tickets.get(id)!
+      if (current.ended) throw new RouteError(400, 'Acceptance criteria require a live task')
+      if ((current.acceptance?.revision ?? 0) !== value.expectedRevision) throw new RouteError(409, 'Acceptance revision changed')
+      const released = new Set(current.requests?.filter(item => item.state === 'released').map(item => `trigger/${item.triggerId}`) ?? [])
+      if (value.criteria.some(item => item && typeof item === 'object' && 'sourceRefs' in item && Array.isArray(item.sourceRefs)
+        && item.sourceRefs.some((ref: unknown) => typeof ref === 'string' && released.has(ref)))) throw new RouteError(400, 'The cited request has been handed to another task')
+      return { acceptance: runtime.verification.setCriteria(id, value.expectedRevision, value.criteria).acceptance! }
     },
     'POST tickets/:id/verify': async ({ params, body }) => {
       if (!runtime.verification) throw new RouteError(503, 'Independent verification is unavailable')

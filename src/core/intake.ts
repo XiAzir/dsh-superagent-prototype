@@ -44,7 +44,7 @@ export class Intake extends EnginePart {
         // threads when it resumes), and a human-stopped ticket receives nothing because its Mandate was withdrawn.
         const followed = !!thread.context?.includes(ticketId)
         const resumes = trigger.human && ticket?.ended?.by !== 'human' && !followed
-        if (!ticket || (!routerFirst && !liveTicket(ticket) && !resumes)) continue
+        if (!ticket || ticket.requestRedirect || (!routerFirst && !liveTicket(ticket) && !resumes)) continue
         reached.set(ticketId, { ticket, context: followed && (reached.get(ticketId)?.context ?? true) })
       }
       this.repo.threads.save(thread)

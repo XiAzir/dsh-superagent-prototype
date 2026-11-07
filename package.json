@@ -30,6 +30,8 @@
     "docs/memory.md",
     "docs/qq-observation-routing.md",
     "docs/autonomy-evaluation.md",
+    "docs/routing-recovery.md",
+    "docs/routing-recovery-acceptance-20261107.md",
     "docs/remote-environments.md",
     "docs/runtime-operations.md",
     "docs/result-verification.md",

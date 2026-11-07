@@ -370,7 +370,11 @@ export class DshExecutor implements Executor {
     if (!trigger) return undefined
     const parent = this.host.repliedTo(trigger)
     const seen = parent && (parent.id === ticket.origin.triggerId || ticket.inputs.some(item => item.kind === 'trigger' && item.triggerId === parent.id))
-    return triggerMessage(trigger, await this.host.sourceLink(trigger), note, seen ? undefined : parent)
+    const responsibility = this.host.store.triggers.disposition?.(triggerId)?.request
+    return { ...triggerMessage(trigger, await this.host.sourceLink(trigger), note, seen ? undefined : parent),
+      ...responsibility ? { request: { request_id: responsibility.id, revision: responsibility.revision, state: responsibility.state,
+        provisional: ticket.requests?.some(item => item.triggerId === triggerId && item.state === 'proposed') ?? false,
+        read: `trigger/${triggerId}/request` } } : {} }
   }
   /**
    * After the ending transaction commits (so a rollback leaves the worker working, and a launch the same transaction queued

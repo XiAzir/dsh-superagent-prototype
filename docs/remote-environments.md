@@ -128,6 +128,8 @@ The backup uses SQLite `VACUUM INTO` and requires a fresh destination. Keep the 
 
 ## Test entry points
 
+Original-request operations retain the first command ID, daemon ticket, payload and directory through transfers. Reuse the same operation `request_id`; when the successor owns several requests, select its claimed `source_request_id`. Inspect inherited unknown outcomes before new writes. Ending the released source preserves these operations; stopping the current owner cancels inherited running operations. Schema-13 live task ownership is reconstructed from existing messages. A legacy task-scoped operation with the same ID yields `legacy_operation_scope` and its original command ID for inspection. See [routing recovery](routing-recovery.md).
+
 `tests/remote-environments.spec.ts` executes real local HTTP and independent daemon processes. It covers lost start responses, same-ID conflict protection, host-state reconstruction, offline cancellation, reconnect, actual command cancellation, binary transfer, SHA checks, path/junction rejection, token redaction, daemon crash and manual unknown resolution. Additional tests cover device identity changes, corrupted file responses, model tools and self-check/backup.
 
 Tests use temporary workspaces and credentials, loopback listeners and bounded commands. Existing user profiles and devices are unaffected.

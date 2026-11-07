@@ -124,7 +124,9 @@ function feishu(id: string, text: string, overrides: Record<string, unknown> = {
 const worktreeName = 'fix-regression'
 /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
 async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
+  const target = item.kind === 'attach' && typeof item.ticket_id === 'string' ? runtime.store.tickets.get(item.ticket_id) : undefined
+  const supplied = target ? { reason: 'The original request continues this target task.', evidence_refs: [`trigger/${target.origin.triggerId}`], ...item } : item
+  const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [supplied] }) as { results: Record<string, unknown>[] }
   if (results[0]!.refused) throw new Error(String(results[0]!.refused))
   return results[0]!
 }
@@ -507,9 +509,12 @@ it('attaches an event to an existing open task through orchestrator_route', asyn
   await receive(other)
   deliveries.mockClear()
   expect(await route({ kind: 'attach', ticket_id: ticket.id, trigger_id: other.id, note: '同一个页面' })).toMatchObject({ ticket: { ticket_id: ticket.id } })
-  expect(runtime.store.threads.get(`feishu:${CHAT}:om_9`)?.subscriptions).toEqual([ticket.id])
+  expect(runtime.store.threads.get(`feishu:${CHAT}:om_9`)?.subscriptions).toEqual([])
   expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_9`)).toEqual([expect.objectContaining({ kind: 'ignore', reason: [{ code: 'routed', values: { ticket: ticket.id } }] })])
   expect(relays(sessionId)[0]).toMatchObject({ trigger_id: other.id, text: '@bot 顺手把这里也改了', routing_note: '同一个页面' })
+  await runTool(sessionId, 'orchestrator_request_claim', { trigger_id: other.id,
+    expected_revision: runtime.engine.requestResponsibility(other.id)!.revision, reason: 'The original source names the same page.' })
+  expect(runtime.store.threads.get(`feishu:${CHAT}:om_9`)?.subscriptions).toEqual([ticket.id])
 })
 
 it('acknowledges a follow-up from the worker once and rejects events outside the task', async () => {

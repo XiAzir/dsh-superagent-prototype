@@ -51,6 +51,8 @@ export interface Trigger {
 
 /** Where a trigger went after intake; it grants nothing, but decides who decides a person's follow-up (see `followupOwners`). */
 export interface TriggerDisposition {
+  /** Durable responsibility for the original human request, independent of a temporary ticket owner. */
+  request?: import('./requests.ts').RequestResponsibility
   /** Router-first conversations stay pending until explicitly attached as work or answered without worker delivery. */
   routing?: 'pending' | 'worker' | 'handled'
   /** An explicitly addressed human trigger delivered only to this ticket. */
@@ -71,7 +73,7 @@ export interface TriggerDisposition {
   /** A person, or the main Session for a message no ticket decides, sent it to Eval again; a hand-back does not set it. */
   requeued?: true
   /** The tickets whose Executor handed it back as beyond the ticket, each once, with why; it goes to Eval once none decides it. */
-  handbacks?: { ticketId: string; reason: string; at: string }[]
+  handbacks?: { ticketId: string; reason: string; at: string; queued?: boolean }[]
   /** The tickets whose Executor acknowledged it or answered it, taking it up as within the ticket. */
   acked?: string[]
   at: string
@@ -269,6 +271,10 @@ export interface Assignment {
 export type TicketInput =
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
   | { id: string; kind: 'trigger'; triggerId: string; at: string; note?: string; human?: true
+    /** A trial delivery has no persistent thread subscription until explicitly claimed. */
+    provisional?: true
+    /** The input remains historical context after its request responsibility was returned or transferred. */
+    requestReleased?: true
     /** It reached the ticket only on a Thread its Executor follows for context. */
     context?: true
     /**
@@ -309,6 +315,10 @@ export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'sto
 export interface Attention { id: string; question: string; triggerId?: string }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
+  /** Current and released original-request bindings; request IDs survive ticket transfers. */
+  requests?: import('./requests.ts').TicketRequestBinding[]
+  /** An empty duplicate/incorrect ticket handed all its work back; old results are revoked. */
+  requestRedirect?: { triggerId: string; toTicketId?: string; at: string; reason: string }
   /** A resumable resource/environment pause preserves the original mandate and task history. */
   hold?: { kind: 'budget' | 'environment' | 'operator'; reason: string; at: string; resumeAt?: string }
   /** New tickets may opt into independent evidence review; older tickets retain their lifecycle. */
@@ -369,6 +379,7 @@ export const runningAssignment = (ticket: Ticket): Assignment | undefined => tic
  * to; with `context` false, not a Thread the ticket follows only for context, where its worker may read but not write.
  */
 export function reached(ticket: Ticket, trigger: Trigger, thread: (key: string) => Thread | undefined, context = true): boolean {
+  if (!context && ticket.requests?.some(item => item.triggerId === trigger.id && ['released', 'cancelled'].includes(item.state))) return false
   if (ticket.origin.triggerId === trigger.id) return true
   const input = ticket.inputs.some(item => item.kind === 'trigger' && item.triggerId === trigger.id)
   return trigger.threads.some(ref => {

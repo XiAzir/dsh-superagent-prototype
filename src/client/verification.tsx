@@ -7,6 +7,7 @@ import { Button, Icon } from './controls.tsx'
 import { usePanel } from './provider.tsx'
 import { errorText, when, type T } from './text.ts'
 import CSS from './verification.css?raw'
+import { RequestRecoverySettings } from './requests.tsx'
 
 export const VERIFICATION_CSS = CSS
 type View = ApiResponse<'GET tickets/:id/verification'>
@@ -124,7 +125,7 @@ export function VerificationSettings() {
           {[0, 1, 2, 3].map(value => <option key={value} value={value}>{value}</option>)}</select></div>
       <Button variant="outline" size="sm" disabled={busy} onClick={() => { void save() }}>{t(busy ? 'verification.saving' : 'save')}</Button>
     </fieldset>{notice && <p role="status">{notice}</p>}{failure && <p className="dt-error" role="alert">{failure}</p>}</>}
-  </section><SupervisionSettings call={call} t={t} /></>
+  </section><SupervisionSettings call={call} t={t} /><RequestRecoverySettings /></>
 }
 
 function SupervisionSettings({ call, t }: { call: Call; t: T }) {

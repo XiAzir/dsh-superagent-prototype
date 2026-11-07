@@ -12,14 +12,14 @@ import { VerificationService } from '../src/app/verification.ts'
 const cleanup: (() => void | Promise<void>)[] = []
 afterEach(async () => { for (const done of cleanup.splice(0).reverse()) await done() })
 type Model = (input: string, signal?: AbortSignal) => Promise<{ text: string }>
-function fixture(model: Model, mode: 'observe' | 'enforce' = 'enforce') {
+function fixture(model: Model, mode: 'observe' | 'enforce' = 'enforce', routing = false, batch = false) {
   const directory = mkdtempSync(join(tmpdir(), 'acceptance-')), db = join(directory, 'state.sqlite')
   const store = new Store(db), effects = new Effects(store, new HealthBoard()), artifacts = new ArtifactRegistry(store, directory)
   const controller = new AbortController(), relay = vi.fn(), stop = vi.fn(), notes = vi.fn()
   const policy: Policy = { version: 'test', paused: false, evalTimeoutMs: 60_000, revalidate: () => true,
     admitsInferred: () => true, gate: () => ({ admissible: true, strength: 'explicit', basis: { via: 'listed' } }) }
   let service: VerificationService, clock = Date.parse('2026-11-07T00:00:00Z')
-  const engine: Engine = new Engine({ repo: store, scope: { scope: () => ({ listened: true, observed: false }) }, policy: () => policy,
+  const engine: Engine = new Engine({ repo: store, provisionalRouting: routing, scope: { scope: () => ({ listened: true, observed: false }) }, policy: () => policy,
     assessor: { request() {} }, executor: { start: (ticket, assignment) => engine.assignmentStarted(ticket.id, assignment.id), deliver: notes, stop },
     outbox: { send() {}, status: () => undefined, withdraw() {} }, now: () => new Date(clock++).toISOString(),
     prepareTicket: ticket => service.prepare({ ...ticket, execution: { name: ticket.id, directory: join(directory, ticket.id), assignment: 'Create the requested JSON result.' } }) })
@@ -30,7 +30,9 @@ function fixture(model: Model, mode: 'observe' | 'enforce' = 'enforce') {
   const trigger: Trigger = { id: 'request', source: 'web', threads: [{ source: 'web', id: 'conversation' }], actor: { source: 'web', id: 'owner' },
     human: true, addressed: 'direct', routing: 'router', at: new Date(clock++).toISOString(), text: 'Create result.json containing {"total":2}.',
     channel: { source: 'web', thread: 'web:conversation', address: {} }, meta: {} }
-  engine.receive(trigger); engine.evaluateDue()
+  engine.receive(trigger)
+  if (batch) engine.receive({ ...trigger, id: 'request-detail', at: new Date(clock++).toISOString(), text: 'Also preserve the input row order.' })
+  engine.evaluateDue()
   const decision = engine.decide(trigger.id, { kind: 'accept', title: 'JSON result', scope: trigger.text, reason: 'Explicit request', name: 'json-result' })
   const id = decision.ticketId!, ticket = () => store.tickets.get(id)!
   mkdirSync(ticket().execution!.directory, { recursive: true })
@@ -170,4 +172,33 @@ it('memory or remote-result corrections invalidate an in-flight review until the
   expect(h.service.view(h.id).verification).toBeNull()
   expect(h.service.history(h.id)[0]?.superseded).toBe(true)
   expect(h.ticket().ended).toBeUndefined()
+})
+
+it('captures every human source in an accepted origin batch as an independent acceptance criterion', async () => {
+  const model = vi.fn(async (input: string) => verdict(input)), h = fixture(model, 'enforce', true, true)
+  expect(h.ticket().origin.triggerIds).toEqual(['request', 'request-detail'])
+  expect(h.ticket().acceptance?.criteria.map(item => item.sourceRefs[0]).sort()).toEqual(['trigger/request', 'trigger/request-detail'])
+  const { updated } = await h.ready('{"total":2}')
+  h.service.enqueue(updated); await h.effects.idle('verification')
+  const input = JSON.parse(model.mock.calls[0]![0])
+  expect(input.evidence.filter((item: { kind: string }) => item.kind === 'source').map((item: { ref: string }) => item.ref).sort())
+    .toEqual(['trigger/request', 'trigger/request-detail'])
+  expect(h.ticket().verification?.checks).toHaveLength(2)
+})
+
+it('releases handed-back requirements from old verification evidence and rejects attempts to restore their criteria', async () => {
+  const model = vi.fn(async (input: string) => verdict(input)), h = fixture(model, 'enforce', true)
+  const original = h.store.triggers.get('request')!
+  const followup = { ...original, id: 'other-output', text: 'Generate a separate inventory.csv.', at: new Date().toISOString() }
+  h.engine.receive(followup); h.engine.evaluateDue(); h.engine.attach(h.id, followup.id)
+  expect(h.ticket().acceptance?.criteria.some(item => item.sourceRefs.includes('trigger/other-output'))).toBe(true)
+  h.engine.handback(h.id, followup.id, 'This output belongs to a separate request.', h.ticket().assignments.at(-1)!.id)
+  expect(h.ticket().acceptance?.criteria.map(item => item.sourceRefs)).toEqual([['trigger/request']])
+  expect(() => h.service.setCriteria(h.id, h.ticket().acceptance!.revision, [{ id: 'inventory', kind: 'artifact',
+    description: 'Create inventory.csv', sourceRefs: ['trigger/other-output'] }])).toThrow(/original human request/)
+  const { updated } = await h.ready('{"total":2}')
+  h.service.enqueue(updated); await h.effects.idle('verification')
+  expect(JSON.parse(model.mock.calls[0]![0]).evidence.map((item: { ref: string }) => item.ref)).not.toContain('trigger/other-output')
+  expect(h.ticket().verification?.state).toBe('passed')
+  expect(h.engine.requestResponsibility(followup.id)?.state).toBe('returned')
 })

@@ -3,11 +3,12 @@ import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
 import { Store } from '../src/app/store.ts'
 import { EvaluationLedger } from '../src/evaluation/ledger.ts'
-import { runAutonomyEvaluation } from '../src/evaluation/runner.ts'
+import { pairedEvaluationSchedule, runAutonomyEvaluation } from '../src/evaluation/runner.ts'
 import { AUTONOMY_TASK_SET_VERSION, replayFixtures } from '../src/evaluation/fixtures.ts'
-import { cliEvaluationProvider, type EvaluationProvider } from '../src/evaluation/provider.ts'
+import { cliEvaluationProvider, EvaluationProviderError, parseEvaluationRoute, type EvaluationProvider } from '../src/evaluation/provider.ts'
 
 const directories: string[] = []
 const temporary = () => { const path = mkdtempSync(join(tmpdir(), 'autonomy-evaluation-')); directories.push(path); return path }
@@ -69,7 +70,7 @@ it('runs real Engine and SQLite event replay with actual file generation, verifi
   const persisted = JSON.parse(await readFile(result.output.result, 'utf8'))
   expect(persisted.routingPolicy).toBe('fixture-oracle')
   expect(persisted.model).toBeNull()
-  expect(persisted.taskSetVersion).toBe('autonomy-fixtures-v3')
+  expect(persisted.taskSetVersion).toBe('autonomy-fixtures-v4')
 }, 20000)
 
 it('gives the provider public schemas, original source context and a real host JSON.parse observation before file generation', async () => {
@@ -106,6 +107,74 @@ it('gives the provider public schemas, original source context and a real host J
   expect(JSON.stringify(contexts)).not.toContain('"expected":')
   expect(result.summary.metrics.wrongRoutes).toBe(0)
 }, 20000)
+
+it('composes the production Router policy for a selected profile and retains exact provider inputs and outputs', async () => {
+  const directory = temporary(), provider = fileProvider(), route = provider.route
+  const inputs: Parameters<EvaluationProvider['route']>[0][] = []
+  provider.route = async input => { inputs.push(input); return route(input) }
+  const result = await runAutonomyEvaluation({ directory, mode: 'structured-fast-path', promptProfile: 'repository', provider })
+  expect(result.failures).toEqual([])
+  expect(result.promptProfile).toBe('repository')
+  const prompt = JSON.parse(await readFile(result.output.prompt!, 'utf8'))
+  expect(prompt.text).toContain('## Policy')
+  expect(prompt.text).toContain('orchestrator_route')
+  expect(prompt.sha256).toBe(createHash('sha256').update(prompt.text).digest('hex'))
+  expect(result.promptHash).toBe(prompt.sha256)
+  expect(inputs.every(input => input.routerPrompt?.text === prompt.text)).toBe(true)
+  const traces = JSON.parse(await readFile(result.output.traces, 'utf8')) as { task: string; input: unknown; inputSha256: string; output: string; state: string }[]
+  expect(traces.length).toBeGreaterThan(inputs.length)
+  expect(traces.every(trace => trace.state === 'valid' && trace.output)).toBe(true)
+  for (const trace of traces) expect(trace.inputSha256).toBe(createHash('sha256').update(JSON.stringify(trace.input)).digest('hex'))
+  const origin = replayFixtures.find(event => event.id === 'waiting-request')!
+  expect(origin.text).toContain('新建一项独立任务')
+  expect(origin.text).not.toContain('继续原工单')
+  const store = new Store(result.output.database)
+  const followup = store.triggers.get('evaluation-waiting-continuation')!
+  const waiting = store.tickets.list().find(ticket => ticket.origin.triggerId === 'evaluation-waiting-request')!
+  expect(followup.text).toContain(waiting.id)
+  expect(followup.text).not.toContain('{{ticket:')
+  store.close()
+  expect(result.interpretation.join(' ')).toContain('Routing replay completes before any worker concurrency')
+}, 20000)
+
+it('pairs repeated modes on the same workload, rotates order and keeps a finite repeat limit', () => {
+  const modes = ['router-first', 'single-worker'] as const
+  expect(pairedEvaluationSchedule([...modes], 2)).toEqual([
+    { replicate: 1, mode: 'router-first' }, { replicate: 1, mode: 'single-worker' },
+    { replicate: 2, mode: 'single-worker' }, { replicate: 2, mode: 'router-first' },
+  ])
+  for (const repeats of [0, 21, 1.5]) expect(() => pairedEvaluationSchedule([...modes], repeats)).toThrow('1 to 20')
+})
+
+it('normalizes only semantically unused null route fields and rejects missing attachment targets', () => {
+  expect(parseEvaluationRoute({ decision: { kind: 'accept', ticketId: null, title: null } })).toEqual({
+    response: { decision: { kind: 'accept' } }, normalizations: [
+      'Omitted an unused null ticketId for accept/ignore.', 'Omitted an optional null title.',
+    ],
+  })
+  for (const kind of ['attach', 'stop', 'status']) {
+    expect(() => parseEvaluationRoute({ decision: { kind, ticketId: null } })).toThrow()
+    expect(() => parseEvaluationRoute({ decision: { kind } })).toThrow('real ticketId')
+  }
+})
+
+it('retains the exact invalid provider response and usage before schema validation rejects it', async () => {
+  const modelTrace = { input: { model: 'fixture', messages: [{ role: 'user', content: 'continue task' }] },
+    output: '```json\n{"decision":{"kind":"attach","ticketId":null}}\n```', model: 'fixture', finishReason: 'stop' }
+  const raw = JSON.stringify({ decision: { kind: 'attach', ticketId: null }, usage: { tokens: 23, cost: 0.02 }, evaluationTrace: modelTrace })
+  const provider = cliEvaluationProvider([process.execPath, '-e', `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(${JSON.stringify(raw)}))`],
+    { name: 'invalid-route-fixture', timeoutMs: 10000 })
+  const input = { trigger: { id: 'invalid-message', source: 'fixture', actor: { source: 'fixture', id: 'owner' }, human: true,
+    text: 'continue task', at: new Date().toISOString(), meta: {}, threads: [{ source: 'fixture', id: 'room' }] }, tickets: [] }
+  let failure: unknown
+  try { await provider.route(input) } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(EvaluationProviderError)
+  expect((failure as EvaluationProviderError).trace).toMatchObject({ state: 'invalid', output: raw, usage: { tokens: 23, cost: 0.02 }, provider: modelTrace })
+  expect(provider.traces?.()).toHaveLength(1)
+  const trace = provider.traces!()[0]!
+  expect(trace.outputSha256).toBe(createHash('sha256').update(raw).digest('hex'))
+  expect((trace.input as { context: unknown }).context).toEqual(input)
+})
 
 it.each([
   { list: '[\n 3,\n 5,\n 7\n]', passed: true },

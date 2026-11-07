@@ -1,5 +1,5 @@
 /** Fixed regression workloads. Expected routes are retained by the scorer and omitted from provider input. */
-export const AUTONOMY_TASK_SET_VERSION = 'autonomy-fixtures-v3'
+export const AUTONOMY_TASK_SET_VERSION = 'autonomy-fixtures-v4'
 export type FixtureTask = 'summary' | 'stopped' | 'recovery' | 'reproduction' | 'waiting'
 export interface ReplayFixture {
   id: string
@@ -8,6 +8,8 @@ export interface ReplayFixture {
   text: string
   task?: FixtureTask
   target?: FixtureTask
+  /** A public message reference is replaced with the actual accepted task ID before model delivery. */
+  referenceTask?: FixtureTask
   duplicateOf?: string
   control?: 'status' | 'stop' | 'supplement'
   expected: { kind: 'accept' | 'attach' | 'ignore' | 'status' | 'stop' | 'duplicate'; target?: FixtureTask }
@@ -22,7 +24,9 @@ export const replayFixtures: readonly ReplayFixture[] = [
   { id: 'summary-status', kind: 'status', thread: 'summary', text: '查看这项汇总任务的进度。', target: 'summary', control: 'status', expected: { kind: 'status', target: 'summary' } },
   { id: 'ci-summary', kind: 'ci', thread: 'summary', text: 'Fixture CI: input schema validation passed.', target: 'summary', expected: { kind: 'attach', target: 'summary' } },
   { id: 'recovery-request', kind: 'request', thread: 'recovery', text: '执行一次本地记账并生成 receipt.json（JSON 对象，operationId 字段为 "fixture-operation"，count 字段为该操作的记账次数，成功时应为 1）；遇到宿主重启时沿 effects.json 已有记录继续，保持同一操作只记一次。', task: 'recovery', expected: { kind: 'accept' } },
-  { id: 'waiting-request', kind: 'request', thread: 'waiting', text: '等待 external.txt 出现后读取其内容，生成 resumed.txt，继续原工单。', task: 'waiting', expected: { kind: 'accept' } },
+  { id: 'waiting-request', kind: 'request', thread: 'waiting', text: '新建一项独立任务：等待 external.txt 出现后读取其内容，生成 resumed.txt。等待期间保持这项任务，文件出现后在该任务内继续。', task: 'waiting', expected: { kind: 'accept' } },
+  { id: 'waiting-continuation', kind: 'followup', thread: 'waiting', text: '补充工单 {{ticket:waiting}}：external.txt 出现后，把观察到的完整内容写入 resumed.txt，继续该工单。',
+    target: 'waiting', referenceTask: 'waiting', control: 'supplement', expected: { kind: 'attach', target: 'waiting' } },
   { id: 'observation', kind: 'observation', thread: 'observation', text: '讨论反馈：Node.js JSON.parse 解析 {invalid-json} 时崩溃，可在独立目录复现，将实际错误名称和原始输入记录到 reproduction.txt。', task: 'reproduction', expected: { kind: 'accept' } },
   { id: 'stop-filter', kind: 'stop', thread: 'stopped', text: '停止筛选任务。', target: 'stopped', control: 'stop', expected: { kind: 'stop', target: 'stopped' } },
   { id: 'stopped-status', kind: 'status', thread: 'stopped', text: '查看已停止筛选任务的状态。', target: 'stopped', control: 'status', expected: { kind: 'status', target: 'stopped' } },

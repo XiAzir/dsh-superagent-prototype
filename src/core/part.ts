@@ -3,6 +3,7 @@ import { UserError } from './errors.ts'
 import { followupOwners, reached, threadKey } from './model.ts'
 import type { Thread, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Assessor, AssessmentOutcome, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
+import { bindRequest, releaseRequest, requestRoutingEnabled } from './requests.ts'
 
 export interface EngineOptions {
   repo: Repositories
@@ -16,6 +17,8 @@ export interface EngineOptions {
   now?: () => string
   /** Optional deployment switch; a disabled scheduler retains checks for a later explicit re-enable. */
   followupsEnabled?: () => boolean
+  /** Trial-deliver Router attachments across new threads before a Worker confirms their ownership. */
+  provisionalRouting?: boolean | (() => boolean)
   emit?: (event: DomainEvent) => void
 }
 
@@ -46,10 +49,35 @@ export abstract class EnginePart {
     const disposition = this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at: this.now() }
     const handbacks = [...disposition.handbacks ?? [], { ticketId, reason, at: this.now() }]
     this.repo.triggers.saveDisposition(trigger.id, { ...disposition, handbacks })
+    if (requestRoutingEnabled(this.options)) {
+      const ticket = this.require(ticketId)
+      releaseRequest(this.options, ticket, trigger.id, reason)
+      this.repo.tickets.save(ticket)
+    }
     return decided && !this.owners(trigger).length && this.queueForEval(trigger)
   }
   /** Record that a ticket's worker took a person's message up as within the ticket, by acknowledging or answering it. */
   protected takeUp(ticketId: string, triggerId: string): void {
+    if (requestRoutingEnabled(this.options)) {
+      const ticket = this.require(ticketId), trigger = this.repo.triggers.get(triggerId)
+      if (trigger && ticket.requests?.some(item => item.triggerId === triggerId && item.state === 'proposed')) {
+        const policy = this.policy(), thread = this.thread(trigger.threads[0]!)
+        if (ticket.ended || ticket.hold || policy.paused || !policy.revalidate(ticket.mandate)
+          || !this.options.scope.scope(trigger).listened || !policy.gate(trigger, thread, [ticket]).admissible
+          || trigger.source === 'qq' && !!trigger.meta.observation && !policy.observedRouting)
+          throw new UserError('notAdmissible', { reason: 'Original request authority changed before internal confirmation' })
+        bindRequest(this.options, ticket, trigger, false)
+        for (const input of ticket.inputs) if (input.kind === 'trigger' && input.triggerId === triggerId) delete input.provisional
+        for (const ref of trigger.threads) {
+          const thread = this.thread(ref)
+          if (!thread.subscriptions.includes(ticket.id)) {
+            thread.subscriptions.push(ticket.id); this.repo.threads.save(thread)
+            this.emit('thread.subscribed', { threadKey: thread.key, ticketId })
+          }
+        }
+        this.repo.tickets.save(ticket)
+      }
+    }
     const disposition = this.repo.triggers.disposition(triggerId)
     if (disposition && !disposition.acked?.includes(ticketId)) {
       this.repo.triggers.saveDisposition(triggerId, { ...disposition, acked: [...disposition.acked ?? [], ticketId] })

@@ -1,6 +1,7 @@
 /** Reusable proactive-agent core: model, ports, engine and in-memory repositories. */
 export * from './model.ts'
 export * from './verification.ts'
+export * from './requests.ts'
 export * from './ports.ts'
 export { Engine, type EngineForExecutor, type EngineForMainSession, type EngineForPeople, type EngineForSettings, type EngineForSources,
   type EngineOptions, type Outcome, type ReceiveResult, type Reply, type ReplyRequest, type TicketStatusSnapshot, type WorkerReport } from './engine.ts'

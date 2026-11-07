@@ -22,6 +22,7 @@ import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import { readSessionEvents } from '../infra/session-history.ts'
+import { requestForWorker, requestView, ticketRequestViews } from './request-views.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
@@ -40,12 +41,14 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
   { name: 'ticket/<id>/verification', holds: 'current acceptance criteria and independent result review', executor: true },
+  { name: 'ticket/<id>/requests', holds: 'request ownership/revisions/history', executor: true },
   { name: 'ticket/<id>/report/<id>', holds: 'the report of one of its assignments', executor: true },
   { name: 'ticket/<id>/transcript', holds: 'its Executor Session\'s messages, newest first', executor: true },
   { name: 'ticket/<id>/message/<n>', holds: 'one message of that transcript', executor: true },
   { name: 'ticket/<id>/input/<id>', holds: 'one input it was delivered', executor: true },
   { name: 'trigger/<id>', holds: 'a trigger\'s text, where it went, the message it replies to and the messages around it on its thread',
     executor: true },
+  { name: 'trigger/<id>/request', holds: 'request ownership/history', executor: true },
   { name: 'settings', holds: 'settings by block, each with the revision a save names: the small blocks whole, the Policy and the Source '
     + 'instances summarized' },
   { name: 'settings/<block>', holds: 'one settings block whole, as orchestrator_settings_save takes it: policy, eval, executor, pause or '
@@ -292,8 +295,14 @@ const ROUTES: readonly Route[] = [
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['trigger/', async read => {
     const { host, rest, ticketId, offset, signal } = read
-    if (!rest || rest.includes('/')) throw new Error('Unknown context resource')
-    const found = trigger(host, rest, ticketId)
+    const [id, section, extra] = rest.split('/')
+    if (!id || extra || (section !== undefined && section !== 'request')) throw new Error('Unknown context resource')
+    const found = trigger(host, id, ticketId)
+    if (section === 'request') {
+      const view = requestView(host.store, found.id, ticketId)
+      if (!view) throw new Error('This source message has no human request responsibility')
+      return text(read, JSON.stringify(view))
+    }
     const ref = feishuRef(found)
     // Redact decision IDs, other tickets, and unreachable neighbour triggers when a worker session reads a trigger.
     const ticket = ticketId ? host.store.tickets.get(ticketId) : undefined
@@ -301,7 +310,8 @@ const ROUTES: readonly Route[] = [
     const disposition = host.store.triggers.disposition(found.id)
     const visible = disposition && ticket ? { ...disposition, decisionId: undefined, matched: undefined,
       fanout: disposition.fanout.filter(id => id === ticket.id), context: disposition.context?.filter(id => id === ticket.id),
-      handbacks: disposition.handbacks?.filter(item => item.ticketId === ticket.id), acked: disposition.acked?.filter(id => id === ticket.id) }
+      handbacks: disposition.handbacks?.filter(item => item.ticketId === ticket.id), acked: disposition.acked?.filter(id => id === ticket.id),
+      ...disposition.request ? { request: requestForWorker(disposition.request, ticket.id) } : {} }
       : disposition
     // Omit card preview and self-reference because this resource returns the full text.
     const { preview: _preview, chars: _chars, read: _read, ...card } = triggerCard(found, visible)
@@ -326,6 +336,7 @@ const ROUTES: readonly Route[] = [
     if (ticketId && ticketId !== id) throw new Error('Ticket does not belong to this worker')
     const ticket = host.store.tickets.get(id)
     if (!ticket) throw new UserError('unknownTicket')
+    if (section === 'requests' && part === undefined) return ticketRequestViews(host.store, ticket, read.offset, read.limit, !!ticketId)
     if (section === 'verification' && part === undefined) return { acceptance: ticket.acceptance ?? null, verification: ticket.verification ?? null }
     if (section === undefined) {
       const running = runningAssignment(ticket) && workerSessionId(ticket.id)

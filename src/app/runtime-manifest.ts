@@ -8,7 +8,7 @@ import { record } from '../kv.ts'
 import type { Store } from './store.ts'
 import { ENVIRONMENT_PROTOCOL } from '../remote/protocol.ts'
 
-export const RUNTIME_MANIFEST_FORMAT = 1, RUNTIME_STATE_SCHEMA = 13, RUNTIME_OLDEST_SCHEMA = 10
+export const RUNTIME_MANIFEST_FORMAT = 1, RUNTIME_STATE_SCHEMA = 14, RUNTIME_OLDEST_SCHEMA = 10
 const CURRENT = record<RuntimeManifest>('runtime-manifest-current'), GOOD = record<RuntimeManifest>('runtime-manifest-last-good')
 const HISTORY = 'runtime-manifest-history:', DEFAULT_RUN = randomUUID()
 const protocols = { environment: ENVIRONMENT_PROTOCOL, supervision: 1, verification: 1 }

@@ -62,6 +62,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [Remote execution environments](docs/remote-environments.md): device setup, durable commands, reconnect and owner resolution
 - [Runtime operations](docs/runtime-operations.md): version/configuration manifests, read-only preflight and recovery evidence
 - [Autonomy evaluation](docs/autonomy-evaluation.md): isolated event/file tasks, provider adapter and measured coverage
+- [Routing recovery](docs/routing-recovery.md): original-request ownership, internal claims, bounded correction and reusable results
 - [Implementation and acceptance tracker](docs/autonomy-implementation-plan.md): requirement evidence and remaining release checks
 
 ## Development

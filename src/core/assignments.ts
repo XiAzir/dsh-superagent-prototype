@@ -130,6 +130,8 @@ export class Assignments extends EnginePart {
       : runningAssignment(ticket) ?? latestAssignment(ticket)
     if (!assignment) throw new UserError('unknownAssignment')
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
+    if (report.state === 'ready' && ticket.requests?.some(item => item.state === 'proposed' && item.triggerId !== report.answers))
+      throw new UserError('notAdmissible', { reason: 'Claim or return every trial request before reporting ready' })
     const at = this.now()
     const previous = ticket.attention
     const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
@@ -154,7 +156,12 @@ export class Assignments extends EnginePart {
     }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
-    if (report.answers) this.takeUp(ticketId, report.answers)
+    if (report.answers) {
+      this.takeUp(ticketId, report.answers)
+      const current = this.require(ticketId)
+      ticket.requests = current.requests
+      for (const input of ticket.inputs) if (input.kind === 'trigger' && input.triggerId === report.answers) delete input.provisional
+    }
     if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.

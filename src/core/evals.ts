@@ -6,6 +6,7 @@ import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strengt
 import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
+import { requestResponsibility, requestRoutingEnabled, writeRequest } from './requests.ts'
 import type { Tickets } from './tickets.ts'
 
 /** An outcome for the Eval that holds a Trigger; `evalId` names the Eval it was judged for, so a later Eval refuses it. */
@@ -104,7 +105,8 @@ export class Evals extends EnginePart {
       this.repo.threads.save(thread)
       return
     }
-    const evalId = key('eval', thread.key, policy.version, at, ...thread.pending)
+    const evalId = key('eval', thread.key, policy.version, at, ...thread.pending,
+      ...requestRoutingEnabled(this.options) ? thread.pending.map(id => String(requestResponsibility(this.repo, id)?.revision ?? 0)) : [])
     const deadline = new Date(Date.parse(at) + policy.evalTimeoutMs).toISOString()
     const { strength, trigger: { actor }, basis } = strongest
     thread.evaluating = { id: evalId, threadKey: thread.key, triggerIds: thread.pending, primary: strongest.trigger.id, strength, actor, basis,
@@ -131,6 +133,8 @@ export class Evals extends EnginePart {
   decide(triggerId: string, outcome: Outcome): Decision {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
+    if (requestRoutingEnabled(this.options) && requestResponsibility(this.repo, triggerId)?.state === 'cancelled' && outcome.kind === 'accept')
+      throw new UserError('notAdmissible', { reason: 'The original request was explicitly cancelled; a new human request is required' })
     const held = this.holding(triggerId)
     if (outcome.evalId && held?.evaluating?.id !== outcome.evalId) throw new UserError('evalFinished', { eval: outcome.evalId })
     // Prevent a replayed trigger that already created a ticket from spawning a second one.
@@ -180,11 +184,31 @@ export class Evals extends EnginePart {
    * and hands a Trigger back once.
    * @returns whether it was queued: false while another ticket decides it, and for one the ticket did not decide.
    */
-  handback(ticketId: string, triggerId: string, reason: string): boolean {
+  handback(ticketId: string, triggerId: string, reason: string, expectedAssignmentId?: string, expectedRevision?: number): boolean {
     const ticket = this.require(ticketId)
-    if (!ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === triggerId)) throw new UserError('notReached')
-    if (this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)) throw new UserError('handedBack')
-    return this.handBack(ticketId, this.repo.triggers.get(triggerId)!, reason)
+    const enabled = requestRoutingEnabled(this.options)
+    if (!ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === triggerId)
+      && !(enabled && ticket.origin.triggerIds.includes(triggerId))) throw new UserError('notReached')
+    const prior = this.repo.triggers.disposition(triggerId)?.handbacks?.find(item => item.ticketId === ticketId)
+    if (prior) {
+      if (enabled && prior.reason === reason) return prior.queued ?? true
+      throw new UserError('handedBack')
+    }
+    if (enabled) {
+      if (!liveTicket(ticket) || ticket.hold || this.policy().paused || !this.policy().revalidate(ticket.mandate)) throw new UserError('notAdmissible', { reason: 'Task is stopped, held or no longer authorized' })
+      if (expectedAssignmentId !== undefined && ticket.assignments.at(-1)?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+      const revision = requestResponsibility(this.repo, triggerId)?.revision
+      if (expectedRevision !== undefined && revision !== expectedRevision) throw new UserError('notAdmissible', { reason: 'Request responsibility revision changed' })
+    }
+    const queued = this.handBack(ticketId, this.repo.triggers.get(triggerId)!, reason)
+    if (enabled) {
+      const disposition = this.repo.triggers.disposition(triggerId)!
+      const item = disposition.handbacks?.find(item => item.ticketId === ticketId)
+      if (item) item.queued = queued
+      this.repo.triggers.saveDisposition(triggerId, disposition)
+      this.tickets.finalizeReleasedTicket(ticketId, triggerId, reason)
+    }
+    return queued
   }
   /**
    * Marks an `unavailable` Decision dismissed so the overview lists it no more.
@@ -259,7 +283,11 @@ export class Evals extends EnginePart {
     const accepted = new Map<string, Decision>()
     for (const decision of this.repo.decisions.byThread(threadKey)) {
       if (decision.kind !== 'accept' || !decision.ticketId) continue
-      for (const id of decision.triggerIds) if (!accepted.has(id)) accepted.set(id, decision)
+      for (const id of decision.triggerIds) {
+        const request = requestRoutingEnabled(this.options) ? requestResponsibility(this.repo, id) : undefined
+        if (request && !request.owners.some(owner => owner.ticketId === decision.ticketId && owner.state !== 'cancelled')) continue
+        if (!accepted.has(id)) accepted.set(id, decision)
+      }
     }
     return accepted
   }
@@ -274,7 +302,8 @@ export class Evals extends EnginePart {
     if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
     const at = this.now()
     if (thread.pending.includes(trigger.id)) { thread.pending = thread.pending.filter(id => id !== trigger.id); this.repo.threads.save(thread) }
-    const id = key('eval', thread.key, 'direct', trigger.id, kind, ...ticketId ? [ticketId] : [], at)
+    const id = key('eval', thread.key, 'direct', trigger.id, kind, ...ticketId ? [ticketId] : [], at,
+      ...requestRoutingEnabled(this.options) ? [String(requestResponsibility(this.repo, trigger.id)?.revision ?? 0)] : [])
     return { id, threadKey: thread.key, triggerIds: [trigger.id], primary: trigger.id,
       strength: gate.strength, actor: trigger.actor, basis: gate.basis, policyVersion: policy.version, startedAt: at, deadline: at }
   }
@@ -333,6 +362,14 @@ export class Evals extends EnginePart {
     for (const id of evaluation.triggerIds) {
       const disposition = this.repo.triggers.disposition(id) ?? { fanout: [], at }
       this.repo.triggers.saveDisposition(id, { ...disposition, evalId: evaluation.id, decisionId: decision.id })
+      if (requestRoutingEnabled(this.options) && ['ignore', 'unavailable'].includes(decision.kind)
+        && !decision.reason.some(item => ['routed', 'statusRead', 'startedTicket', 'acceptedBefore'].includes(item.code))) {
+        const request = requestResponsibility(this.repo, id)
+        if (request && !['completed', 'cancelled'].includes(request.state) && !request.owners.some(owner => ['claimed', 'proposed'].includes(owner.state))) {
+          writeRequest(this.options, id, decision.kind === 'ignore' ? 'ignored' : 'pending', request.owners,
+            { kind: decision.kind, reason: decision.reason.map(item => item.code).join(', ') })
+        }
+      }
     }
     this.emit('decision.recorded', { decisionId: decision.id, kind: decision.kind, threadKey: thread.key })
     return decision

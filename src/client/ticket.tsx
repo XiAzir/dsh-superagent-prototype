@@ -10,6 +10,7 @@ import { actorName, localized, readableMarkers, reasonLabel, valueLabel, when } 
 import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
   StageMark, When } from './widgets.tsx'
 import { TicketVerification } from './verification.tsx'
+import { TicketRequests } from './requests.tsx'
 import { TaskEnvironment, TaskFeedback } from './remote-environments.tsx'
 
 type Input = TicketPageView['inputs'][number]
@@ -144,6 +145,7 @@ export function TicketPage({ id }: { id: string }) {
     </div>
     {ended && <Hint>{ended}</Hint>}
     <TicketVerification key={id} id={id} acceptance={data.acceptance} verification={data.verification} hold={data.hold} call={call} t={t} onChanged={reload} />
+      <TicketRequests key={`requests-${id}`} id={id} call={call} t={t} />
     <TaskEnvironment key={`environment-${id}`} id={id} call={call} t={t} onChanged={reload} />
     <TaskFeedback key={`feedback-${id}`} id={id} call={call} t={t} />
     {data.attention && <div className="dt-banner"><span className="dt-banner-label">{t('attentionPrefix')}</span><MarkdownLite

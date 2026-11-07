@@ -95,10 +95,12 @@ it('leaves a delivered follow-up to its ticket\'s worker: the main Session may s
   await h.runTool(sessionId, 'orchestrator_trigger_handback', { trigger_id: attach, reason: 'It is about the other request.' })
   expect(await h!.route({ kind: 'attach', ticket_id: other.ticket.id, trigger_id: attach }))
     .toMatchObject({ ticket: expect.objectContaining({ ticket_id: other.ticket.id }) })
+  await h.runTool(other.sessionId, 'orchestrator_request_claim', { trigger_id: attach,
+    expected_revision: h.runtime.engine.requestResponsibility(attach)!.revision, reason: 'This request belongs to the other task.' })
   const work = await settle('6', '另外把导出按钮也加上')
   const request = { trigger_id: work, title: '导出按钮', worktree_name: 'export', acknowledgement: '收到，加导出按钮。' }
   await expect(h!.route({ kind: 'accept', ...request })).rejects.toThrow(decides)
-  // The attach subscribed the other ticket to this thread, so its worker decides the message too; it is new work once both
+  // The confirmed claim subscribed the other ticket to this thread, so its worker decides the message too; it is new work once both
   // hand it back.
   await h.runTool(sessionId, 'orchestrator_trigger_handback', { trigger_id: work, reason: 'It asks for an export button.' })
   await expect(h!.route({ kind: 'accept', ...request })).rejects.toThrow(decides)
@@ -322,5 +324,5 @@ it('tells a worker it may hand back a message beyond its ticket or for another o
   h = await startRuntime()
   const { sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   expect((h.tools.get(sessionId)!.get('orchestrator_trigger_handback') as unknown as { description: string }).description)
-    .toContain('beyond this ticket or for another one')
+    .toContain('Return original/later work outside this task')
 })

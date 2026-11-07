@@ -9,6 +9,7 @@ import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 import { completionApproved } from './verification.ts'
+import { bindRequest, requestIds, requestResponsibility, requestRoutingEnabled, settleTicketRequests, type RequestRoutingEvidence } from './requests.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
@@ -50,6 +51,14 @@ export class Tickets extends EnginePart {
     }
     ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
     const assignment = this.newAssignment(ticket)
+    this.repo.tickets.save(ticket)
+    if (requestRoutingEnabled(this.options)) for (const triggerId of triggerIds) {
+      const trigger = this.repo.triggers.get(triggerId)
+      if (!trigger?.human) continue
+      const disposition = this.repo.triggers.disposition(triggerId) ?? { fanout: [], at }
+      this.repo.triggers.saveDisposition(triggerId, { ...disposition, routing: 'worker', fanout: [...new Set([...disposition.fanout, id])] })
+      bindRequest(this.options, ticket, trigger, false)
+    }
     this.repo.tickets.save(ticket)
     for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref)
     if (outcome.acknowledgement && primary && !(mandate.strength === 'inferred' && primary.meta.observation)) this.replies.acknowledgeAccepted(id, primary, outcome.acknowledgement)
@@ -171,6 +180,8 @@ export class Tickets extends EnginePart {
     } else this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
+    if (current.requestRedirect) throw new UserError('notAdmissible', { reason: 'This ticket transferred all of its requests; select their current owner' })
+    if (requestRoutingEnabled(this.options) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
     return trigger
   }
@@ -179,8 +190,11 @@ export class Tickets extends EnginePart {
    * then decides it, as it decides a message that reached the ticket on its own Thread; a worker that does not hold the
    * message as its ticket's takes it as a new Input, which wakes an ended ticket as any attached message does.
    */
-  attach(ticketId: string, trigger: Trigger, note?: string): void {
-    for (const ref of trigger.threads) this.subscribe(ticketId, ref)
+  attach(ticketId: string, trigger: Trigger, note?: string, routing?: RequestRoutingEvidence, confirmed = false): void {
+    const coordinated = trigger.meta.router === true && Array.isArray(trigger.meta.mentions) && trigger.meta.mentions.includes(ticketId)
+    const provisional = requestRoutingEnabled(this.options) && trigger.human && !confirmed && !coordinated
+      && !trigger.threads.some(ref => this.repo.threads.get(threadKey(ref))?.subscriptions.includes(ticketId))
+    if (!provisional) for (const ref of trigger.threads) this.subscribe(ticketId, ref)
     // A person's sending it to Eval, which routed it here, is over, and so is the ticket's reading it for context only.
     const current: TriggerDisposition = this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at: this.now() }
     const { context, requeued, ...disposition } = current
@@ -193,6 +207,7 @@ export class Tickets extends EnginePart {
     const existing = ticket.inputs.find(input => input.id === id)
     const at = this.now()
     const input = (inputId: string): TicketInput => ({ id: inputId, kind: 'trigger', triggerId: trigger.id, at, ...(note ? { note } : {}),
+      ...provisional ? { provisional: true as const } : {},
       ...trigger.human ? { human: true } : {} })
     if (existing?.kind !== 'trigger') this.addInput(ticket, input(id))
     else if (note && ticket.undelivered.includes(id)) { existing.note = note; ticket.updatedAt = at; this.repo.tickets.save(ticket) }
@@ -203,6 +218,44 @@ export class Tickets extends EnginePart {
     }
     // The worker has the message already, so the note comes with it again.
     else if (note) this.addInput(ticket, input(key('input', ticketId, 'trigger', trigger.id, 'note', note)))
+    const currentTicket = this.require(ticketId)
+    bindRequest(this.options, currentTicket, trigger, provisional, routing)
+    this.repo.tickets.save(currentTicket)
+  }
+  /** Finish an empty mistaken ticket after all original request responsibilities have moved elsewhere. */
+  finalizeReleasedTicket(ticketId: string, triggerId: string, reason: string, toTicketId?: string): void {
+    const ticket = this.require(ticketId)
+    if (!requestRoutingEnabled(this.options) || !liveTicket(ticket)) return
+    const ids = requestIds(ticket)
+    if (ids.some(id => !ticket.requests?.some(item => item.triggerId === id && item.state === 'released'))) return
+    ticket.requestRedirect = { triggerId, at: this.now(), reason, ...toTicketId ? { toTicketId } : {} }
+    delete ticket.verification
+    this.repo.tickets.save(ticket)
+    for (const thread of this.repo.threads.list()) if (thread.subscriptions.includes(ticketId)) this.dropSubscriptions(thread.key, 'executor', ticketId, reason)
+    this.end(ticketId, 'executor', 'dropped', this.now(), `Request responsibility transferred: ${reason}`)
+  }
+  /** Confirm a delivered request before its thread becomes a persistent subscription. */
+  claimRequest(ticketId: string, triggerId: string, reason: string, expectedAssignmentId?: string, expectedRevision?: number) {
+    const ticket = this.require(ticketId), trigger = this.repo.triggers.get(triggerId)
+    if (!trigger || !requestIds(ticket).includes(triggerId)) throw new UserError('notReached')
+    if (!reason.trim()) throw new UserError('notAdmissible', { reason: 'A claim needs concrete request-to-task evidence' })
+    if (!liveTicket(ticket) || ticket.hold || !this.policy().revalidate(ticket.mandate) || this.policy().paused) throw new UserError('notAdmissible', { reason: 'Task is stopped, held or no longer authorized' })
+    const assignment = runningAssignment(ticket)
+    if (expectedAssignmentId !== undefined && assignment?.id !== expectedAssignmentId) throw new UserError('assignmentEnded')
+    const thread = this.thread(trigger.threads[0]!), scope = this.options.scope.scope(trigger), gate = this.policy().gate(trigger, thread, [ticket])
+    if (!scope.listened || !gate.admissible) throw new UserError('notAdmissible', { reason: 'Original request source authority changed before claim' })
+    if (trigger.source === 'qq' && trigger.meta.observation && !this.policy().observedRouting)
+      throw new UserError('notAdmissible', { reason: 'Observed requests require current auto-mode authority before claim' })
+    const previous = requestResponsibility(this.repo, triggerId)!
+    const binding = ticket.requests?.find(item => item.triggerId === triggerId)
+    if (binding?.state === 'released' || previous.owners.some(owner => owner.ticketId === ticketId && owner.state === 'cancelled')) throw new UserError('handedBackHere')
+    if (previous.owners.some(owner => owner.ticketId === ticketId && owner.state === 'claimed') && binding?.state === 'active') return previous
+    if (expectedRevision !== undefined && expectedRevision !== previous.revision) throw new UserError('notAdmissible', { reason: 'Request responsibility revision changed' })
+    bindRequest(this.options, ticket, trigger, false)
+    for (const input of ticket.inputs) if (input.kind === 'trigger' && input.triggerId === triggerId) delete input.provisional
+    this.repo.tickets.save(ticket)
+    for (const ref of trigger.threads) this.subscribe(ticketId, ref)
+    return requestResponsibility(this.repo, triggerId)!
   }
   /**
    * Ask a running worker whose latest report is `waiting` for a status report; leaves any other ticket alone.
@@ -368,6 +421,10 @@ export class Tickets extends EnginePart {
       }
     }
     ticket.inputs.push(input); ticket.updatedAt = this.now()
+    if (input.kind === 'trigger' && input.human && !input.context) {
+      const trigger = this.repo.triggers.get(input.triggerId)
+      if (trigger) bindRequest(this.options, ticket, trigger, input.provisional === true)
+    }
     // Hold back automated inputs while the worker is waiting on a person.
     const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
     if (!held) ticket.undelivered.push(input.id)
@@ -385,7 +442,7 @@ export class Tickets extends EnginePart {
    */
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
-    if (!ticket || liveTicket(ticket) || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
+    if (!ticket || liveTicket(ticket) || ticket.ended?.by === 'human' || ticket.requestRedirect || !ticket.undelivered.length) return
     const policy = this.policy()
     if (policy.paused) return
     if (!policy.revalidate(ticket.mandate)) { this.refuse(ticket); return }
@@ -404,7 +461,7 @@ export class Tickets extends EnginePart {
   }
   /** The Triggers of a ticket's trigger Inputs, or of those of them whose Input ids are `ids`. */
   private triggersOf(ticket: Ticket, ids?: readonly string[]): Trigger[] {
-    return ticket.inputs.flatMap(input => input.kind === 'trigger' && (!ids || ids.includes(input.id))
+    return ticket.inputs.flatMap(input => input.kind === 'trigger' && !input.requestReleased && (!ids || ids.includes(input.id))
       ? this.repo.triggers.get(input.triggerId) ?? [] : [])
   }
   /**
@@ -492,9 +549,12 @@ export class Tickets extends EnginePart {
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
+    settleTicketRequests(this.options, ticket)
+    this.repo.tickets.save(ticket)
     // A directed supplement belongs to this task; an owner stop also cancels its unread instructions.
     const cancelled = by === 'human' ? new Set([...waiting, ...left].filter(trigger =>
-      this.repo.triggers.disposition(trigger.id)?.directTicketId === ticketId).map(trigger => trigger.id)) : new Set<string>()
+      this.repo.triggers.disposition(trigger.id)?.directTicketId === ticketId
+      || (requestRoutingEnabled(this.options) && this.repo.triggers.disposition(trigger.id)?.request?.state === 'cancelled')).map(trigger => trigger.id)) : new Set<string>()
     for (const id of cancelled) {
       const disposition = this.repo.triggers.disposition(id)!
       this.repo.triggers.saveDisposition(id, { ...disposition, routing: 'handled',

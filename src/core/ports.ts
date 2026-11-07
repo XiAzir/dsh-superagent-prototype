@@ -86,6 +86,7 @@ export interface Outbox {
 
 /** What the Engine reports after a change, by event type. */
 export interface DomainEvents {
+  'request.changed': { triggerId: string; revision: number; state: import('./requests.ts').RequestState }
   'trigger.received': { triggerId: string; threads: string[] }
   'eval.started': { evalId: string; threadKey: string; triggerIds: string[]; strength: Strength }
   'decision.recorded': { decisionId: string; kind: DecisionKind; threadKey: string }

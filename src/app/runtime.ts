@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { join, basename } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, completionApproved, completionKey, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, completionApproved, completionKey, key, reasonText, requestIds, requestResponsibility, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -30,7 +30,7 @@ import { KV, record } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects } from './effects.ts'
+import { Effects, Later } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -67,6 +67,8 @@ import { RemoteEnvironments, type RemoteTransition } from '../remote/client.ts'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { MemoryExperienceService } from './memory-experience.ts'
 import { recordRuntimeManifest, runtimeBuildIdentity, runtimeManifestState } from './runtime-manifest.ts'
+import { RequestReviewService } from './request-review.ts'
+import { RequestHandoffService } from './request-handoff.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -103,6 +105,8 @@ export class Runtime extends Service implements SourceHost {
   readonly evaluation: EvaluationLedger
   readonly remote: RemoteEnvironments
   readonly experience: MemoryExperienceService
+  readonly requestReview: RequestReviewService
+  readonly requestHandoff: RequestHandoffService
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
@@ -216,6 +220,23 @@ export class Runtime extends Service implements SourceHost {
           if (!value) throw new Error('Execution environment credential is unavailable')
           return value
         },
+        requestScope: (ticketId, requestedTriggerId) => {
+          const ticket = store.tickets.get(ticketId)
+          if (!ticket || ticket.ended || !settingsPolicy(store.settings(), sources).revalidate(ticket.mandate)) return
+          const released = new Set(ticket.requests?.filter(item => item.state === 'released').map(item => item.triggerId))
+          const claimed = requestIds(ticket).filter(id => !released.has(id))
+            .filter(id => requestResponsibility(store, id)?.owners.some(owner => owner.ticketId === ticketId && owner.state === 'claimed'))
+          return requestedTriggerId ? claimed.includes(requestedTriggerId) ? requestedTriggerId : undefined : claimed.length === 1 ? claimed[0] : undefined
+        },
+        mayAccessRequestCommand: (ticketId, triggerId, originalTicketId) => {
+          const ticket = store.tickets.get(ticketId), original = store.tickets.get(originalTicketId), trigger = store.triggers.get(triggerId)
+          const responsibility = requestResponsibility(store, triggerId), currentPolicy = settingsPolicy(store.settings(), sources)
+          if (!ticket || !original || !trigger || ticket.ended?.by === 'human' || !currentPolicy.revalidate(ticket.mandate)
+            || !responsibility?.owners.some(owner => owner.ticketId === ticketId && ['proposed', 'claimed', 'completed'].includes(owner.state))
+            || !responsibility.owners.some(owner => owner.ticketId === originalTicketId)) return false
+          const thread = store.threads.get(`${trigger.threads[0]!.source}:${trigger.threads[0]!.id}`)
+          return !!thread && sources.scope(trigger).listened && currentPolicy.gate(trigger, thread, [ticket]).admissible
+        },
         mayExecute: ticketId => {
           const ticket = store.tickets.get(ticketId)
           return !!ticket && !ticket.ended && !this.paused() && (!ticket.hold || ticket.hold.kind === 'environment')
@@ -263,6 +284,7 @@ export class Runtime extends Service implements SourceHost {
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         allowMessage: message => {
+          if (message.purpose === 'result' && message.ticketId && store.tickets.get(message.ticketId)?.requestRedirect) return false
           if (message.completionKey) {
             const ticket = message.ticketId && store.tickets.get(message.ticketId)
             if (!ticket || ticket.ended?.by === 'human' || !completionApproved(ticket) || completionKey(ticket) !== message.completionKey) return false
@@ -273,8 +295,10 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
+        provisionalRouting: true,
         followupsEnabled: () => !personal() || this.personal.enabled(),
         outbox, prepareTicket: (ticket, outcome) => this.verification.prepare(executor.prepare(ticket, outcome)), emit: event => {
+          if (event.type === 'request.changed') { this.requestReview?.submit(event.data.triggerId); this.requestHandoff?.submit(event.data.triggerId) }
           if (event.type === 'trigger.received') {
             const trigger = store.triggers.get(event.data.triggerId), disposition = store.triggers.disposition(event.data.triggerId)
             if (trigger?.human) measure({ id: `request:${trigger.id}`, kind: 'request', triggerId: trigger.id, at: trigger.at,
@@ -308,7 +332,9 @@ export class Runtime extends Service implements SourceHost {
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended) {
-            void remote.cancelTicket(ended.id).catch(error => ctx.logger.warn('Remote cancellation remains queued: %s', String(error)))
+            const released = new Set(ended.requests?.filter(item => item.state === 'released').map(item => item.triggerId))
+            void remote.cancelTicket(ended.id, requestIds(ended).filter(id => !released.has(id)))
+              .catch(error => ctx.logger.warn('Remote cancellation remains queued: %s', String(error)))
             this.personalRuntime.attention.resolve({ ticketId: ended.id })
             for (const receipt of store.receipts.waiting()) if (receipt.ticketId === ended.id
               && (receipt.id.startsWith('personal-action:') || receipt.id.startsWith('personal-attention:'))) outbox.withdraw(receipt.id)
@@ -331,6 +357,37 @@ export class Runtime extends Service implements SourceHost {
           return result
         } catch (error) { measure({ id, kind: 'usage', data: { tokens: null, cost: null, auxiliary: true } }); throw error }
       }
+      this.requestReview = new RequestReviewService({ store, effects, engine, runModel: reviewModel,
+        paused: () => this.paused(), lifetime: this.lifetime, requestPass: () => this.passes.request(),
+        authorized: trigger => {
+          if (this.paused() || !sources.kind(trigger.source)) return false
+          const thread = store.threads.get(`${trigger.threads[0]!.source}:${trigger.threads[0]!.id}`)
+          if (!thread) return false
+          const gate = policy().gate(trigger, thread, thread.subscriptions.flatMap(id => store.tickets.get(id) ?? []))
+          return sources.scope(trigger).listened && gate.admissible && gate.strength === 'explicit'
+        },
+        recovered: review => measure({ id: `routing-recovery:${review.id}`, kind: 'recovery', triggerId: review.triggerId,
+          data: { kind: 'routing', durationMs: Math.max(0, Date.now() - Date.parse(review.createdAt)), requestRevision: review.requestRevision } }) })
+      this.requestHandoff = new RequestHandoffService({ store, effects, artifacts: this.artifacts,
+        authorized: (from, to, trigger) => {
+          if (from.ended?.by === 'human' || to.ended || !policy().revalidate(from.mandate) || !policy().revalidate(to.mandate)) return false
+          const thread = store.threads.get(`${trigger.threads[0]!.source}:${trigger.threads[0]!.id}`)
+          return !!thread && sources.scope(trigger).listened && policy().gate(trigger, thread, [to]).admissible
+        },
+        destination: ticket => ticket.execution?.directory,
+        importArtifact: async (ticket, _artifact, localPath, relativePath, signal) => {
+          signal.throwIfAborted()
+          const deviceId = remote.binding(ticket.id)
+          if (!deviceId) return { path: localPath }
+          if (remote.commands(ticket.id).some(command => command.effectiveState === 'unknown')) throw new Later('Resolve inherited unknown commands before importing handoff files')
+          const saved = await remote.importFile(ticket.id, deviceId, localPath, relativePath, true).catch(error => {
+            if (error && typeof error === 'object' && 'status' in error && error.status === 503) throw new Later('Waiting for the handoff execution device')
+            throw error
+          })
+          signal.throwIfAborted(); return { path: saved.path, deviceId }
+        },
+        note: (ticketId, text, requestId) => { engine.note(ticketId, text, requestId) },
+        paused: () => this.paused(), lifetime: this.lifetime, requestPass: () => this.passes.request() })
       this.experience = new MemoryExperienceService({ store, memory, effects, runModel: reviewModel,
         paused: () => this.paused(), lifetime: this.lifetime,
         scopes: ticket => [`source:${store.triggers.get(ticket.origin.triggerId)?.source ?? ticket.mandate.actor.source}`,
@@ -398,7 +455,10 @@ export class Runtime extends Service implements SourceHost {
         for (const ticket of store.tickets.open()) if (!ticket.hold && sources.kind(ticket.mandate.actor.source) && !policy().revalidate(ticket.mandate)) {
           engine.holdTicket(ticket.id, { kind: 'operator', at: now(), reason: 'Task authority changed; restore the source/requester/rule authorization before resuming.' })
         }
-        engine.evaluateDue(); this.personalRuntime.tick(); this.workerProgress.tick(); this.verification.tick()
+        for (const ticket of store.tickets.open()) if (!ticket.hold && remote.commands(ticket.id).some(command => command.effectiveState === 'unknown')) {
+          engine.holdTicket(ticket.id, { kind: 'environment', at: now(), reason: 'An original-request command has an unknown outcome; inspect its preserved result before resuming.' })
+        }
+        engine.evaluateDue(); this.personalRuntime.tick(); this.workerProgress.tick(); this.verification.tick(); this.requestReview.tick()
         void remote.tick().catch(error => ctx.logger.warn('Remote environment reconciliation: %s', String(error)))
         this.applyRemoteTransitions()
         void memory.flushCorrections().catch(error => ctx.logger.warn('Memory correction delivery: %s', String(error)))
@@ -426,7 +486,7 @@ export class Runtime extends Service implements SourceHost {
   get health(): Readonly<Record<string, Health>> { return this.board.all }
   private recordManifest(phase = this.manifestPhase): void {
     const config = { mode: this.machine.mode ?? 'repository', settings: this.store.settings(), promptRevision: this.store.get(KV.prompts.revision) ?? 0,
-      verification: this.verification?.config(), supervision: this.supervision?.config(),
+      verification: this.verification?.config(), supervision: this.supervision?.config(), routingReview: this.requestReview?.config(),
       environments: this.remote?.list().map(({ id, label, url }) => ({ id, label, url })) ?? [] }
     const serialized = JSON.stringify(config)
     if (this.manifestConfig === serialized && this.manifestPhase === phase) return
@@ -531,7 +591,7 @@ export class Runtime extends Service implements SourceHost {
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, artifacts: this.artifacts, schedules,
       personal: this.personal,
       personalRuntime: this.personalRuntime,
-      verification: this.verification, supervision: this.supervision,
+      verification: this.verification, supervision: this.supervision, requestReview: this.requestReview,
       evaluation: this.evaluation,
       remote: this.remote,
       runtimeManifest: () => runtimeManifestState(store),

@@ -3,6 +3,7 @@ import { currentVerification, latestReport, reasonText, threadKey, ticketStage, 
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
+import { requestSummary } from './request-views.ts'
 
 /** Collapses whitespace and truncates text for display previews while keeping code, angle brackets, and links intact for model readers. */
 export function preview(text: string): string { return text.replace(/\s+/g, ' ').slice(0, 160) }
@@ -16,6 +17,7 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
       ...typeof trigger.meta.routingInstruction === 'string' ? { routing_instruction: trigger.meta.routingInstruction } : {} } : {},
     ...trigger.context?.length ? { context: trigger.context.map(id => ({ trigger_id: id, read: `trigger/${id}` })) } : {},
     preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}`,
+    ...requestSummary(trigger, disposition) ? { request: requestSummary(trigger, disposition) } : {},
     ...(disposition ? { disposition: { ...(disposition.filtered ? { filtered: reasonText(disposition.filtered) } : {}),
       ...(disposition.decisionId ? { decision_id: disposition.decisionId } : {}),
       ...disposition.routing && disposition.routing !== 'worker' ? { matched_tickets: disposition.matched ?? [], routing: disposition.routing }
@@ -36,6 +38,9 @@ export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...ticket.requests?.length ? { requests: { active: ticket.requests.filter(item => item.state === 'active').length,
+      proposed: ticket.requests.filter(item => item.state === 'proposed').length, released: ticket.requests.filter(item => item.state === 'released').length,
+      read: `ticket/${ticket.id}/requests` } } : {},
     ...ticket.hold ? { hold: ticket.hold } : {}, ...verification ? { verification: { state: verification.state,
       at: verification.at, summary: verification.summary.slice(0, 600), read: `ticket/${ticket.id}/verification` } } : {},
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
@@ -54,7 +59,9 @@ export function inputLine(ticket: Ticket, input: TicketInput, worker = false) {
     : input.kind !== 'text' ? read
     : input.text.length <= INPUT_TEXT ? { text: input.text }
     : { preview: preview(input.text).slice(0, INPUT_TEXT), chars: input.text.length, ...read }
-  return { kind: input.kind, at: input.at, ...names, ...ticket.undelivered.includes(input.id) ? { undelivered: true } : {} }
+  return { kind: input.kind, at: input.at, ...names, ...ticket.undelivered.includes(input.id) ? { undelivered: true } : {},
+    ...input.kind === 'trigger' && input.provisional ? { scope_review: 'claim_or_handback', request: `trigger/${input.triggerId}/request` } : {},
+    ...input.kind === 'trigger' && input.requestReleased ? { responsibility: 'released' } : {} }
 }
 export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number]) {
   return { id: item.id, state: item.state, at: item.createdAt, ...(item.endedReason ? { ended_reason: reasonText({ code: item.endedReason }) } : {}),

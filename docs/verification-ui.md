@@ -51,3 +51,5 @@ node node_modules/vitest/vitest.mjs run tests/panel-verification.spec.tsx tests/
 执行设置还展示实际任务效果汇总，费用与判断覆盖缺失时明确显示“未知”。工单详情提供独立的采纳、正确性和路由纠正反馈，失败重试复用原请求 ID。
 
 `tests/panel-remote-environments.spec.tsx` 覆盖登记引用、离线探测、绑定失败保留现场、unknown 核实确认与失败恢复、费用未知及反馈幂等。`tests/autonomy-runtime.spec.ts` 使用真实 Runtime、SQLite、HTTP 与本地 daemon 验证设备工具接线、同命令重放、离线取消、未知结果 CAS、记忆更正、观察验收和效果反馈。
+
+执行设置追加路由覆盖复核的关闭、观察、自动恢复模式，并展示当前预算。工单详情按需展开原请求、责任人及转交历史；其余 Worker 控制继续保留。模式、责任和恢复次数见[路由恢复](routing-recovery.md)。

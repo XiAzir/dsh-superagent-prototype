@@ -188,7 +188,7 @@ export class Replies extends EnginePart {
     const trigger = this.repo.triggers.get(request.triggerId)!
     const id = key('status-reply', trigger.id, request.ticketId)
     const existing = this.options.outbox.status(id)
-    this.options.outbox.send({ id, channel: trigger.channel!, text: request.text, kind: 'reply', ticketId: request.ticketId, delivery: 'interactive' })
+    this.options.outbox.send({ id, channel: trigger.channel!, text: request.text, kind: 'reply', purpose: 'status', ticketId: request.ticketId, delivery: 'interactive' })
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined, snapshot }
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
