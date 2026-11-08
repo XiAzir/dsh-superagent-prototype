@@ -131,8 +131,8 @@ it('withdraws pending attention and action messages when a ticket stops, authori
   host.runtime.store.receipts.add({ id: noticeReceiptId, ticketId: ticket.id, kind: 'notice', channel: ticket.channels[0]!, text: 'cancel me' })
   host.runtime.store.tickets.save({ ...ticket, ended: { at, by: 'executor', reason: 'completed', outcome: 'completed' } })
   host.runtime.personalRuntime.tick()
-  expect(host.runtime.store.receipts.get(actionReceiptId)).toBeUndefined()
-  expect(host.runtime.store.receipts.get(noticeReceiptId)).toBeUndefined()
+  expect(host.runtime.store.receipts.get(actionReceiptId)?.status).toBe('dropped')
+  expect(host.runtime.store.receipts.get(noticeReceiptId)?.status).toBe('dropped')
   expect(host.runtime.store.personal.get('attention', attention.id)?.status).toBe('resolved')
 
   const stillPending = host.runtime.personalRuntime.attention.queue({ title: 'Disable notice', summary: 'cancel me', priority: 'P0', digestKey: 'disabled' }, 'disabled-attention')
@@ -141,7 +141,7 @@ it('withdraws pending attention and action messages when a ticket stops, authori
   host.runtime.personalRuntime.tick()
   expect(host.runtime.personalRuntime.attention.collectDue()).toEqual([])
   expect(host.runtime.store.personal.get('attention', stillPending.id)?.status).toBe('queued')
-  expect(host.runtime.store.receipts.get('personal-attention:disabled-notice')).toBeUndefined()
+  expect(host.runtime.store.receipts.get('personal-attention:disabled-notice')?.status).toBe('dropped')
 })
 
 it('keeps request side effects in durable state when a response is lost and marks delivery snapshots using canonical IDs', async () => {

@@ -16,8 +16,8 @@ export { SCHEMA_VERSION }
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
-/** Why a message was dropped: its conversation can never receive it (`channelGone`), or its Source no longer listens to it (`channelIgnored`). */
-export type DropReason = 'channelGone' | 'channelIgnored' | 'deliveryRevoked'
+/** Why automatic delivery ended: target loss, source filtering, revoked authority, or an unconfirmed send. */
+export type DropReason = 'channelGone' | 'channelIgnored' | 'deliveryRevoked' | 'deliveryUncertain'
 /** Outbound message receipt tracked in the outbox from the moment it is queued (`pending`, `sent`, or `dropped`); delivery attempt counts live on its `reply` effect. */
 export interface Receipt extends OutboundMessage { status: ReplyStatus; dropped?: { at: string; reason: DropReason } }
 /** A dropped outbound message receipt, with the timestamp and reason it was dropped. */
@@ -391,10 +391,12 @@ export class Store implements Repositories {
     },
     /**
      * Withdraws a pending message that has not yet been sent.
-     * @returns Whether a pending message with `id` was waiting and removed.
+     * Retains a revoked receipt so a replay of its ID stays cancelled.
+     * @returns Whether a pending message with `id` was withdrawn.
      */
     withdraw: (id: string): boolean =>
-      Number(this.db.prepare("DELETE FROM outbox WHERE id = ? AND value ->> '$.status' = 'pending'").run(id).changes) > 0,
+      Number(this.db.prepare("UPDATE outbox SET value = json_patch(value, ?) WHERE id = ? AND value ->> '$.status' = 'pending'")
+        .run(JSON.stringify({ status: 'dropped', dropped: { at: new Date().toISOString(), reason: 'deliveryRevoked' } }), id).changes) > 0,
   }
 }
 export { key, threadKey }

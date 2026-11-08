@@ -6,7 +6,7 @@ import { record } from '../kv.ts'
 import { SourcePolicySchema } from '../policy.ts'
 import type { Health } from '../sources/host.ts'
 import type { FieldSpec, SourceKind } from '../sources/kind.ts'
-import { OneBotClient, type OneBotState } from '../sources/onebot-client.ts'
+import { OneBotClient, OneBotRpcError, type OneBotState } from '../sources/onebot-client.ts'
 import { normalizeOneBotMessage } from '../sources/onebot-message.ts'
 import { QqThreads } from './qq-threads.ts'
 import { safeFailureMessage } from './session-failures.ts'
@@ -34,6 +34,7 @@ export const QqConfigSchema = z.object({
   privateFollowups: z.enum(['semantic', 'sender-window']).default('semantic'),
   replyChunkSize: z.number().int().min(200).max(4000).default(1800), maxReplyChunks: z.number().int().min(1).max(50).default(20),
   requestTimeoutMs: z.number().int().min(1000).max(60000).default(15000),
+  fileUploadTimeoutMs: z.number().int().min(1000).max(600000).default(120000),
   observation: z.object({
     windowMinutes: z.number().int().min(1).max(30).default(5),
     maxCandidatesPerHour: z.number().int().min(1).max(1000).default(30),
@@ -60,7 +61,12 @@ interface QqHost {
   resolveToken(name: string): Promise<string | undefined>; writeToken(name: string, value: string): Promise<void>
 }
 interface QqStats { received: number; lastMessageAt?: string }
-interface Delivery { chunks: { text: string; messageId: string }[]; artifacts?: { id: string; fileId: string | null }[] }
+interface Delivery {
+  chunks: { text: string; messageId: string }[]
+  artifacts?: { id: string; fileId: string | null }[]
+  /** Written before a send; retained across transport failure and restarts until confirmed. */
+  pending?: { part: string; at: string }
+}
 const statsKey = record<QqStats>('qq-stats')
 const deliveryKey = (id: string) => record<Delivery>(`qq-delivery:${id}`)
 const triggerId = (self: string, type: string, chat: string, message: string) => `qq-message-${key(self, type, chat, message)}`
@@ -295,7 +301,9 @@ export class QqBridge {
     return address.message_type === 'private' ? config.privateMessages && address.recipient_id === address.user_id
       : address.message_type === 'group' && config.groups.some(group => group.id === address.recipient_id)
   }
-  private async send(message: OutboundMessage): Promise<'sent' | 'gone'> {
+  private async send(message: OutboundMessage, cancellation?: AbortSignal): Promise<'sent' | 'gone' | 'uncertain'> {
+    const signal = AbortSignal.any([this.downloads.signal, ...cancellation ? [cancellation] : []])
+    if (signal.aborted) return 'gone'
     if (!this.canSend(message.channel.address)) return 'gone'
     const client = this.client, address = message.channel.address, config = this.config()
     if (!client?.connected || !this.selfId) throw new Error('OneBot 尚未连接，回复会在连接恢复后重试。')
@@ -303,49 +311,72 @@ export class QqBridge {
     const chunks = qqReplyChunks(message.text, config.replyChunkSize)
     if (chunks.length > config.maxReplyChunks) throw new Error('回复超过 QQ 分段上限，请在来源设置中提高最大分段数。')
     let delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
-    for (const id of message.artifacts ?? []) {
-      if (delivery.artifacts?.some(item => item.id === id)) continue
-      if (!this.host.artifacts || !message.ticketId) throw new Error('Artifact delivery requires its originating task and durable artifact registry')
-      const artifact = await this.host.artifacts.verify(id, message.ticketId)
-      if (!this.canSend(address)) return 'gone'
-      const native = artifact.kind === 'image' || artifact.kind === 'video'
-      if (native && !artifact.mediaType.startsWith(`${artifact.kind}/`)) throw new Error('Artifact media kind and format do not match')
-      const contents = await readFile(artifact.path)
-      const file = `base64://${contents.toString('base64')}`
-      const reply = native
-        ? await client.call<{ message_id?: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
-          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id,
-            message: [{ type: artifact.kind, data: { file } }] })
-        : await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
-          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file, name: artifact.name })
-      // OneBot confirms file uploads with file_id; text and native media use message_id.
-      const fileId = native ? String((reply as { message_id?: string | number })?.message_id ?? '') : (reply as { file_id?: string | null })?.file_id
-      if (native ? !/^-?\d+$/.test(String(fileId)) : fileId !== null && typeof fileId !== 'string') throw new Error('OneBot did not confirm the artifact delivery')
-      this.host.store.atomic(() => {
-        delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
-        delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: fileId ?? null }]
-        this.host.store.set(deliveryKey(message.id), delivery)
-        if (native) this.threads.recordOutgoing(String(fileId), address.thread_id!, {
-          messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, `[${artifact.kind}] ${artifact.name}`)
-      })
+    if (delivery.pending) return 'uncertain'
+    const sending = (part: string) => {
+      if (!client.connected) throw new Error('OneBot is not connected')
+      delivery.pending = { part, at: new Date().toISOString() }
+      this.host.store.set(deliveryKey(message.id), delivery)
     }
-    if (delivery.chunks.some((chunk, index) => chunk.text !== chunks[index])) throw new Error('QQ 回复分段配置发生变化，请恢复原分段大小后重试。')
-    for (let index = delivery.chunks.length; index < chunks.length; index++) {
-      if (!this.canSend(address)) return 'gone'
-      const segments = [...index === 0 && address.message_id ? [{ type: 'reply', data: { id: address.message_id } }] : [],
-        { type: 'text', data: { text: chunks[index]! } }]
-      const reply = await client.call<{ message_id: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
-        { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, message: segments })
-      const messageId = String(reply?.message_id ?? '')
-      if (!/^-?\d+$/.test(messageId)) throw new Error('OneBot 未返回有效的回复消息编号。')
-      this.host.store.atomic(() => {
+    try {
+      for (const id of message.artifacts ?? []) {
+        if (delivery.artifacts?.some(item => item.id === id)) continue
+        if (!this.host.artifacts || !message.ticketId) throw new Error('Artifact delivery requires its originating task and durable artifact registry')
+        const artifact = await this.host.artifacts.verify(id, message.ticketId)
+        if (signal.aborted || !this.canSend(address)) return 'gone'
+        const native = artifact.kind === 'image' || artifact.kind === 'video'
+        if (native && !artifact.mediaType.startsWith(`${artifact.kind}/`)) throw new Error('Artifact media kind and format do not match')
+        const contents = await readFile(artifact.path)
+        if (signal.aborted || !this.canSend(address)) return 'gone'
+        const file = `base64://${contents.toString('base64')}`
+        sending(`artifact:${id}`)
+        const reply = native
+          ? await client.call<{ message_id?: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
+            { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id,
+              message: [{ type: artifact.kind, data: { file } }] }, signal, config.fileUploadTimeoutMs)
+          : await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
+            { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file, name: artifact.name }, signal, config.fileUploadTimeoutMs)
+        // Upload APIs may return empty data on success; the successful RPC is their confirmation.
+        const fileId = native ? String((reply as { message_id?: string | number })?.message_id ?? '') : (reply as { file_id?: string | null })?.file_id
+        if (native ? !/^-?\d+$/.test(String(fileId)) : fileId != null && typeof fileId !== 'string') throw new Error('OneBot did not confirm the artifact delivery')
+        this.host.store.atomic(() => {
+          delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
+          delivery.artifacts = [...delivery.artifacts ?? [], { id, fileId: fileId ?? null }]
+          delete delivery.pending
+          this.host.store.set(deliveryKey(message.id), delivery)
+          if (native) this.threads.recordOutgoing(String(fileId), address.thread_id!, {
+            messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, `[${artifact.kind}] ${artifact.name}`)
+        })
+      }
+      if (delivery.chunks.some((chunk, index) => chunk.text !== chunks[index])) throw new Error('QQ 回复分段配置发生变化，请恢复原分段大小后重试。')
+      for (let index = delivery.chunks.length; index < chunks.length; index++) {
+        if (signal.aborted || !this.canSend(address)) return 'gone'
+        const segments = [...index === 0 && address.message_id ? [{ type: 'reply', data: { id: address.message_id } }] : [],
+          { type: 'text', data: { text: chunks[index]! } }]
+        sending(`chunk:${index}`)
+        const reply = await client.call<{ message_id: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
+          { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, message: segments }, signal)
+        const messageId = String(reply?.message_id ?? '')
+        if (!/^-?\d+$/.test(messageId)) throw new Error('OneBot 未返回有效的回复消息编号。')
+        this.host.store.atomic(() => {
+          delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
+          if (delivery.chunks.length === index) delivery.chunks.push({ text: chunks[index]!, messageId })
+          delete delivery.pending
+          this.host.store.set(deliveryKey(message.id), delivery)
+          this.threads.recordOutgoing(messageId, address.thread_id!, { messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, chunks[index]!)
+        })
+      }
+      return 'sent'
+    } catch (error) {
+      if (error instanceof OneBotRpcError) {
         delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
-        if (delivery.chunks.length === index) delivery.chunks.push({ text: chunks[index]!, messageId })
+        delete delivery.pending
         this.host.store.set(deliveryKey(message.id), delivery)
-        this.threads.recordOutgoing(messageId, address.thread_id!, { messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, chunks[index]!)
-      })
+        throw error
+      }
+      // A timeout or disconnect does not cancel an upload already accepted by the peer.
+      if (this.host.store.get(deliveryKey(message.id))?.pending) return 'uncertain'
+      throw error
     }
-    return 'sent'
   }
   private source(): SourceKind<QqConfig> {
     return { kind: 'qq', title: { zh: 'QQ · OneBot v11', en: 'QQ · OneBot v11' },
@@ -361,7 +392,7 @@ export class QqBridge {
         const group = config.groups.find(group => group.id === meta.groupId)
         return group ? { listened: true, observed: group.listen === 'observe', row: group.id } : { listened: false, reason: 'source_disabled' }
       },
-      channel: { artifacts: true, allowed: address => this.canSend(address), send: (_host, message) => this.send(message), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },
+      channel: { artifacts: true, allowed: address => this.canSend(address), send: (_host, message, signal) => this.send(message, signal), link: () => ({ url: '', label: { zh: 'QQ 会话', en: 'QQ chat' } }) },
       policy: { schema: SourcePolicySchema, fields: [{ key: 'allowed', type: 'rows', label: { zh: '允许交办任务的 QQ 账号', en: 'Allowed QQ senders' },
         columns: [{ key: 'id', type: 'text', pattern: '[1-9][0-9]{3,19}', label: { zh: 'QQ 号', en: 'QQ ID' } }, { key: 'name', type: 'text', optional: true, label: { zh: '名称', en: 'Name' } }] }],
         rows: value => QqConfigSchema.parse(value).groups.map(group => ({ id: group.id, label: group.name ?? `QQ ${group.id}`,
@@ -404,5 +435,6 @@ function qqFields(): FieldSpec[] {
     number('replyChunkSize', '每段回复字符数', 'Reply chunk characters', 200, 4000),
     number('maxReplyChunks', '每条回复最多分段数', 'Maximum reply chunks', 1, 50),
     number('requestTimeoutMs', 'OneBot 请求超时 / 毫秒', 'OneBot timeout / ms', 1000, 60000),
+    number('fileUploadTimeoutMs', 'QQ 文件上传超时 / 毫秒', 'QQ file upload timeout / ms', 1000, 600000),
   ]
 }

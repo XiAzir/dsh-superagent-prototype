@@ -15,6 +15,40 @@ async function at(ms: number) {
   try { await h.runtime.pump(); await h.runtime.sendReplies() } finally { vi.useRealTimers() }
 }
 
+it('revokes queued ticket replies on a stop and keeps their IDs cancelled when replayed', async () => {
+  const { ticket, trigger } = await h.acceptedTicket(feishu('100', '@bot 获取安装包'))
+  await h.runtime.settings.pause(true, 'panel')
+  const message: OutboundMessage = { id: 'cancelled-result', channel: trigger.channel!, ticketId: ticket.id, text: '安装包', kind: 'reply' }
+  h.runtime.outbox.send(message)
+  h.runtime.engine.stopTicket(ticket.id)
+  expect(h.runtime.store.receipts.get(message.id)).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryRevoked' } })
+  expect(h.runtime.effects.pending('reply', message.id)).toBe(false)
+  h.runtime.outbox.send(message)
+  await h.runtime.settings.pause(false, 'panel')
+  await h.runtime.sendReplies()
+  expect(h.runtime.outbox.status(message.id)).toBe('dropped')
+})
+
+it('revokes legacy pending results for a stopped ticket before checking source availability, and still answers new status questions', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('101', '@bot 获取安装包'))
+  h.runtime.engine.stopTicket(ticket.id)
+  const source = 'uninstalled-qq'
+  const message: OutboundMessage = { id: 'legacy-result', channel: { source, thread: 'qq:private', address: {} }, ticketId: ticket.id,
+    text: '遗留结果', kind: 'reply' }
+  h.runtime.store.receipts.add(message)
+  h.runtime.effects.enqueue('reply', message.id, {})
+  await h.runtime.sendReplies()
+  expect(h.runtime.store.receipts.get(message.id)).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryRevoked' } })
+  expect(h.runtime.effects.pending('reply', message.id)).toBe(false)
+  const sent: string[] = []
+  h.runtime.sources.register({ kind: source, title: { zh: '探针', en: 'Probe' }, description: { zh: '', en: '' }, health: [],
+    schema: z.object({}).strict(), fields: [], channel: { send: async (_host, item) => { sent.push(item.id); return 'sent' },
+      link: () => ({ url: '', label: { zh: '探针', en: 'Probe' } }) } })
+  h.runtime.outbox.send({ ...message, id: 'new-status', purpose: 'status', delivery: 'interactive', text: '发送已停止。' })
+  await h.runtime.sendReplies()
+  expect(sent).toEqual(['new-status'])
+})
+
 it('holds every message while processing is paused, and sends it once processing resumes', async () => {
   const lark = vi.mocked(Commands.prototype.lark)
   await h.runtime.settings.pause(true, 'panel')

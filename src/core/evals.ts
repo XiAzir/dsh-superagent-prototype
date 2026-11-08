@@ -321,7 +321,7 @@ export class Evals extends EnginePart {
       reason: [...unassessed, ...reasonOf(outcome.reason)], ...audit })
     if (outcome.kind === 'stop') {
       const ticket = this.repo.tickets.get(outcome.ticketId)
-      if (!ticket || !liveTicket(ticket)) return this.finish(thread, evaluation, { kind: 'ignore', reason: [{ code: 'stopUnknown' }],
+      if (!ticket) return this.finish(thread, evaluation, { kind: 'ignore', reason: [{ code: 'stopUnknown' }],
         ...audit })
       if (evaluation.strength !== 'explicit') return this.finish(thread, evaluation, { kind: 'ignore',
         reason: [{ code: 'stopNotExplicit' }], ...audit })

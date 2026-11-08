@@ -92,7 +92,7 @@ it.each(['report-change', 'human-supplement', 'human-stop'] as const)('revokes a
     expect(h.runtime.store.tickets.get(task.ticket.id)?.ended).toMatchObject({ by: 'human', outcome: 'stopped' })
   }
   if (change !== 'human-stop') expect(completionKey(h.runtime.store.tickets.get(task.ticket.id)!)).not.toBe(proof)
-  expect(h.runtime.store.replyStatus(id)).toBe('pending')
+  expect(h.runtime.store.replyStatus(id)).toBe(change === 'human-stop' ? 'dropped' : 'pending')
   await h.runtime.settings.pause(false, 'panel')
   await h.runtime.pump(); await h.runtime.idle(); await h.runtime.sendReplies()
   expect(h.runtime.store.receipts.get(id)).toMatchObject({ completionKey: proof, status: 'dropped', dropped: { reason: 'deliveryRevoked' } })

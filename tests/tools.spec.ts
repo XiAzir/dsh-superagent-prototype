@@ -352,7 +352,7 @@ it('returns a pending receipt immediately and lets the main Session query its fi
   await h.runtime.idle()
   expect(h.runtime.store.replyStatus(gone.receipt_id)).toBe('dropped')
   expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: `receipt/${gone.receipt_id}` }))
-    .toEqual({ receipt_id: gone.receipt_id, status: 'dropped' })
+    .toEqual({ receipt_id: gone.receipt_id, status: 'dropped', dropped: { at: expect.any(String), reason: 'channelGone' } })
 })
 
 it('checks an acknowledgement against the IM word limit, not a character count', async () => {

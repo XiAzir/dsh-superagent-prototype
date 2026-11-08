@@ -93,11 +93,11 @@ export class SourceRegistry implements SourceScope {
    * Sends a message idempotently through its Channel's kind; returns `'waiting'` while the kind is not installed, or
    * `'gone'` when the target (or a kind without channels) can never receive it.
    */
-  async send(message: OutboundMessage, commands: Commands): Promise<'sent' | 'gone' | 'waiting'> {
+  async send(message: OutboundMessage, commands: Commands, signal?: AbortSignal): Promise<'sent' | 'gone' | 'waiting' | 'uncertain'> {
     const kind = this.kinds.get(message.channel.source)
     if (!kind) return 'waiting'
     if (message.artifacts?.length && !kind.channel?.artifacts) throw new Error(`The ${kind.kind} source has no artifact delivery adapter`)
-    return kind.channel ? kind.channel.send({ commands }, message) : 'gone'
+    return kind.channel ? kind.channel.send({ commands }, message, signal) : 'gone'
   }
   link(channel: ChannelRef, links: ChannelLinks): ChannelLink {
     const link = this.kinds.get(channel.source)?.channel?.link(channel.address, links)

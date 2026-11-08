@@ -17,6 +17,9 @@ export interface OneBotClientOptions {
 interface RpcResponse { status?: unknown; retcode?: unknown; data?: unknown; echo?: unknown }
 interface Pending { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void }
 
+/** The peer explicitly rejected an RPC, so its side effect was not accepted. */
+export class OneBotRpcError extends Error {}
+
 const DEFAULT_TIMEOUT = 10_000
 const DEFAULT_MAX_PAYLOAD = 2 * 1024 * 1024
 const CLOSE_TIMEOUT_MS = 500
@@ -57,15 +60,15 @@ export class OneBotClient {
     else this.connectForward()
   }
 
-  async call<T = unknown>(action: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
+  async call<T = unknown>(action: string, params: Record<string, unknown> = {}, signal?: AbortSignal,
+    timeoutMs = this.connection.requestTimeoutMs ?? DEFAULT_TIMEOUT): Promise<T> {
     if (this.stopped || !this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('OneBot is not connected')
     if (signal?.aborted) throw new Error('OneBot request aborted')
     // Numeric echoes are part of the OneBot v11 protocol and tolerate peers
     // that serialize the response echo as either a JSON number or string.
     const echo = String(++this.nextEcho)
     return await new Promise<T>((resolve, reject) => {
-      const timeout = this.connection.requestTimeoutMs ?? DEFAULT_TIMEOUT
-      const timer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC timeout: ${action}`)), timeout)
+      const timer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC timeout: ${action}`)), timeoutMs)
       const pending: Pending = { resolve: value => resolve(value as T), reject, timer, signal }
       if (signal) {
         pending.abort = () => this.settle(echo, new Error('OneBot request aborted'))
@@ -208,7 +211,7 @@ export class OneBotClient {
         return
       }
       if (response.status === 'failed' || response.retcode !== 0) {
-        this.settle(echo, new Error(`OneBot RPC failed (retcode ${response.retcode})`)); return
+        this.settle(echo, new OneBotRpcError(`OneBot RPC failed (retcode ${response.retcode})`)); return
       }
       this.settle(echo, undefined, response.data)
       return

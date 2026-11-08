@@ -9,6 +9,7 @@ import { record } from '../src/kv.ts'
 import { QqBridge, QqConfigSchema } from '../src/app/qq-source.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
+import { deferred } from './fixtures/async.ts'
 
 const owner = '12345', selfId = '98765', groupId = '23456', otherGroup = '34567'
 let host: Host | undefined
@@ -118,7 +119,135 @@ const qqTriggers = (runtime: Host['runtime']) => runtime.store.read.recentTrigge
   .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
 const outbound = (id: string, channel: NonNullable<Trigger['channel']>, text: string): OutboundMessage => ({ id, channel, text, kind: 'reply' })
 
+async function fileResult(runtime: Host['runtime'], type: 'private' | 'group' = 'private') {
+  await push(event(800, type, owner, [
+    ...type === 'group' ? [{ type: 'at', data: { qq: selfId } }] : [],
+    { type: 'text', data: { text: '发送两个文件' } },
+  ]))
+  await waitFor(() => qqTriggers(runtime).length === 1)
+  const trigger = qqTriggers(runtime)[0]!
+  const accepted = await host!.route({ kind: 'accept', trigger_id: trigger.id, title: 'Send files', worktree_name: 'send-files', acknowledgement: '收到。' })
+  await runtime.idle()
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+  const ticket = runtime.store.tickets.get(ticketId)!
+  await mkdir(ticket.execution!.directory, { recursive: true })
+  const files = ['one.apk', 'two.apk'].map(name => join(ticket.execution!.directory, name))
+  for (const file of files) await writeFile(file, 'test package')
+  const report = await host!.runTool(`worker-${ticketId}`, 'orchestrator_report', {
+    state: 'ready', summary: '文件已准备。', artifacts: files.map(path => ({ path })),
+  })
+  return { ticketId, trigger, message: { id: 'files-result', channel: trigger.channel!, text: '请查收。', kind: 'reply' as const,
+    purpose: 'result' as const, ticketId, artifacts: (report.artifacts as { id: string }[]).map(item => item.id) } }
+}
+
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('waits longer for file uploads than ordinary RPCs', async () => {
+    const { runtime, store } = await startQq({ requestTimeoutMs: 1000, fileUploadTimeoutMs: 5000 })
+    const { message } = await fileResult(runtime)
+    const upload = deferred<null>()
+    let uploads = 0
+    rpcHandlers.upload_private_file = () => { uploads++; return uploads === 1 ? upload.promise : null }
+    runtime.outbox.send(message)
+    await waitFor(() => uploads === 1)
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(store.receipts.get(message.id)?.status).toBe('pending')
+    upload.resolve(null)
+    await runtime.sendReplies()
+    expect([uploads, store.replyStatus(message.id)]).toEqual([2, 'sent'])
+  })
+
+  it.each(['private', 'group'] as const)('accepts successful %s uploads with empty data and skips confirmed artifacts on replay', async type => {
+    const { runtime, bridge: qq, store } = await startQq()
+    const { message } = await fileResult(runtime, type)
+    let uploads = 0
+    rpcHandlers[type === 'group' ? 'upload_group_file' : 'upload_private_file'] = () => { uploads++; return uploads === 1 ? null : {} }
+    runtime.outbox.send(message)
+    await runtime.sendReplies()
+    expect([uploads, store.replyStatus(message.id)]).toEqual([2, 'sent'])
+    await expect(qq.kind.channel!.send({} as never, message)).resolves.toBe('sent')
+    expect(uploads).toBe(2)
+  })
+
+  it('stops automatic retries after an upload times out, including a late successful reply and connection replacement', async () => {
+    const { runtime, bridge: qq, store } = await startQq({ fileUploadTimeoutMs: 1000 })
+    const { message } = await fileResult(runtime)
+    const upload = deferred<{ file_id: string }>()
+    let uploads = 0
+    rpcHandlers.upload_private_file = () => { uploads++; return upload.promise }
+    runtime.outbox.send(message)
+    await runtime.sendReplies()
+    expect(store.receipts.get(message.id)).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryUncertain' } })
+    expect(runtime.effects.pending('reply', message.id)).toBe(false)
+    const receipt = await host!.runTool(runtime.masterId, 'orchestrator_read', { resource: `receipt/${message.id}` })
+    expect(receipt).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryUncertain' } })
+    upload.resolve({ file_id: 'late-success' })
+    await qq.setToken('replacement-after-timeout')
+    await waitFor(async () => (await qq.status()).state === 'connected')
+    runtime.outbox.send(message)
+    await runtime.sendReplies()
+    await expect(qq.kind.channel!.send({} as never, message)).resolves.toBe('uncertain')
+    expect(uploads).toBe(1)
+    expect(sent.filter(item => item.text === message.text)).toEqual([])
+  })
+
+  it('keeps an unconfirmed upload durable when the OneBot connection drops', async () => {
+    const { runtime, bridge: qq, store } = await startQq()
+    const { message } = await fileResult(runtime)
+    let uploads = 0
+    rpcHandlers.upload_private_file = () => {
+      uploads++
+      for (const socket of server!.clients) socket.terminate()
+      return new Promise(() => {})
+    }
+    runtime.outbox.send(message)
+    await runtime.sendReplies()
+    expect(store.receipts.get(message.id)).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryUncertain' } })
+    await waitFor(async () => (await qq.status()).state === 'connected')
+    await expect(qq.kind.channel!.send({} as never, message)).resolves.toBe('uncertain')
+    expect(uploads).toBe(1)
+  })
+
+  it('revokes queued and active deliveries when a completed ticket is stopped through QQ', async () => {
+    const { runtime, store } = await startQq()
+    const { ticketId, message } = await fileResult(runtime)
+    const upload = deferred<{ file_id: string }>()
+    let uploads = 0
+    rpcHandlers.upload_private_file = () => { uploads++; return upload.promise }
+    runtime.outbox.send(message)
+    runtime.outbox.send({ ...message, id: 'queued-result' })
+    await waitFor(() => uploads === 1)
+    await push(event(801, 'private', owner, [{ type: 'text', data: { text: '停止发送' } }]))
+    await waitFor(() => qqTriggers(runtime).length === 2)
+    const stopping = qqTriggers(runtime)[1]!
+    const result = await host!.route({ kind: 'stop', trigger_id: stopping.id, ticket_id: ticketId, reason: '停止发送' })
+    expect(result).toMatchObject({ decision: 'stop', ticket: { ticket_id: ticketId } })
+    await runtime.sendReplies()
+    expect(store.tickets.get(ticketId)?.ended).toMatchObject({ by: 'human', outcome: 'stopped' })
+    for (const id of [message.id, 'queued-result']) {
+      expect(store.receipts.get(id)).toMatchObject({ status: 'dropped', dropped: { reason: 'deliveryRevoked' } })
+      expect(runtime.effects.pending('reply', id)).toBe(false)
+    }
+    upload.resolve({ file_id: 'finished-at-peer' })
+    runtime.outbox.send(message)
+    await runtime.sendReplies()
+    expect(uploads).toBe(1)
+    expect(sent.filter(item => item.text === message.text)).toEqual([])
+    // A second stop still revokes a late legacy receipt without starting another worker.
+    store.receipts.add({ ...message, id: 'legacy-stopped-result' })
+    runtime.engine.stopTicket(ticketId)
+    expect(store.replyStatus('legacy-stopped-result')).toBe('dropped')
+  })
+
+  it('preserves a pending attempt from a previous host before replaying any QQ message parts', async () => {
+    const { runtime, bridge: qq, store } = await startQq()
+    const { message } = await fileResult(runtime)
+    let uploads = 0
+    rpcHandlers.upload_private_file = () => { uploads++; return null }
+    store.set(record(`qq-delivery:${message.id}`), { chunks: [], pending: { part: `artifact:${message.artifacts[0]}`, at: new Date().toISOString() } })
+    await expect(qq.kind.channel!.send({} as never, message)).resolves.toBe('uncertain')
+    expect(uploads).toBe(0)
+  })
+
   it('observes opted-in discussion in bounded threads, preserves native replies and stays silent in observe mode', async () => {
     const { runtime, store, bridge: qq } = await startQq({ groups: [{ id: groupId, listen: 'observe' }] })
     const observingSettings = store.settings(); observingSettings.eval.mode = 'observe'; store.saveSettings(observingSettings)

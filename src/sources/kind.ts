@@ -50,9 +50,11 @@ export interface SourceChannel<C> {
   allowed?(address: Record<string, string>, config: C): boolean
   /**
    * Sends a message idempotently by ID; returns `'gone'` when the target conversation no longer accepts replies.
+   * Returns `'uncertain'` after an unconfirmed side effect that must not be retried automatically.
+   * Stops starting new parts when `signal` is aborted; already accepted remote sends may complete.
    * @throws when delivery failed but may succeed on a later retry.
    */
-  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'>
+  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage, signal?: AbortSignal): Promise<'sent' | 'gone' | 'uncertain'>
   /** Returns the URL and label for `address`; `url` is empty when `links` lack the required deployment info. */
   link(address: Record<string, string>, links: ChannelLinks): ChannelLink
 }

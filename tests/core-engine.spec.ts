@@ -1332,15 +1332,17 @@ describe('gaps', () => {
     expect(h.repo.tickets.get(ticketId)!.assignments).toEqual(before.assignments)
     expect(h.delivered).toHaveLength(delivered)
   })
-  it('records a stop that names an unknown or ended ticket as ignored', () => {
+  it('ignores an unknown stop and accepts stops of completed tickets to revoke remaining deliveries', () => {
     const h = harness()
     const ended = accepted(h).ticketId!
     h.engine.report(ended, { state: 'ready', summary: 'Done' })
     for (const [id, ticketId] of [['2', 'missing'], ['3', ended]] as const) {
       h.tick(1); h.engine.receive(trigger(id, { threads: [{ source: 'chat', id: `t${id}` }] })); h.pump()
-      expect(h.decide(h.requests.at(-1)!, { kind: 'stop', ticketId, reason: 'stop it' })).toMatchObject({ kind: 'ignore', reason: [{ code: 'stopUnknown' }] })
+      const decision = h.decide(h.requests.at(-1)!, { kind: 'stop', ticketId, reason: 'stop it' })
+      if (ticketId === 'missing') expect(decision).toMatchObject({ kind: 'ignore', reason: [{ code: 'stopUnknown' }] })
+      else expect(decision).toMatchObject({ kind: 'stop', ticketId })
     }
-    expect(h.repo.tickets.get(ended)!.ended).toMatchObject({ by: 'executor', outcome: 'completed' })
+    expect(h.repo.tickets.get(ended)!.ended).toMatchObject({ by: 'human', outcome: 'stopped' })
   })
   it('refuses a direct decision on a Trigger the gate does not admit, and leaves the queue as it was', () => {
     const h = harness()

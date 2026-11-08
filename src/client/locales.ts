@@ -998,6 +998,7 @@ const TEXT = {
   'reason.explicitRouted': ['名单里的人明确请求，由主 Session 接单', 'Explicit request from someone on the list, accepted by the main Session'],
   'reason.legacyImport': ['从旧版工单记录导入', 'Imported from a legacy Ticket record'],
   'reason.channelGone': ['对话已无法接收消息', 'The conversation can no longer receive messages'],
+  'reason.deliveryUncertain': ['发送结果待确认，已停止自动重发', 'Delivery outcome is uncertain; automatic resend stopped'],
   'reason.channelIgnored': ['来源已不再监听这个对话', 'The Source no longer listens to this conversation'],
   'reason.hostRestarted': ['dsh-superagent 重启', 'dsh-superagent restarted'],
   'reason.retried': ['人工重试', 'Retried by a person'],

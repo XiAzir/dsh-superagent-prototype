@@ -69,7 +69,7 @@ export interface ResourceHost {
   readonly artifacts?: ArtifactRegistry
   attachmentReferences?(trigger: Trigger): SourceAttachmentRef[]
   readAttachment?(trigger: Trigger, id: string, sessionId: string, signal: AbortSignal): Promise<unknown>
-  readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
+  readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus' | 'receipts'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
   readonly commands: Commands
@@ -234,9 +234,9 @@ const ROUTES: readonly Route[] = [
   ['receipt/', read => {
     const id = read.rest
     if (!id || id.includes('/')) throw new Error('Choose one reply receipt id')
-    const status = main(read).store.replyStatus(id)
-    if (!status) throw new Error('Unknown reply receipt')
-    return { receipt_id: id, status }
+    const receipt = main(read).store.receipts.get(id)
+    if (!receipt) throw new Error('Unknown reply receipt')
+    return { receipt_id: id, status: receipt.status, ...receipt.dropped ? { dropped: receipt.dropped } : {} }
   }],
   ['settings', read => main(read).settings.view()],
   ['settings/', read => text(read, JSON.stringify(main(read).settings.block(read.rest)))],

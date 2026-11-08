@@ -284,6 +284,8 @@ export class Runtime extends Service implements SourceHost {
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         allowMessage: message => {
+          if (message.ticketId && store.tickets.get(message.ticketId)?.ended?.by === 'human'
+            && message.purpose !== 'status' && message.purpose !== 'answer') return false
           if (message.purpose === 'result' && message.ticketId && store.tickets.get(message.ticketId)?.requestRedirect) return false
           if (message.completionKey) {
             const ticket = message.ticketId && store.tickets.get(message.ticketId)
@@ -337,7 +339,7 @@ export class Runtime extends Service implements SourceHost {
               .catch(error => ctx.logger.warn('Remote cancellation remains queued: %s', String(error)))
             this.personalRuntime.attention.resolve({ ticketId: ended.id })
             for (const receipt of store.receipts.waiting()) if (receipt.ticketId === ended.id
-              && (receipt.id.startsWith('personal-action:') || receipt.id.startsWith('personal-attention:'))) outbox.withdraw(receipt.id)
+              && (ended.ended?.by === 'human' || receipt.id.startsWith('personal-action:') || receipt.id.startsWith('personal-attention:'))) outbox.withdraw(receipt.id)
           }
           if (ended && setup.configured() && setup.deployment.repository) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''

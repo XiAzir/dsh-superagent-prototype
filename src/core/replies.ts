@@ -129,7 +129,7 @@ export class Replies extends EnginePart {
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
     if (!channel) throw new UserError('noChannel')
     this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {},
-      ...ticket?.acceptance ? { purpose: request.purpose as 'answer' | 'result' | 'attention' } : {}, ...proof ? { completionKey: proof } : {},
+      purpose: request.purpose, ...proof ? { completionKey: proof } : {},
       ...artifacts.length ? { artifacts } : {} })
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)

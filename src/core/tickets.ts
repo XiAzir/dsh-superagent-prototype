@@ -535,7 +535,18 @@ export class Tickets extends EnginePart {
    */
   end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string): void {
     const ticket = this.require(ticketId)
-    if (!liveTicket(ticket)) return
+    if (!liveTicket(ticket)) {
+      if (by === 'human') {
+        // Completed work may still have outbound deliveries. Repeated stops revoke those too.
+        ticket.ended = { at, by, outcome, ...reason ? { reason } : {} }; ticket.updatedAt = at
+        this.cancelPendingFollowups(ticket)
+        this.repo.tickets.save(ticket)
+        settleTicketRequests(this.options, ticket)
+        this.repo.tickets.save(ticket)
+        this.emit('ticket.ended', { ticketId, by, outcome, ...reason ? { reason } : {} })
+      }
+      return
+    }
     const stopping = ticket.assignments.filter(assignment => assignment.state !== 'ended')
     const why = reason && reason !== outcome ? { reason } : {}
     const until = readUntil(ticket)

@@ -1311,7 +1311,7 @@ it('keeps the receipt of a message withdrawn while it went out, so its id is not
   runtime.outbox.send({ id: 'raced', channel: trigger.channel!, text: 'Done', kind: 'reply' })
   await runtime.sendReplies()
   runtime.outbox.send({ id: 'raced', channel: trigger.channel!, text: 'Again', kind: 'reply' })
-  expect([runtime.store.receipts.get('raced'), runtime.effects.pending('reply')]).toEqual([expect.objectContaining({ text: 'Done', status: 'sent' }), false])
+  expect([runtime.store.receipts.get('raced'), runtime.effects.pending('reply')]).toEqual([expect.objectContaining({ text: 'Done', status: 'dropped', dropped: { at: expect.any(String), reason: 'deliveryRevoked' } }), false])
 })
 
 it('resumes several ended tickets on one thread from one message without the launch waiting on itself', async () => {
