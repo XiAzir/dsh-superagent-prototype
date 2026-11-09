@@ -25,7 +25,7 @@ import urllib.request
 from pathlib import Path
 
 REPO = "XiAzir/dsh-superagent"
-BRANCH = "linux"
+BRANCHES = ("codex/autonomy-plan-20261107", "linux")
 API = "https://api.cnb.cool/"
 PRIVATE = Path("/root/.cnb-superagent")
 SN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -61,7 +61,7 @@ def main():
             item for item in items
             if isinstance(item, dict)
             and item.get("slug") == REPO
-            and item.get("branch") == BRANCH
+            and item.get("branch") in BRANCHES
             and item.get("status") == "running"
         )
         has_more = value.get("hasMore") is True

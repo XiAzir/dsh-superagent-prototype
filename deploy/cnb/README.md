@@ -4,7 +4,7 @@
 
 ## 目标规格与访问
 
-- `.cnb.yml` 的 `linux.vscode` 使用4核、8GB，Docker service承载所选QQ后端，离线保留18小时。首次配置将Worker并发设为1；已有配置继续保留。更高内存规格需核对对应runner资源。
+- `.cnb.yml` 的 `codex/autonomy-plan-20261107.vscode` 与 `linux.vscode` 共用部署流程，使用4核、8GB，Docker service承载所选QQ后端，离线保留18小时。当前部署及外部恢复目标为 `codex/autonomy-plan-20261107`。首次配置将Worker并发设为1；已有配置继续保留。更高内存规格需核对对应runner资源。
 - 本部署的公网 Web 入口为 `https://superagent.1994622.xyz/`，使用独立 HTTPS BasicAuth 登录；用户名 `azir`，密码保存在运维仓库已忽略的 `local/secrets.md` 对应条目。云端环境恢复后会自动重建反向隧道，日常访问直接使用域名。
 - Superagent web 服务监听 `127.0.0.1:13082`。客户端通过当前 CNB 工作区 SSH 目标建立隧道：
 
@@ -18,7 +18,7 @@ Windows 推荐从 PowerShell 7 运行仓库的连接助手：
 pwsh -File scripts/connect-cnb.ps1
 ```
 
-它经 `ssh wuhan` 查询本项目当前云环境，显示本机14082端口的认证链接并保持前台SSH隧道。云环境重建后重新执行即可；`-InfoOnly`显示当前SSH目标，`-VerifyOnly`验证认证链接且隐藏token。使用默认SSH known_hosts；首次连接按SSH提示核对主机。`-KnownHostsFile`可传已有CNB主机密钥文件。
+它经 `ssh wuhan` 查询本项目在 Codex 或 Linux 分支创建的唯一运行中云环境，显示本机14082端口的认证链接并保持前台SSH隧道。工作区内切换 Git 分支后，CNB 的创建分支元数据仍沿用原值；连接助手兼容这段迁移期。云环境重建后重新执行即可；`-InfoOnly`显示当前SSH目标，`-VerifyOnly`验证认证链接且隐藏token。使用默认SSH known_hosts；首次连接按SSH提示核对主机。`-KnownHostsFile`可传已有CNB主机密钥文件。
 
 - 备份接收端在固定入口反代至本机 `127.0.0.1:9012`，API 前缀为 `/superagent-runtime`。公网入口应使用 HTTPS，访问令牌通过 `Authorization: Bearer ...` 传送。
 - CNB 资源回收后，下一工作区由 runtime 先获取180秒租约，再从接收端恢复快照；成功运行后每5分钟创建并上传新快照。接收端的租约与备份元数据保存在 `/var/lib/cnb-superagent/state.json`，latest 与 previous 存放两代 ZIP。
