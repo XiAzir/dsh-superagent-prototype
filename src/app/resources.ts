@@ -18,7 +18,7 @@ import type { Sessions } from './sessions.ts'
 import type { ArtifactRegistry } from './artifacts.ts'
 import type { SourceAttachmentRef } from '../sources/kind.ts'
 import type { Settings } from './settings.ts'
-import { KV } from '../kv.ts'
+import { KV, record } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import { readSessionEvents } from '../infra/session-history.ts'
@@ -236,7 +236,10 @@ const ROUTES: readonly Route[] = [
     if (!id || id.includes('/')) throw new Error('Choose one reply receipt id')
     const receipt = main(read).store.receipts.get(id)
     if (!receipt) throw new Error('Unknown reply receipt')
-    return { receipt_id: id, status: receipt.status, ...receipt.dropped ? { dropped: receipt.dropped } : {} }
+    const uploads = main(read).store.get(record<import('./qq-source.ts').QqUploadProgress[]>('qq-upload-progress'))
+      ?.filter(item => item.receiptId === id)
+    return { receipt_id: id, status: receipt.status, ...receipt.dropped ? { dropped: receipt.dropped } : {},
+      ...uploads?.length ? { uploads } : {} }
   }],
   ['settings', read => main(read).settings.view()],
   ['settings/', read => text(read, JSON.stringify(main(read).settings.block(read.rest)))],

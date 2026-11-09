@@ -32,6 +32,48 @@ function makeClient(url: string, extra: Partial<ConstructorParameters<typeof One
 }
 
 describe('OneBotClient', () => {
+  it('keeps correlated upload progress separate from the final reply and renews the idle timeout on advancing bytes', async () => {
+    const { url } = await forwardServer((socket, packet) => {
+      for (const [delay, uploaded] of [[30, 20], [90, 50], [150, 100]]) setTimeout(() => {
+        socket.send(JSON.stringify({ status: 'async', retcode: 0, echo: packet.echo,
+          data: { type: 'upload_progress', uploaded_bytes: uploaded, total_bytes: 100, phase: 'uploading' } }))
+      }, delay)
+      setTimeout(() => socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: packet.echo, data: { file_id: 'uploaded' } })), 200)
+    })
+    const client = makeClient(url); await client.start(); await waitConnected(client)
+    const progress: number[] = []
+    const result = await client.call('upload_private_file', {}, undefined, 100, { totalTimeoutMs: 1000,
+      onProgress: value => progress.push(value.uploadedBytes) })
+    expect(result).toEqual({ file_id: 'uploaded' })
+    expect(progress).toEqual([20, 50, 100])
+  })
+
+  it('expires stalled uploads despite repeated progress packets and ignores regressing, invalid and other-request frames', async () => {
+    const { url } = await forwardServer((socket, packet) => {
+      const frame = (echo: unknown, uploaded: number, total = 100) => socket.send(JSON.stringify({ status: 'async', retcode: 0, echo,
+        data: { type: 'upload_progress', uploaded_bytes: uploaded, total_bytes: total, phase: 'uploading' } }))
+      frame(packet.echo, 10)
+      frame(packet.echo, 9); frame(packet.echo, 101); frame(packet.echo, 20, 200); frame('unknown', 90)
+      for (const delay of [20, 40, 60, 80]) setTimeout(() => frame(packet.echo, 10), delay)
+    })
+    const client = makeClient(url); await client.start(); await waitConnected(client)
+    const progress: number[] = []
+    await expect(client.call('upload_private_file', {}, undefined, 100, { totalTimeoutMs: 1000,
+      onProgress: value => progress.push(value.uploadedBytes) })).rejects.toThrow('stalled')
+    expect(progress).toEqual([10])
+  })
+
+  it('enforces a total upload deadline while bytes keep advancing', async () => {
+    const { url } = await forwardServer((socket, packet) => {
+      for (const [delay, uploaded] of [[10, 10], [40, 20], [70, 30], [100, 40]]) setTimeout(() => {
+        socket.send(JSON.stringify({ status: 'async', retcode: 0, echo: packet.echo,
+          data: { type: 'upload_progress', uploaded_bytes: uploaded, total_bytes: 100, phase: 'uploading' } }))
+      }, delay)
+    })
+    const client = makeClient(url); await client.start(); await waitConnected(client)
+    await expect(client.call('upload_private_file', {}, undefined, 80, { totalTimeoutMs: 120,
+      onProgress: () => {} })).rejects.toThrow('total timeout')
+  })
   it('correlates concurrent RPC responses by echo and exposes login self id', async () => {
     const { url } = await forwardServer((socket, packet) => {
       if (packet.action === 'get_login_info') socket.send(JSON.stringify({ status: 'ok', retcode: 0, data: { user_id: 9988 }, echo: packet.echo }))

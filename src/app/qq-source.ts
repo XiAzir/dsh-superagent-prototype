@@ -52,7 +52,14 @@ export interface QqStatus {
   enabled: boolean; mode: 'forward' | 'reverse'; state: 'disabled' | OneBotState; detail: string; selfId?: string
   forwardUrl: string; reverseUrl: string; tokenConfigured: boolean; allowedUsers: number; groups: number
   received: number; lastMessageAt?: string
+  uploads?: QqUploadProgress[]
 }
+export interface QqUploadProgress {
+  receiptId: string; ticketId?: string; artifactId: string; fileName: string
+  uploadedBytes: number; totalBytes: number; percent: number
+  phase: 'preparing' | 'uploading' | 'sending' | 'sent' | 'uncertain' | 'cancelled'; updatedAt: string
+}
+const uploadsKey = record<QqUploadProgress[]>('qq-upload-progress')
 interface QqHost {
   stateDir: string
   artifacts?: Pick<ArtifactRegistry, 'verify'>
@@ -135,7 +142,20 @@ export class QqBridge {
       reverseUrl: `ws://${config.host === '::1' ? '[::1]' : config.host}:${config.port}${config.path}`,
       tokenConfigured: !!await this.host.resolveToken(config.tokenRef).catch(() => undefined),
       allowedUsers: this.host.store.settings().policy.sources.qq?.allowed.length ?? 0, groups: config.groups.length,
-      received: stats?.received ?? 0, ...stats?.lastMessageAt ? { lastMessageAt: stats.lastMessageAt } : {} }
+      received: stats?.received ?? 0, ...stats?.lastMessageAt ? { lastMessageAt: stats.lastMessageAt } : {},
+      uploads: this.uploads() }
+  }
+  private uploads(): QqUploadProgress[] {
+    return (this.host.store.get(uploadsKey) ?? []).map(item => {
+      const receipt = this.host.store.receipts.get(item.receiptId)
+      return receipt?.status === 'dropped' && item.phase !== 'sent' ? { ...item, phase: receipt.dropped?.reason === 'deliveryRevoked'
+        ? 'cancelled' as const : 'uncertain' as const } : item
+    })
+  }
+  private progress(item: QqUploadProgress): void {
+    const prior = this.host.store.get(uploadsKey) ?? []
+    this.host.store.set(uploadsKey, [{ ...item, updatedAt: new Date().toISOString() },
+      ...prior.filter(row => row.receiptId !== item.receiptId || row.artifactId !== item.artifactId)].slice(0, 20))
   }
   async setToken(value: string): Promise<{ configured: boolean }> {
     const token = z.string().max(4000).parse(value).trim()
@@ -328,13 +348,24 @@ export class QqBridge {
         const contents = await readFile(artifact.path)
         if (signal.aborted || !this.canSend(address)) return 'gone'
         const file = `base64://${contents.toString('base64')}`
+        let progress: QqUploadProgress = { receiptId: message.id, ticketId: message.ticketId, artifactId: id, fileName: artifact.name,
+          uploadedBytes: 0, totalBytes: artifact.size, percent: 0, phase: 'preparing', updatedAt: new Date().toISOString() }
+        if (!native) this.progress(progress)
         sending(`artifact:${id}`)
         const reply = native
           ? await client.call<{ message_id?: string | number }>(address.message_type === 'group' ? 'send_group_msg' : 'send_private_msg',
             { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id,
               message: [{ type: artifact.kind, data: { file } }] }, signal, config.fileUploadTimeoutMs)
           : await client.call<{ file_id?: string | null }>(address.message_type === 'group' ? 'upload_group_file' : 'upload_private_file',
-            { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file, name: artifact.name }, signal, config.fileUploadTimeoutMs)
+            { [address.message_type === 'group' ? 'group_id' : 'user_id']: address.recipient_id, file, name: artifact.name,
+              superagent_progress: true }, signal, config.fileUploadTimeoutMs, {
+              totalTimeoutMs: Math.max(config.fileUploadTimeoutMs, 15 * 60_000),
+              onProgress: value => {
+                if (signal.aborted) return
+                progress = { ...progress, ...value, percent: Math.floor(value.uploadedBytes / value.totalBytes * 100) }
+                this.progress(progress)
+              },
+            })
         // Upload APIs may return empty data on success; the successful RPC is their confirmation.
         const fileId = native ? String((reply as { message_id?: string | number })?.message_id ?? '') : (reply as { file_id?: string | null })?.file_id
         if (native ? !/^-?\d+$/.test(String(fileId)) : fileId != null && typeof fileId !== 'string') throw new Error('OneBot did not confirm the artifact delivery')
@@ -346,6 +377,7 @@ export class QqBridge {
           if (native) this.threads.recordOutgoing(String(fileId), address.thread_id!, {
             messageType: address.message_type as 'private' | 'group', recipientId: address.recipient_id!, selfId: address.self_id! }, `[${artifact.kind}] ${artifact.name}`)
         })
+        if (!native) this.progress({ ...progress, uploadedBytes: artifact.size, totalBytes: artifact.size, percent: 100, phase: 'sent' })
       }
       if (delivery.chunks.some((chunk, index) => chunk.text !== chunks[index])) throw new Error('QQ 回复分段配置发生变化，请恢复原分段大小后重试。')
       for (let index = delivery.chunks.length; index < chunks.length; index++) {
@@ -367,6 +399,10 @@ export class QqBridge {
       }
       return 'sent'
     } catch (error) {
+      for (const item of this.host.store.get(uploadsKey) ?? []) if (item.receiptId === message.id
+        && ['preparing', 'uploading', 'sending'].includes(item.phase)) {
+        this.progress({ ...item, phase: signal.aborted ? 'cancelled' : 'uncertain' })
+      }
       if (error instanceof OneBotRpcError) {
         delivery = this.host.store.get(deliveryKey(message.id)) ?? { chunks: [] }
         delete delivery.pending

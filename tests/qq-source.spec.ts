@@ -21,7 +21,7 @@ let sent: { action: string; text: string; params: Record<string, unknown> }[] = 
 let confirmed: { action: string; text: string; params: Record<string, unknown> }[] = []
 let failSendNumber: number | undefined
 let sendCount = 0
-let rpcHandlers: Record<string, (params: Record<string, unknown>) => unknown> = {}
+let rpcHandlers: Record<string, (params: Record<string, unknown>, progress?: (uploaded: number, total: number) => void) => unknown> = {}
 let loginInfoCalls = 0
 let loginInfoTimes: number[] = []
 
@@ -54,7 +54,10 @@ async function startQq(options: Record<string, unknown> = {}, waitConnected = tr
           socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
         }, () => socket.send(JSON.stringify({ status: 'failed', retcode: 1200, data: {}, echo: packet.echo })))
       } else if (rpcHandlers[packet.action]) {
-        Promise.resolve(rpcHandlers[packet.action]!(packet.params ?? {})).then(data => {
+        Promise.resolve(rpcHandlers[packet.action]!(packet.params ?? {}, (uploaded, total) => {
+          socket.send(JSON.stringify({ status: 'async', retcode: 0, echo: packet.echo,
+            data: { type: 'upload_progress', uploaded_bytes: uploaded, total_bytes: total, phase: 'uploading' } }))
+        })).then(data => {
           socket.send(JSON.stringify({ status: 'ok', retcode: 0, data, echo: packet.echo }))
         })
       } else if (packet.action === 'get_group_file_url' || packet.action === 'get_private_file_url') {
@@ -141,6 +144,31 @@ async function fileResult(runtime: Host['runtime'], type: 'private' | 'group' = 
 }
 
 describe('QQ source with a real OneBot WebSocket and Runtime', () => {
+  it('persists and exposes SL acknowledged upload progress while the final send receipt still waits', async () => {
+    const { runtime, bridge: qq, store } = await startQq()
+    const { message } = await fileResult(runtime)
+    const upload = deferred<{ file_id: string }>()
+    let uploads = 0
+    rpcHandlers.upload_private_file = (params, progress) => {
+      expect(params.superagent_progress).toBe(true)
+      uploads++
+      if (uploads === 1) { progress!(6, 12); return upload.promise }
+      return { file_id: 'second-file' }
+    }
+    runtime.outbox.send(message)
+    await waitFor(async () => (await qq.status()).uploads?.some(item => item.uploadedBytes === 6) === true)
+    expect(store.replyStatus(message.id)).toBe('pending')
+    const progress = (await qq.status()).uploads!.find(item => item.fileName === 'one.apk')!
+    expect(progress).toMatchObject({ receiptId: message.id, uploadedBytes: 6, totalBytes: 12, percent: 50, phase: 'uploading' })
+    const read = await host!.runTool(runtime.masterId, 'orchestrator_read', { resource: `receipt/${message.id}` })
+    expect(read).toMatchObject({ status: 'pending', uploads: [expect.objectContaining({ uploadedBytes: 6, percent: 50 })] })
+    upload.resolve({ file_id: 'first-file' })
+    await runtime.sendReplies()
+    expect(store.replyStatus(message.id)).toBe('sent')
+    expect((await qq.status()).uploads).toHaveLength(2)
+    expect((await qq.status()).uploads!.every(item => item.percent === 100 && item.phase === 'sent')).toBe(true)
+    expect(uploads).toBe(2)
+  })
   it('waits longer for file uploads than ordinary RPCs', async () => {
     const { runtime, store } = await startQq({ requestTimeoutMs: 1000, fileUploadTimeoutMs: 5000 })
     const { message } = await fileResult(runtime)

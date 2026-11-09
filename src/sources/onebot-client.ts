@@ -15,7 +15,13 @@ export interface OneBotClientOptions {
   onError?: (error: Error) => void
 }
 interface RpcResponse { status?: unknown; retcode?: unknown; data?: unknown; echo?: unknown }
-interface Pending { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void }
+export interface OneBotUploadProgress { uploadedBytes: number; totalBytes: number; phase: 'uploading' | 'sending' }
+interface CallProgress { onProgress(value: OneBotUploadProgress): void; totalTimeoutMs: number }
+interface Pending {
+  resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>
+  signal?: AbortSignal; abort?: () => void; hardTimer?: ReturnType<typeof setTimeout>
+  progress?: CallProgress; lastProgress?: OneBotUploadProgress; renew?(): void
+}
 
 /** The peer explicitly rejected an RPC, so its side effect was not accepted. */
 export class OneBotRpcError extends Error {}
@@ -61,7 +67,7 @@ export class OneBotClient {
   }
 
   async call<T = unknown>(action: string, params: Record<string, unknown> = {}, signal?: AbortSignal,
-    timeoutMs = this.connection.requestTimeoutMs ?? DEFAULT_TIMEOUT): Promise<T> {
+    timeoutMs = this.connection.requestTimeoutMs ?? DEFAULT_TIMEOUT, progress?: CallProgress): Promise<T> {
     if (this.stopped || !this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('OneBot is not connected')
     if (signal?.aborted) throw new Error('OneBot request aborted')
     // Numeric echoes are part of the OneBot v11 protocol and tolerate peers
@@ -69,7 +75,14 @@ export class OneBotClient {
     const echo = String(++this.nextEcho)
     return await new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC timeout: ${action}`)), timeoutMs)
-      const pending: Pending = { resolve: value => resolve(value as T), reject, timer, signal }
+      const pending: Pending = { resolve: value => resolve(value as T), reject, timer, signal, progress }
+      if (progress) {
+        pending.renew = () => {
+          clearTimeout(pending.timer)
+          pending.timer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC stalled: ${action}`)), timeoutMs)
+        }
+        pending.hardTimer = setTimeout(() => this.settle(echo, new Error(`OneBot RPC total timeout: ${action}`)), progress.totalTimeoutMs)
+      }
       if (signal) {
         pending.abort = () => this.settle(echo, new Error('OneBot request aborted'))
         signal.addEventListener('abort', pending.abort, { once: true })
@@ -117,6 +130,7 @@ export class OneBotClient {
     if (!item) return
     this.pending.delete(echo)
     clearTimeout(item.timer)
+    clearTimeout(item.hardTimer)
     if (item.abort && item.signal) item.signal.removeEventListener('abort', item.abort)
     if (error) item.reject(error); else item.resolve(value)
   }
@@ -212,6 +226,24 @@ export class OneBotClient {
       }
       if (response.status === 'failed' || response.retcode !== 0) {
         this.settle(echo, new OneBotRpcError(`OneBot RPC failed (retcode ${response.retcode})`)); return
+      }
+      const data = response.data as Record<string, unknown> | undefined
+      if (data?.type === 'upload_progress') {
+        const pending = this.pending.get(echo)!
+        const uploadedBytes = data.uploaded_bytes, totalBytes = data.total_bytes, phase = data.phase
+        if (!pending.progress || !Number.isSafeInteger(uploadedBytes) || !Number.isSafeInteger(totalBytes)
+          || Number(uploadedBytes) < 0 || Number(totalBytes) <= 0 || Number(uploadedBytes) > Number(totalBytes)
+          || (phase !== 'uploading' && phase !== 'sending')) return
+        const last = pending.lastProgress
+        if (last && (last.totalBytes !== totalBytes || Number(uploadedBytes) < last.uploadedBytes
+          || last.phase === 'sending' && phase !== 'sending')) return
+        if (!last || Number(uploadedBytes) > last.uploadedBytes || phase !== last.phase) {
+          const value: OneBotUploadProgress = { uploadedBytes: Number(uploadedBytes), totalBytes: Number(totalBytes), phase }
+          pending.lastProgress = value
+          pending.renew?.()
+          try { pending.progress.onProgress(value) } catch (error) { this.reportError(error) }
+        }
+        return
       }
       this.settle(echo, undefined, response.data)
       return

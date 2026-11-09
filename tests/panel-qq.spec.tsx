@@ -7,6 +7,18 @@ import { server } from './fixtures/panel-server.ts'
 
 usePanel()
 
+it('shows confirmed QQ upload bytes and percent separately from sending and delivery confirmation', async () => {
+  server.qqStatus.uploads = [{ receiptId: 'upload', artifactId: 'file', fileName: 'installer.apk',
+    uploadedBytes: 23 * 1048576, totalBytes: 49 * 1048576, percent: 46, phase: 'uploading', updatedAt: new Date().toISOString() }]
+  at({ page: 'settings', query: { group: 'source', source: 'qq' } })
+  await mount()
+  expect(text()).toContain('23.0 / 49.0 MiB · 46%')
+  const progress = document.querySelector('progress[aria-label="installer.apk"]') as HTMLProgressElement
+  expect(progress.value).toBe(23 * 1048576)
+  expect(progress.max).toBe(49 * 1048576)
+  expect(text()).toContain(zh['qq.upload.uploading'])
+})
+
 it('shows live QQ status, mode-specific OneBot guidance, and saves or clears the token separately', async () => {
   at({ page: 'settings', query: { group: 'source', source: 'qq' } })
   await mount()

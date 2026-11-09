@@ -13,6 +13,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+try:
+    from deploy.cnb.snowluma_progress import prepare_bundle
+except ModuleNotFoundError:
+    from snowluma_progress import prepare_bundle
+
 
 # Docker Hub v2.4.0 multi-platform index (verified 2026-11-05).
 IMAGE = 'motricseven7/snowluma@sha256:9b035551e8615a20d8367601a6a61c641796d9ed870f5501830f045b68f74667'
@@ -74,6 +79,7 @@ class SnowLuma:
         self.sleep = sleep
         self.clock = clock
         self.config_path = self.root / CONFIG_NAME
+        self.progress_bundle = self.root / 'runtime' / 'index.mjs'
         self.paths = {
             'data': self.root / 'data',
             'config': self.root / '.config',
@@ -237,7 +243,19 @@ class SnowLuma:
             f"{self.paths['data']}:/app/data",
             f"{self.paths['config']}:/app/.config",
             f"{self.paths['share']}:/app/.local/share",
+            f'{self.progress_bundle}:/app/runtime/index.mjs:ro',
         }
+
+    def _prepare_progress_bundle(self) -> None:
+        self._assert_managed_path(self.progress_bundle)
+        if self.progress_bundle.is_file():
+            return
+        result = self._run(['docker', 'run', '--rm', '--pull=never', '--entrypoint', 'cat', IMAGE,
+                            '/app/runtime/index.mjs'], timeout=60)
+        try:
+            prepare_bundle(self.progress_bundle, _as_text(result.stdout))
+        except ValueError as exc:
+            raise SnowLumaError(str(exc)) from None
 
     @staticmethod
     def _expected_env() -> dict[str, str]:
@@ -311,6 +329,7 @@ class SnowLuma:
             '-v', f'{self.paths["data"]}:/app/data',
             '-v', f'{self.paths["config"]}:/app/.config',
             '-v', f'{self.paths["share"]}:/app/.local/share',
+            '-v', f'{self.progress_bundle}:/app/runtime/index.mjs:ro',
             IMAGE,
         ])
         env = _safe_child_environment()
@@ -358,6 +377,7 @@ class SnowLuma:
         if getattr(image_probe, 'returncode', 1) != 0:
             self._run(['docker', 'pull', IMAGE], timeout=PULL_TIMEOUT)
         self._probe_bind()
+        self._prepare_progress_bundle()
         info = self._container_info()
         if info is not None:
             self._assert_owned(info)

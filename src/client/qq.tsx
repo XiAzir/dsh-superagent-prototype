@@ -46,6 +46,15 @@ export function QqSourcePanel({ config }: { config: Record<string, unknown> }) {
     {error && <p className="dt-error">{errorText(error)}</p>}
     {data && <>
       {data.detail && <p className={data.state === 'error' ? 'dt-error' : 'dt-hint'}>{data.detail}</p>}
+      {!!data.uploads?.length && <div aria-label={t('qq.uploads')}>
+        <h4>{t('qq.uploads')}</h4>
+        {data.uploads.map(item => <div key={`${item.receiptId}:${item.artifactId}`} className="dt-field">
+          <div className="dt-row-meta"><span>{item.fileName}</span><Tag tone={item.phase === 'sent' ? 'success' : 'neutral'}>
+            {t(`qq.upload.${item.phase}`)}</Tag></div>
+          <progress aria-label={item.fileName} max={item.totalBytes} value={item.uploadedBytes} style={{ width: '100%' }} />
+          <span className="dt-hint">{(item.uploadedBytes / 1048576).toFixed(1)} / {(item.totalBytes / 1048576).toFixed(1)} MiB · {item.percent}%</span>
+        </div>)}
+      </div>}
       <div className="dt-row-meta">
         <Tag tone="neutral">{t(`qq.mode.${data.mode}`)}</Tag>
         <span>{t('qq.allowedUsers')}: {data.allowedUsers}</span>

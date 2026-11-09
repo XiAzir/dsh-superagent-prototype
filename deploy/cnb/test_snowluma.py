@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from deploy.cnb import snowluma
+from deploy.cnb import snowluma_progress
 
 
 class FakeDocker:
@@ -32,6 +33,8 @@ class FakeDocker:
             self.pulled = True
             return self.result(stdout='image pulled')
         if args[:3] == ['docker', 'run', '--rm']:
+            if '--entrypoint' in args and args[args.index('--entrypoint') + 1] == 'cat':
+                return self.result(stdout='\n'.join(old for old, _new in snowluma_progress.REPLACEMENTS))
             mount = args[args.index('-v') + 1]
             marker_path = Path(mount.rsplit(':', 2)[0])
             return self.result(stdout=marker_path.read_text(encoding='ascii'))
@@ -87,6 +90,8 @@ class FakeDocker:
                 i += 2
             elif arg == '--cap-add':
                 caps.append(args[i + 1]); i += 2
+            elif arg.startswith('--cap-add='):
+                caps.append(arg.split('=', 1)[1]); i += 1
             elif arg.startswith('--shm-size='):
                 shm_size = 1073741824; i += 1
             elif arg == snowluma.IMAGE:
@@ -121,6 +126,7 @@ class SnowLumaTests(unittest.TestCase):
             'SUPERAGENT_ARCHIVE_TOKEN': 'supervisor-private-token',
             'SUPERAGENT_WEB_TUNNEL_KEY_B64': 'supervisor-tunnel-private-key',
             'PATH': os.environ.get('PATH', ''),
+            'SystemRoot': os.environ.get('SystemRoot', 'C:\\Windows'),
         }, clear=True)
         self._env.start()
 
@@ -244,6 +250,49 @@ class SnowLumaTests(unittest.TestCase):
         self.write_config({'enabled': True, 'http_enabled': 'yes'})
         with self.assertRaisesRegex(snowluma.SnowLumaError, 'boolean'):
             self.client.ensure_started(timeout=0)
+
+    def test_progress_bundle_is_persisted_mounted_read_only_and_reused(self):
+        self.write_config({'enabled': True})
+        with patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started()
+            self.client.ensure_started()
+        path = self.client.progress_bundle
+        self.assertTrue(path.read_text().startswith(snowluma_progress.MARKER))
+        self.assertIn(f'{path}:/app/runtime/index.mjs:ro', self.docker.info['HostConfig']['Binds'])
+        extracts = [args for args, _env in self.docker.calls if '/app/runtime/index.mjs' in args]
+        self.assertEqual(len(extracts), 1)
+        self.assertEqual(snowluma_progress.patch_bundle(path.read_text()), path.read_text())
+
+    def test_progress_patch_checks_anchors_before_publishing(self):
+        with self.assertRaises(ValueError):
+            snowluma_progress.prepare_bundle(self.tmp / 'runtime.mjs', '// incompatible runtime')
+        self.assertFalse((self.tmp / 'runtime.mjs').exists())
+
+    def test_progress_events_follow_the_request_and_opt_in_without_altering_final_results(self):
+        source = snowluma_progress.HELPERS + r'''
+import assert from "node:assert/strict";
+const frames = [];
+const emit = async raw => { frames.push(JSON.parse(raw)); };
+const upload = (echo, bytes) => superagentWithUploadProgress("upload_private_file", {superagent_progress:true}, echo, emit, () => true, async () => {
+    await new Promise(resolve => setTimeout(resolve, echo === 1 ? 10 : 1));
+    await superagentReportUpload(bytes, bytes);
+    await superagentReportUpload(bytes, bytes, "sending");
+    return {status:"ok",retcode:0,data:{file_id:`file-${echo}`}};
+});
+const results = await Promise.all([upload(1, 1024), upload(2, 2048),
+    superagentWithUploadProgress("upload_private_file", {}, 3, emit, () => true, async () => {
+        await superagentReportUpload(3000, 3000); return "legacy-result";
+    })]);
+assert.deepEqual(frames.filter(frame => frame.echo === 1).map(frame => frame.data.uploaded_bytes), [1024,1024]);
+assert.deepEqual(frames.filter(frame => frame.echo === 2).map(frame => frame.data.uploaded_bytes), [2048,2048]);
+assert.equal(frames.length, 4);
+assert.equal(results[0].data.file_id, "file-1");
+assert.equal(results[1].data.file_id, "file-2");
+assert.equal(results[2], "legacy-result");
+'''
+        result = snowluma.subprocess.run(['node', '--input-type=module', '-'], input=source,
+                                        capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':
