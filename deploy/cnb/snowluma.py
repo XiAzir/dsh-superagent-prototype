@@ -14,9 +14,9 @@ import urllib.request
 from typing import Any, Callable
 
 try:
-    from deploy.cnb.snowluma_progress import prepare_bundle
+    from deploy.cnb.snowluma_progress import patch_bundle, prepare_bundle
 except ModuleNotFoundError:
-    from snowluma_progress import prepare_bundle
+    from snowluma_progress import patch_bundle, prepare_bundle
 
 
 # Docker Hub v2.4.0 multi-platform index (verified 2026-11-05).
@@ -249,6 +249,11 @@ class SnowLuma:
     def _prepare_progress_bundle(self) -> None:
         self._assert_managed_path(self.progress_bundle)
         if self.progress_bundle.is_file():
+            original = self.progress_bundle.read_text(encoding='utf-8')
+            patched = patch_bundle(original)
+            if patched != original:
+                # Keep the inode used by an existing read-only Docker bind mount.
+                self.progress_bundle.write_text(patched, encoding='utf-8', newline='\n')
             return
         result = self._run(['docker', 'run', '--rm', '--pull=never', '--entrypoint', 'cat', IMAGE,
                             '/app/runtime/index.mjs'], timeout=60)

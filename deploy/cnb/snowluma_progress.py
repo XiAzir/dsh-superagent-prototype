@@ -25,7 +25,7 @@ async function superagentWithUploadProgress(action, params, echo, emit, isAlive,
     return superagentUploadContext.run({ send: async data => {
         if (isAlive && !isAlive()) return;
         if (data.phase === lastPhase && data.uploaded_bytes === latest) return;
-        if (data.phase === lastPhase && data.uploaded_bytes < data.total_bytes && Date.now() - lastAt < 500) return;
+        if (data.phase === lastPhase && data.uploaded_bytes < data.total_bytes && Date.now() - lastAt < 8000) return;
         latest = data.uploaded_bytes; lastAt = Date.now(); lastPhase = data.phase;
         await emit(JSON.stringify({ status: "async", retcode: 0, data, ...(echo === undefined ? {} : { echo }) }));
     } }, run);
@@ -47,7 +47,7 @@ REPLACEMENTS = (
 def patch_bundle(source: str) -> str:
     """Apply exact anchors once; normal OneBot calls retain their original response."""
     if source.startswith(MARKER + '\n'):
-        return source
+        return source.replace('Date.now() - lastAt < 500) return;', 'Date.now() - lastAt < 8000) return;', 1)
     for old, new in REPLACEMENTS:
         if source.count(old) != 1:
             raise ValueError('SnowLuma upload progress patch does not match the selected runtime.')

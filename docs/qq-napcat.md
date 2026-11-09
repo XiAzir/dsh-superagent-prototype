@@ -101,7 +101,7 @@ QQ 活动可在 **来源、触发、评估、执行** 页查看。个人任务�
 
 ## 回复与附件
 
-CNB 的 SnowLuma v2.4.0 适配支持上传进度：SA 在文件上传调用中带上 `superagent_progress:true`，SL 根据 QQ 已确认的分块回传相同 echo 的 `upload_progress` 帧，包含 `uploaded_bytes`、`total_bytes` 和 `phase`。来源设置的 QQ 状态面板显示文件名、已上传 MiB / 总 MiB 与百分比；`qq/status` 和 `receipt/<id>` 同时提供结构化进度。上传完成后等待最终发送回包，收到最终成功结果才标记已发送。
+CNB 的 SnowLuma v2.4.0 适配支持上传进度：SA 在文件上传调用中带上 `superagent_progress:true`，SL 根据 QQ 已确认的分块回传相同 echo 的 `upload_progress` 帧，包含 `uploaded_bytes`、`total_bytes` 和 `phase`。普通进度最多每 8 秒推送一次，上传完成与阶段切换立即推送。来源设置的 QQ 状态面板显示文件名、已上传 MiB / 总 MiB 与百分比；`qq/status` 和 `receipt/<id>` 同时提供结构化进度。上传完成后等待最终发送回包，收到最终成功结果才标记已发送。
 
 只有字节数增加或阶段前进会续期上传等待，重复、倒退和其他请求的进度帧保持原等待期限；单次上传另有 15 分钟总时限。进度保存在运行数据库，停止发送后保留最后已确认字节数与停止状态。部署器从固定镜像生成兼容补丁，并以只读方式挂载，云环境重建时自动恢复。
 

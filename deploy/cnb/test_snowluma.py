@@ -262,6 +262,12 @@ class SnowLumaTests(unittest.TestCase):
         extracts = [args for args, _env in self.docker.calls if '/app/runtime/index.mjs' in args]
         self.assertEqual(len(extracts), 1)
         self.assertEqual(snowluma_progress.patch_bundle(path.read_text()), path.read_text())
+        path.write_text(path.read_text().replace('Date.now() - lastAt < 8000', 'Date.now() - lastAt < 500'))
+        inode = path.stat().st_ino
+        with patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started()
+        self.assertIn('Date.now() - lastAt < 8000', path.read_text())
+        self.assertEqual(path.stat().st_ino, inode)
 
     def test_progress_patch_checks_anchors_before_publishing(self):
         with self.assertRaises(ValueError):
@@ -289,6 +295,20 @@ assert.equal(frames.length, 4);
 assert.equal(results[0].data.file_id, "file-1");
 assert.equal(results[1].data.file_id, "file-2");
 assert.equal(results[2], "legacy-result");
+const realNow = Date.now;
+let now = 1000;
+Date.now = () => now;
+await superagentWithUploadProgress("upload_private_file", {superagent_progress:true}, 4, emit, () => true, async () => {
+    await superagentReportUpload(0, 100);
+    now = 1500; await superagentReportUpload(10, 100);
+    now = 8999; await superagentReportUpload(20, 100);
+    now = 9000; await superagentReportUpload(30, 100);
+    now = 9001; await superagentReportUpload(100, 100);
+    await superagentReportUpload(100, 100, "sending");
+});
+Date.now = realNow;
+assert.deepEqual(frames.filter(frame => frame.echo === 4).map(frame => [frame.data.uploaded_bytes,frame.data.phase]),
+    [[0,"uploading"],[30,"uploading"],[100,"uploading"],[100,"sending"]]);
 '''
         result = snowluma.subprocess.run(['node', '--input-type=module', '-'], input=source,
                                         capture_output=True, text=True, timeout=10)
