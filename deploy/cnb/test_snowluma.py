@@ -280,11 +280,14 @@ class SnowLumaTests(unittest.TestCase):
         self.assertEqual(len(extracts), 1)
         self.assertEqual(snowluma_progress.patch_bundle(path.read_text()), path.read_text())
         path.write_text(path.read_text().replace('Date.now() - lastAt < 8000', 'Date.now() - lastAt < 500'))
+        path.chmod(0o600)  # Match the private snapshot restore mode.
         inode = path.stat().st_ino
         with patch.object(self.client, '_webui_reachable', return_value=True):
             self.client.ensure_started()
         self.assertIn('Date.now() - lastAt < 8000', path.read_text())
         self.assertEqual(path.stat().st_ino, inode)
+        if os.name != 'nt':
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
 
     def test_progress_patch_checks_anchors_before_publishing(self):
         with self.assertRaises(ValueError):

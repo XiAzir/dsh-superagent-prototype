@@ -67,7 +67,7 @@ def receiver_summary(path: Path, now=None):
         active = isinstance(lease.get('expires_at'), (float, int)) and lease['expires_at'] > now
         recent = isinstance(heartbeat.get('at'), (float, int)) and 0 <= now - heartbeat['at'] <= 120
         paused = state.get('intentional_paused') is True or (active and recent and heartbeat.get('paused') is True)
-        confirmed = active and recent and heartbeat.get('owner') == lease.get('owner') and heartbeat.get('healthy') is True and not paused
+        confirmed = active and recent and heartbeat.get('owner') == lease.get('owner') and heartbeat.get('healthy') is True and heartbeat.get('stage') in (None, 'running') and not paused
         return {'confirmed': confirmed, 'paused': paused, 'owner': lease.get('owner') if active else None}
     except (OSError, ValueError, AttributeError, TypeError):
         return {'confirmed': False, 'paused': False, 'receiverStateUnavailable': True}

@@ -111,7 +111,7 @@ class RecoveryTests(unittest.TestCase):
         base = {'lease': {'owner': 'cnb-a-123-001', 'expires_at': 1100}, 'heartbeat': {'owner': 'cnb-a-123-001', 'at': 990, 'healthy': True}}
         path.write_text(json.dumps(base))
         self.assertTrue(recovery.receiver_summary(path, 1000)['confirmed'])
-        for heartbeat in [None, {'owner': 'old', 'at': 990, 'healthy': True}, {'owner': 'cnb-a-123-001', 'at': 800, 'healthy': True}, {'owner': 'cnb-a-123-001', 'at': 990, 'healthy': False}]:
+        for heartbeat in [None, {'owner': 'old', 'at': 990, 'healthy': True}, {'owner': 'cnb-a-123-001', 'at': 800, 'healthy': True}, {'owner': 'cnb-a-123-001', 'at': 990, 'healthy': False}, {'owner': 'cnb-a-123-001', 'at': 990, 'healthy': True, 'stage': 'shutting_down'}]:
             path.write_text(json.dumps({**base, 'heartbeat': heartbeat}))
             self.assertFalse(recovery.receiver_summary(path, 1000)['confirmed'])
 

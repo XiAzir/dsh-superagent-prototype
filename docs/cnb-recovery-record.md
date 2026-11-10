@@ -17,6 +17,8 @@
 - 无凭据规则快照为 `/root/.cnb-superagent/runtime-import-rules.json`；恢复状态为 `/root/.cnb-superagent/recovery-state.json`。故障日志保留在 `/var/log/cnb-watchdog-superagent.log`。
 - 冷启动进一步发现 SnowLuma 原 Docker Hub 仓库已拒绝镜像拉取。腾讯缓存保留了原固定索引及其 amd64 清单；通过平台清单 `sha256:74215e3c785099b809a6d00be107c63ecd6deeabf521ec99faf863e156b8573b` 恢复同一 v2.4.0 镜像。已导出 `snowluma/runtime/image-amd64.tar.gz`，731,775,447字节、SHA-256 `47fd020cac85e86533b9ce153497e1bfc1f956a12c9900a129fee063345f3326`，后续随私有快照恢复。
 - SnowLuma管理器增加固定身份的本地镜像复用、受管归档加载及固定平台镜像缓存回退；保持设备身份、登录数据和既有进度补丁。
+- 新工作区实测发现，私有快照将只读挂载的程序 `runtime/index.mjs` 恢复为0600，容器UID1000读取报EACCES。启动器现对该公共程序恢复0644，保持挂载inode；测试覆盖从0600恢复后再次启动。私有父目录和凭据权限保持原策略。
+- QQ保存账号停在登录界面且自动登录未勾选；已重新勾选并登录保存账号，SA随后恢复connected。维护时将登录选项与登录态一并纳入最新快照，并在QQ重启后复核。
 
 ### 下次处理
 
@@ -27,4 +29,8 @@
 
 ### 验收
 
-恢复脚本专项16项测试通过。新工作区 `cnb-9vl-1k72scfdu` 已通过 Prepare，并正在恢复末次快照；完整验收结果完成后追加。
+Windows相关回归75项执行，其中2项平台跳过，其余通过；全新Linux工作区对应恢复与SnowLuma专项37项全部通过。`git diff --check`通过。
+
+初次修复实例 `cnb-9vl-1k72scfdu` 完成快照恢复并保存包含离线镜像的新快照后，已正常停机关闭。使用新watchdog启动全新实例 `cnb-1th-1k72tn395`，Prepare通过，22:31:57完成约1.49GB快照恢复，Docker从快照内归档载入镜像，固定清单摘要与预期一致。权限与登录修复后，SA ready、masterReady=true、QQ connected、监督器healthy=true、paused=false、schema14、SQLite quick_check=ok。8秒进度补丁SHA-256仍为 `477c3502e9acac578af0a38232d47f9f5fb95522afb98d04dd14c5924d25b9e9`。
+
+本地独立镜像副本 `output/cnb-recovery-fix-20261110/snowluma-v2.4.0-amd64.tar.gz` 已下载完成，SHA-256与导出记录一致。登录选项重启验证和新快照完成后追加最终记录。

@@ -260,6 +260,8 @@ class SnowLuma:
             if patched != original:
                 # Keep the inode used by an existing read-only Docker bind mount.
                 self.progress_bundle.write_text(patched, encoding='utf-8', newline='\n')
+            # Private snapshots restore files as 0600; this public-code bind is read by UID 1000.
+            self.progress_bundle.chmod(0o644)
             return
         result = self._run(['docker', 'run', '--rm', '--pull=never', '--entrypoint', 'cat', self.resolved_image,
                             '/app/runtime/index.mjs'], timeout=60)
