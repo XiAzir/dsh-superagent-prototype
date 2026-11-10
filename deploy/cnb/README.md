@@ -71,6 +71,8 @@ NapCat的WebUI token从已持久的`napcat/config/webui.json`读取，OneBot tok
 
 SnowLuma 容器 `superagent-snowluma` 固定 v2.4.0 镜像 digest，使用 `unless-stopped` 重启策略。CNB `.cnb.yml` 每次启动执行 `runtime.py start`，恢复快照后启动 QQ 后端，再启动 DSH；运行期间检查容器/WebUI并重试。人工暂停、环境结束或失去租约时停止 QQ 容器；环境结束保存快照并允许下一工作区恢复。手机验证要求以 QQ 的提示为准。
 
+2026-11-10增加离线镜像恢复：原多架构索引摘要保留，Linux amd64 对应清单固定为 `sha256:74215e3c785099b809a6d00be107c63ecd6deeabf521ec99faf863e156b8573b`。优先复用已验证本地镜像；冷启动从持久化的 `snowluma/runtime/image-amd64.tar.gz` 加载 `superagent-snowluma:v2.4.0-amd64`，核对已知清单/配置摘要及平台。该归档随私有快照保存；缺少归档时可从腾讯缓存拉取固定的平台清单。原上游仓库移除后，多架构索引的镜像拉取可能在下载层后失败，使用已固定的平台清单恢复。另保存本地独立归档，留存其SHA-256并定期核对。
+
 三个持久卷为 `snowluma/data:/app/data`、`snowluma/.config:/app/.config`、`snowluma/.local/share:/app/.local/share`；`data/config/machine-id` 及 `identity/mac-address` 持久保存。SnowLuma 数据根参与私有快照；仅排除 QQ 主配置目录及 `Partitions/qqnt_*`、`Partitions/qq-browser-*` 中的 `SharedStorage`、`DIPS` 及对应 SQLite sidecar，这是由 Chromium 重建的浏览器缓存，长期独占锁会阻塞在线备份。QQ 登录态、账号数据库及其他缓存继续保存。归档接收端须同步新版 `archive.py`，支持 `snowluma` 根。
 
 WebUI 5099、noVNC 6081、OneBot WS 3001 发布到宿主 `127.0.0.1`；可选 `http_enabled:true` 发布 HTTP 3000。应用默认 UID/GID1000。CNB Docker service 的 nofile 上限为65535，因此容器使用 `65535:65535`；Docker capability `CAP_SYS_PTRACE` 与 `SYS_PTRACE` 统一校验。镜像的 Node 二进制具有 `cap_sys_ptrace=ep`，显式设置 `no-new-privileges=false`，保留该文件 capability 供 UID1000 加载 QQ 组件；CNB Docker daemon 默认开启的 no-new-privileges 会屏蔽该能力。
@@ -112,6 +114,16 @@ SUPERAGENT_ARCHIVE_PORT=9012
 以 `install-archive.sh` 安装 `cnb-superagent-archive.service` 后，确认服务只监听 `127.0.0.1:9012`。在固定域名的HTTPS server中加入Nginx示例配置，设置`client_max_body_size 4g`并关闭request buffering，确保ZIP流式转发；大归档建议代理读写等待600秒。匿名 `GET /superagent-runtime/health` 返回HTTP 200和`{"status":"ok"}`或`{"status":"waiting"}`，供既有watchdog探测。
 
 Watchdog 仅在连续两次健康失败后请求启动或回收该 CNB 仓库工作区；它需要一枚限定目标仓库的启停PAT，以及单独的 `account-engage:r` workspace列表PAT。列表令牌只用于列举实例，启停令牌只作用于配置的仓库。PAT正文需存于VPS的0600文件，环境模板只填写文件路径。
+
+### 自动恢复校验
+
+将 `recovery.py` 安装到 `/usr/local/lib/cnb-superagent/recovery.py`，将本目录 `watchdog.sh` 安装为 `/usr/local/bin/cnb-superagent-watchdog.sh`。入口使用项目独立锁，每5分钟运行一次。接收端健康或人工暂停时保持现状；接收端不可达时输出诊断并等待修复。
+
+在私有路径 `/root/.cnb-superagent/runtime-import-rules.json` 保存密钥导入文件的规则快照，仅含 `allow_slugs`（兼容 `allow_repos`）、`allow_branches`、`allow_events` 三个字符串数组，权限0600。部署分支必须同时出现在 `.cnb.yml`、watchdog 的 `CNB_BRANCH` 和密钥导入的 `allow_branches` 中；部署时同步更新规则快照。规则检查接受 shell glob，并保留原有精确规则范围。
+
+恢复程序保存启动构建号，后续轮次查询 `build/status` 和失败阶段详情。接收端状态文件中的心跳须属于当前租约、最近120秒内健康，且启动构建对应工作区实际running，才完成恢复；15分钟bootstrap宽限继续等待真实心跳。配置错误会保存 `blocked_import_branch` 诊断、构建号和下一步，每6小时重试一次。修复规则后执行 `/usr/local/bin/cnb-superagent-watchdog.sh --retry-blocked` 可立即重试，并与cron共享项目锁。`python3 /usr/local/lib/cnb-superagent/recovery.py --check` 只读检查，输出JSON且保持本地状态文件和CNB实例原样。
+
+切换分支后应完成一次新工作区启动验收，核对 Prepare、快照恢复、SA ready、QQ连接及新快照上传；在旧工作区内切换Git分支后，继续验证CNB创建分支的导入权限。
 
 ## 公网 Web 接入
 

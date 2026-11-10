@@ -17,6 +17,10 @@ class FakeDocker:
     def __init__(self):
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.pulled = False
+        self.images: dict[str, dict] = {}
+        self.load_image = {'Id': snowluma.AMD64_MANIFEST, 'Os': 'linux', 'Architecture': 'amd64',
+                           'Descriptor': {'digest': snowluma.AMD64_MANIFEST}}
+        self.failed_pulls = set()
         self.info: dict | None = None
         self.configured_mac = ''
 
@@ -28,9 +32,20 @@ class FakeDocker:
         args = list(args)
         self.calls.append((args, dict(env)))
         if args[:3] == ['docker', 'image', 'inspect']:
-            return self.result(0 if self.pulled else 1)
+            reference = args[3]
+            if reference in self.images:
+                return self.result(stdout=json.dumps([self.images[reference]]))
+            return self.result(0 if self.pulled and reference == snowluma.IMAGE else 1)
+        if args[:3] == ['docker', 'image', 'load']:
+            self.images[snowluma.ARCHIVE_IMAGE] = dict(self.load_image)
+            return self.result(stdout='Loaded image: ' + snowluma.ARCHIVE_IMAGE)
         if args[:2] == ['docker', 'pull']:
-            self.pulled = True
+            if args[-1] in self.failed_pulls:
+                return self.result(1, stderr='registry unavailable')
+            if args[-1] == snowluma.IMAGE:
+                self.pulled = True
+            else:
+                self.images[args[-1]] = dict(self.load_image)
             return self.result(stdout='image pulled')
         if args[:3] == ['docker', 'run', '--rm']:
             if '--entrypoint' in args and args[args.index('--entrypoint') + 1] == 'cat':
@@ -94,13 +109,14 @@ class FakeDocker:
                 caps.append(arg.split('=', 1)[1]); i += 1
             elif arg.startswith('--shm-size='):
                 shm_size = 1073741824; i += 1
-            elif arg == snowluma.IMAGE:
+            elif arg in (snowluma.IMAGE, snowluma.AMD64_IMAGE, snowluma.ARCHIVE_IMAGE):
                 break
             else:
                 i += 1
         container_env = [f'{key}={process_env[key]}' for key in env_names]
         return {
-            'Config': {'Image': snowluma.IMAGE, 'Hostname': hostname, 'Labels': labels, 'Env': container_env},
+            'Config': {'Image': args[i], 'Hostname': hostname, 'Labels': labels, 'Env': container_env},
+            'Image': snowluma.AMD64_MANIFEST,
             'HostConfig': {
                 'Binds': binds, 'PortBindings': ports, 'NetworkMode': network,
                 'RestartPolicy': {'Name': restart}, 'SecurityOpt': security, 'Privileged': False,
@@ -121,6 +137,7 @@ class SnowLumaTests(unittest.TestCase):
         self.data, self.control = self.tmp / 'data', self.tmp / 'control'
         self.data.mkdir(); self.control.mkdir()
         self.docker = FakeDocker()
+        self.docker.pulled = True
         self.client = snowluma.SnowLuma(self.data, self.control, self.docker, sleep=lambda _seconds: None)
         self._env = patch.dict(os.environ, {
             'SUPERAGENT_ARCHIVE_TOKEN': 'supervisor-private-token',
@@ -273,6 +290,76 @@ class SnowLumaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             snowluma_progress.prepare_bundle(self.tmp / 'runtime.mjs', '// incompatible runtime')
         self.assertFalse((self.tmp / 'runtime.mjs').exists())
+
+    def test_archived_image_is_loaded_verified_and_used_by_every_container_operation(self):
+        self.write_config({'enabled': True})
+        self.docker.pulled = False
+        self.client.image_archive.parent.mkdir(parents=True)
+        self.client.image_archive.write_bytes(b'fixture image archive')
+        with patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started(timeout=0)
+            self.client.ensure_started(timeout=0)
+            self.assertTrue(self.client.healthy())
+        calls = [args for args, _env in self.docker.calls]
+        loads = [args for args in calls if args[:3] == ['docker', 'image', 'load']]
+        self.assertEqual(loads, [['docker', 'image', 'load', '--input', str(self.client.image_archive)]])
+        self.assertFalse(any(args[:2] == ['docker', 'pull'] for args in calls))
+        for args in calls:
+            if args[:2] == ['docker', 'run']:
+                self.assertIn(snowluma.ARCHIVE_IMAGE, args)
+                self.assertIn('--pull=never', args)
+        self.assertEqual(self.docker.info['Config']['Image'], snowluma.ARCHIVE_IMAGE)
+
+    def test_loaded_archive_with_unexpected_content_is_rejected_before_run(self):
+        self.write_config({'enabled': True})
+        self.docker.pulled = False
+        self.docker.load_image['Id'] = 'sha256:unexpected'
+        self.client.image_archive.parent.mkdir(parents=True)
+        self.client.image_archive.write_bytes(b'incompatible image archive')
+        with self.assertRaisesRegex(snowluma.SnowLumaError, 'identity'):
+            self.client.ensure_started(timeout=0)
+        self.assertFalse(any(args[:2] == ['docker', 'run'] for args, _env in self.docker.calls))
+
+    def test_missing_archive_uses_pinned_mirror_manifest_and_reuses_running_container(self):
+        self.write_config({'enabled': True})
+        self.docker.pulled = False
+        with patch.object(self.client, '_webui_reachable', return_value=True):
+            self.client.ensure_started(timeout=0)
+            # The original reference becoming available must preserve this owned container.
+            self.docker.pulled = True
+            self.client.ensure_started(timeout=0)
+            self.assertTrue(self.client.healthy())
+        calls = [args for args, _env in self.docker.calls]
+        self.assertEqual([args for args in calls if args[:2] == ['docker', 'pull']],
+                         [['docker', 'pull', '--platform', 'linux/amd64', snowluma.AMD64_IMAGE]])
+        self.assertEqual(len([args for args in calls if args[:3] == ['docker', 'run', '-d']]), 1)
+
+    def test_upstream_pull_remains_available_if_pinned_mirror_is_unavailable(self):
+        self.docker.pulled = False
+        self.docker.failed_pulls.add(snowluma.AMD64_IMAGE)
+        self.assertEqual(self.client._resolve_image(), snowluma.IMAGE)
+        pulls = [args for args, _env in self.docker.calls if args[:2] == ['docker', 'pull']]
+        self.assertEqual(pulls[-1], ['docker', 'pull', snowluma.IMAGE])
+
+    def test_classic_config_identity_supported_but_platform_mismatch_rejected(self):
+        self.docker.images[snowluma.ARCHIVE_IMAGE] = {'Id': snowluma.AMD64_CONFIG, 'Os': 'linux', 'Architecture': 'amd64'}
+        self.assertTrue(self.client._verified_amd64_image(snowluma.ARCHIVE_IMAGE))
+        self.docker.images[snowluma.ARCHIVE_IMAGE]['Architecture'] = 'arm64'
+        with self.assertRaisesRegex(snowluma.SnowLumaError, 'identity'):
+            self.client._verified_amd64_image(snowluma.ARCHIVE_IMAGE)
+
+    def test_fallback_container_requires_pinned_content_identity(self):
+        self.assertTrue(self.client._matches_image({'Config': {'Image': snowluma.ARCHIVE_IMAGE}, 'Image': snowluma.AMD64_CONFIG}))
+        self.assertFalse(self.client._matches_image({'Config': {'Image': snowluma.ARCHIVE_IMAGE}, 'Image': 'sha256:other'}))
+        self.assertFalse(self.client._matches_image({'Config': {'Image': 'snowluma:latest'}, 'Image': snowluma.AMD64_CONFIG}))
+
+    def test_archive_path_cannot_traverse_outside_managed_data(self):
+        self.docker.pulled = False
+        self.client.image_archive = self.tmp / 'outside-image.tar.gz'
+        self.client.image_archive.write_bytes(b'outside')
+        with self.assertRaisesRegex(snowluma.SnowLumaError, 'managed data'):
+            self.client._resolve_image()
+        self.assertFalse(any(args[:3] == ['docker', 'image', 'load'] for args, _env in self.docker.calls))
 
     def test_progress_events_follow_the_request_and_opt_in_without_altering_final_results(self):
         source = snowluma_progress.HELPERS + r'''
