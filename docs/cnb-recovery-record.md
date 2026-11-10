@@ -33,4 +33,8 @@ Windows相关回归75项执行，其中2项平台跳过，其余通过；全新L
 
 初次修复实例 `cnb-9vl-1k72scfdu` 完成快照恢复并保存包含离线镜像的新快照后，已正常停机关闭。使用新watchdog启动全新实例 `cnb-1th-1k72tn395`，Prepare通过，22:31:57完成约1.49GB快照恢复，Docker从快照内归档载入镜像，固定清单摘要与预期一致。权限与登录修复后，SA ready、masterReady=true、QQ connected、监督器healthy=true、paused=false、schema14、SQLite quick_check=ok。8秒进度补丁SHA-256仍为 `477c3502e9acac578af0a38232d47f9f5fb95522afb98d04dd14c5924d25b9e9`。
 
-本地独立镜像副本 `output/cnb-recovery-fix-20261110/snowluma-v2.4.0-amd64.tar.gz` 已下载完成，SHA-256与导出记录一致。登录选项重启验证和新快照完成后追加最终记录。
+本地独立镜像副本 `output/cnb-recovery-fix-20261110/snowluma-v2.4.0-amd64.tar.gz` 已下载完成，SHA-256与导出记录一致。
+
+已正常重启QQ进程，保存账号全程自动登录，SA再次connected。启动代码在真实恢复文件上验证0600→0644且inode保持一致，Linux专项37项再次全部通过。新watchdog输出healthy并清空待恢复状态；公网首页与状态API均返回HTTP200，masterReady=true。
+
+北京时间22:47:06，重启验收后立即创建的新快照上传HTTP200：1,491,261,302字节，SHA-256 `aeccef3e50a5749454a6ed79f7295a8a6265f30cc9c9041f2d08a438cffab8c2`，owner为新工作区 `cnb-1th-1k72tn395`。直接读取武汉latest.zip的manifest确认离线镜像731,775,447字节，摘要与本地独立副本一致。验收证据保存在工作区外 `output/cnb-recovery-fix-20261110/` 的 `live-verification.json`、`verified-login-backup.json`、`persisted-backup-verification.json`。
